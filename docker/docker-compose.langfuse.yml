@@ -1,0 +1,186 @@
+# Langfuse, self-hosted. Merged into the same compose project as the desk
+# services so that `decide` can reach `langfuse-web:3000` by name:
+#
+#   docker compose -f docker/docker-compose.yml -f docker/docker-compose.langfuse.yml ...
+#
+# which is what the Makefile's $(COMPOSE) does. Everything here sits behind the
+# `langfuse` profile, so a plain `make up` does not start it.
+#
+# ---------------------------------------------------------------------------
+# A correction to the architecture doc
+# ---------------------------------------------------------------------------
+# Architecture §1 describes Langfuse as "MIT, self-hosted, ONE CONTAINER". That
+# was true of Langfuse v2. Since v3 the self-hosted deployment is SIX services:
+# web, worker, postgres, clickhouse, redis and minio. It is still MIT, still
+# self-hosted, and still free -- but it is roughly 2 GB of images and ~1.5 GB
+# resident, which is a materially different proposition on a laptop that is also
+# running a 14B model.
+#
+# The reasoning in §1 survives the correction: the argument there is that
+# tracing is a BONUS on top of durable node-level resume, explicitly "not the
+# case" for adopting LangGraph. So if this stack proves annoying, the honest
+# fallbacks in preference order are:
+#
+#   1. Langfuse Cloud free tier -- set LANGFUSE_HOST=https://cloud.langfuse.com
+#      and the two keys. Nothing in our code changes; it is the same client.
+#   2. Any other OTel collector -- langfuse 4.x is an OpenTelemetry wrapper and
+#      obs/tracing.py emits ordinary spans.
+#   3. Nothing. Tracing degrades to a no-op and the pipeline runs regardless.
+#
+# ---------------------------------------------------------------------------
+# Passwords
+# ---------------------------------------------------------------------------
+# The defaults below are the upstream development defaults. They are fine for
+# something bound to localhost on your own machine and NOT fine for anything
+# reachable from elsewhere. Override them in .env before exposing port 3000.
+
+services:
+
+  langfuse-web:
+    image: docker.langfuse.com/langfuse/langfuse:4
+    container_name: desk-langfuse-web
+    restart: always
+    profiles: [langfuse]
+    depends_on: &langfuse-deps
+      postgres: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      clickhouse: {condition: service_healthy}
+    ports: ["3000:3000"]
+    environment: &langfuse-env
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-changeme-nextauth-secret}
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/postgres
+      SALT: ${LANGFUSE_SALT:-changeme-salt}
+      # Must be exactly 64 hex chars: `openssl rand -hex 32`
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+      TELEMETRY_ENABLED: ${TELEMETRY_ENABLED:-false}
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_AUTH: ${REDIS_AUTH:-changeme-redis}
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-miniosecret}
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-miniosecret}
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+
+      # Auto-provision an org, project and user on first boot, using the SAME
+      # keys the app reads from .env. This is the bit that makes `make
+      # langfuse-up && make toy-graph` work without clicking through a signup
+      # form, which in turn is what makes the Stage 0 exit gate reproducible.
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-research-desk}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-Research Desk}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-desk}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-decide}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-desk}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-}
+
+  langfuse-worker:
+    image: docker.langfuse.com/langfuse/langfuse-worker:4
+    container_name: desk-langfuse-worker
+    restart: always
+    profiles: [langfuse]
+    depends_on: *langfuse-deps
+    ports: ["127.0.0.1:3030:3030"]
+    environment: *langfuse-env
+
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:25.12
+    container_name: desk-clickhouse
+    restart: always
+    profiles: [langfuse]
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 1s
+
+  minio:
+    image: cgr.dev/chainguard/minio
+    container_name: desk-minio
+    restart: always
+    profiles: [langfuse]
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret}
+    ports:
+      - "127.0.0.1:9090:9000"
+      - "127.0.0.1:9091:9001"
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 1s
+
+  redis:
+    image: docker.io/redis:7
+    container_name: desk-redis
+    restart: always
+    profiles: [langfuse]
+    command: >
+      --requirepass ${REDIS_AUTH:-changeme-redis}
+      --maxmemory-policy noeviction
+    volumes:
+      - langfuse_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+
+  postgres:
+    image: docker.io/postgres:17
+    container_name: desk-postgres
+    restart: always
+    profiles: [langfuse]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: postgres
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  langfuse_postgres_data:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_minio_data:
+  langfuse_redis_data:

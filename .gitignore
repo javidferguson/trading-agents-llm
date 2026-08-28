@@ -1,3 +1,6 @@
+# AI
+*CLAUDE.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -7,6 +10,7 @@ __pycache__/
 *.so
 
 # Distribution / packaging
+.idea/
 .Python
 build/
 develop-eggs/
@@ -216,3 +220,21 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+# Research desk
+# ---------------------------------------------------------------------------
+logs/
+data/
+
+# uv.lock IS committed, deliberately. Architecture §1 pins the LangGraph set to
+# exact versions because langgraph-prebuilt 1.0.2 shipped a breaking change under
+# loose constraints; a lockfile that is not in version control makes that pin
+# meaningless for anyone else checking the repo out.
+!uv.lock
+
+# NOTE ON data/ : the GDELT cache under data/cache/gdelt is the one thing in
+# there that CANNOT be regenerated -- GDELT's API serves a rolling ~3-month
+# window, so a day lost is lost for good. It is gitignored because a JSONish
+# cache that grows daily does not belong in git history, but it does need a
+# backup. Include data/cache/gdelt in whatever backs up this machine.

@@ -1,0 +1,108 @@
+# The research desk. Two services, plus an optional Langfuse stack.
+#
+# This file declares NO IB Gateway service. There is exactly one Gateway, it is
+# owned by the ORB+GEX repo, and this repo joins its network. Two Gateway
+# containers would mean two logins to the same IB account, which IB resolves by
+# evicting one of them (migration plan §0).
+#
+#   `make gateway-start` is a command you run IN THAT REPO, not this one.
+#
+# Ollama is likewise absent by design. On macOS, Docker Desktop runs a Linux VM
+# with no Metal passthrough, so a containerised Ollama is CPU-only with a
+# fraction of your RAM -- roughly 5-15x slower than native. A 14-call pipeline
+# that takes 4 minutes natively takes 40+ containerised, which is the difference
+# between a tool you use and one you abandon (architecture §10). Run it natively
+# and reach it via host.docker.internal. The `ollama` profile below exists only
+# for a Linux/NVIDIA box and for CI.
+
+name: research-desk
+
+x-common: &common
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  env_file: [../.env]
+  working_dir: /app
+  restart: "no"
+  extra_hosts:
+    # host.docker.internal is native on Docker Desktop; this line is what makes
+    # the same compose file work on Linux.
+    - "host.docker.internal:host-gateway"
+  volumes:
+    - ../data:/app/data
+    - ../logs:/app/logs
+    - ../config:/app/config:ro
+    - ../prompts:/app/prompts:ro
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # decide -- agents, LLM, free data. No IB connection, no ib_async installed.
+  # ---------------------------------------------------------------------------
+  decide:
+    <<: *common
+    container_name: desk-decide
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        EXTRAS: ""          # deliberately empty: no ib_async in this image
+    environment:
+      # The gotcha that costs an hour: Ollama binds 127.0.0.1:11434 by default
+      # and a container cannot reach it. Set OLLAMA_HOST=0.0.0.0:11434 on the
+      # HOST daemon, then verify with `make check-ollama`, which curls from
+      # inside this container rather than from your shell.
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-http://langfuse-web:3000}
+    command: ["desk", "doctor"]
+
+  # ---------------------------------------------------------------------------
+  # execute -- human gate and ib_async. No LLM, no network beyond IB.
+  # ---------------------------------------------------------------------------
+  execute:
+    <<: *common
+    container_name: desk-execute
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        EXTRAS: "execute"
+    # Interactive: the confirmation gate reads stdin, and a closed stdin must
+    # decline rather than proceed. `docker compose run --rm execute ...`.
+    stdin_open: true
+    tty: true
+    environment:
+      IB_HOST: ${IB_HOST:-ajj-ib-gateway}
+      # 4004 from inside trading-network; 4002 from the host.
+      IB_PORT: ${IB_PORT:-4004}
+      # 11 is the research desk's execute slot. ib_async connections that
+      # collide on clientId do NOT error -- they silently fail to connect.
+      IB_CLIENT_ID: ${IB_CLIENT_ID:-11}
+      # Must match the exchange, or IB stamps bars in UTC.
+      TZ: ${TZ:-America/New_York}
+    networks: [default, trading-network]
+    profiles: [execute]     # Stage 7. Not started by `make up`.
+
+  # ---------------------------------------------------------------------------
+  # ollama -- Linux/NVIDIA and CI only. On macOS run it natively (§10).
+  # ---------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: desk-ollama
+    ports: ["11434:11434"]
+    volumes: ["../data/ollama:/root/.ollama"]
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      # Otherwise the model unloads between nodes and you pay a multi-second
+      # reload on every one of 14 calls.
+      OLLAMA_KEEP_ALIVE: 30m
+      # Otherwise the four-analyst fan-out silently serialises.
+      OLLAMA_NUM_PARALLEL: 4
+    profiles: [ollama]
+
+networks:
+  # Declared external: it belongs to the ORB+GEX repo's compose file, which
+  # creates it. `docker network create trading-network` if it does not exist.
+  trading-network:
+    external: true
+    name: trading-network

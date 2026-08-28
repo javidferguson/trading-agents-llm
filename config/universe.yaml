@@ -1,0 +1,119 @@
+# The universe, and the two hand-maintained dicts that hang off it.
+#
+# This file exists in week one rather than at Stage 6, for one reason: **the
+# GDELT cache is keyed by symbol**, and GDELT's open API serves only a rolling
+# ~3-month window. Whatever is not on this list from week one has no sentiment
+# history at Stage 8, and no amount of later effort recovers it.
+#
+# So err WIDE. Caching a symbol you never trade costs a few API calls a day;
+# adding one later costs three months of unrecoverable history.
+
+benchmark: SPY
+
+# ---------------------------------------------------------------------------
+# gdelt_query
+# ---------------------------------------------------------------------------
+# GDELT matches TEXT, not tickers. A naive query for `META` returns metaphysics,
+# and `AAPL` returns nothing at all. These are a starting point, NOT verified.
+#
+#   Run `python scripts/gdelt_collect.py --inspect SYMBOL` and read the returned
+#   headlines for each symbol ONCE. Get this wrong and the tone series is
+#   measuring something else entirely -- which is worse than having no tone
+#   series, because it looks like data.
+#
+# The trade-off in each query is recall vs contamination. "Apple" alone pulls in
+# fruit and record labels; "Apple Inc" alone is precise but sparse, and most
+# outlets do not write "Inc". Prefer a couple of unambiguous product or
+# executive terms OR'd together over either extreme.
+#
+# ---------------------------------------------------------------------------
+# sector_etf
+# ---------------------------------------------------------------------------
+# For the relative-strength metric (architecture §7.1): absolute return tells you
+# almost nothing in a trending market. Free sector classification is poor, so a
+# hand-maintained dict for a small universe is 12 lines and honest.
+
+symbols:
+
+  - symbol: SPY
+    name: "SPDR S&P 500 ETF Trust"
+    sector_etf: null              # it IS the benchmark
+    gdelt_query: '("S&P 500" OR "stock market")'
+    # An ETF has no EDGAR companyfacts. This is the case where a naive
+    # fundamentals path throws -- exercise it at the Stage 2 exit gate.
+    has_fundamentals: false
+
+  - symbol: AAPL
+    name: "Apple Inc."
+    sector_etf: XLK
+    gdelt_query: '("Apple Inc" OR "Apple iPhone" OR "Tim Cook")'
+
+  - symbol: MSFT
+    name: "Microsoft Corporation"
+    sector_etf: XLK
+    gdelt_query: '(Microsoft OR "Satya Nadella")'
+
+  - symbol: NVDA
+    name: "NVIDIA Corporation"
+    sector_etf: XLK
+    gdelt_query: '(Nvidia OR "Jensen Huang")'
+
+  - symbol: AVGO
+    name: "Broadcom Inc."
+    sector_etf: XLK
+    gdelt_query: '(Broadcom OR "Hock Tan")'
+
+  - symbol: AMZN
+    name: "Amazon.com, Inc."
+    sector_etf: XLY
+    gdelt_query: '("Amazon.com" OR "Amazon Web Services" OR "Andy Jassy")'
+    # "Amazon" bare would collect rainforest coverage, which is exactly the
+    # failure this column exists to prevent.
+
+  - symbol: GOOGL
+    name: "Alphabet Inc."
+    sector_etf: XLC
+    gdelt_query: '("Alphabet Inc" OR Google OR "Sundar Pichai")'
+
+  - symbol: META
+    name: "Meta Platforms, Inc."
+    sector_etf: XLC
+    gdelt_query: '("Meta Platforms" OR Instagram OR "Mark Zuckerberg")'
+    # The canonical trap. Bare `Meta` returns metaphysics, and bare `Facebook`
+    # returns platform-usage stories rather than company coverage. Worth
+    # eyeballing this one first.
+
+  - symbol: JPM
+    name: "JPMorgan Chase & Co."
+    sector_etf: XLF
+    gdelt_query: '(JPMorgan OR "Jamie Dimon")'
+
+  - symbol: XOM
+    name: "Exxon Mobil Corporation"
+    sector_etf: XLE
+    gdelt_query: '("Exxon Mobil" OR ExxonMobil OR Exxon)'
+
+  - symbol: UNH
+    name: "UnitedHealth Group Incorporated"
+    sector_etf: XLV
+    gdelt_query: '("UnitedHealth" OR "UnitedHealthcare")'
+
+  - symbol: JNJ
+    name: "Johnson & Johnson"
+    sector_etf: XLV
+    gdelt_query: '("Johnson & Johnson" OR "Johnson and Johnson")'
+
+# The eleven SPDR sector ETFs, for reference. Add a symbol's mapping above
+# rather than inferring one at runtime.
+sector_etfs:
+  XLK:  "Technology"
+  XLY:  "Consumer Discretionary"
+  XLC:  "Communication Services"
+  XLF:  "Financials"
+  XLE:  "Energy"
+  XLV:  "Health Care"
+  XLP:  "Consumer Staples"
+  XLI:  "Industrials"
+  XLB:  "Materials"
+  XLRE: "Real Estate"
+  XLU:  "Utilities"

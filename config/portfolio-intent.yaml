@@ -1,0 +1,109 @@
+# Portfolio intent (architecture §8).
+#
+# The desk is driven by a stated intent, not a watchlist. This file is consumed
+# through FOUR distinct channels, deliberately not one:
+#
+#   1. Deterministic pre-filter (no LLM) -- universe minus exclusions minus
+#      earnings blackout minus at-max-positions.
+#   2. Drift table (no LLM) -- compute_gaps() hands the Trader current vs target
+#      weight. Its job is choosing which gap to close, not inventing allocations.
+#   3. Prompt context (LLM) -- `objective` and `themes[].thesis` and
+#      `constraints` go into the TRADER AND FUND MANAGER SYSTEM PROMPTS ONLY.
+#   4. Hard veto (no LLM) -- everything under `risk:` is enforced by
+#      compliance.py AFTER sizing. Any violation blocks the order regardless of
+#      what the fund manager decided.
+#
+# ANALYSTS NEVER SEE THIS FILE. Priming the fundamentals analyst with your thesis
+# before it reads the 10-K evaporates the entire value of the bear researcher.
+# Intent enters at the Trader node and no earlier.
+#
+# Read by intent/engine.py at Stage 6. Only `execution.require_confirmation` is
+# read today -- config.py refuses to load if it is set to false.
+
+execution:
+  # There is deliberately no way to turn this off. The value below is the only
+  # accepted value; `false` raises ConfigError at load time. Carried from the
+  # ORB engine, where the options scanner's gate was INVERTED -- setting it
+  # false still prompted, then returned True regardless of the answer.
+  require_confirmation: true
+  # Approval requires typing the ticker symbol, not "y". A yes/no prompt is
+  # answered by muscle memory; a symbol has to be read first.
+  confirm_by: ticker
+
+objective:
+  horizon_days: 60
+  benchmark: SPY
+  description: >
+    A concentrated, long-only paper book of large-cap US equities held for
+    weeks to months. The goal is to beat SPY on a residual basis, not to
+    maximise absolute return in an up market. Prefer fewer, better-understood
+    positions over breadth. Being flat is an acceptable outcome.
+
+risk:
+  # Every one of these is a hard Python veto. None is a suggestion to a model.
+  per_trade_risk_pct: 0.75        # % of equity at risk if the stop fills
+  default_stop_pct: 8.0
+  max_position_pct: 10.0
+  max_sector_pct: 30.0
+  min_cash_pct: 10.0
+  max_gross_exposure_pct: 95.0
+  max_positions: 8
+  min_trade_usd: 500              # reject dust
+  max_order_shares: 2000
+  # ADV participation is a compliance check, not a nicety: a fill you cannot
+  # actually get makes the Stage 8 equity curve fiction.
+  max_adv_participation_pct: 2.0
+  # No trading into an earnings print.
+  earnings_blackout_days_before: 2
+  earnings_blackout_days_after: 1
+
+universe:
+  # Drawn from config/universe.yaml. Listing it separately keeps "what we may
+  # trade" distinct from "what we collect sentiment for" -- the second should be
+  # wider, because its cost rises with delay and the first's does not.
+  include: [AAPL, MSFT, NVDA, AVGO, AMZN, GOOGL, META, JPM, XOM, UNH, JNJ]
+  exclude: []
+  allow_shorts: false             # long-only for now; §9 sizing assumes it
+
+themes:
+  - name: "AI infrastructure"
+    target_weight_pct: 25.0
+    conviction: 0.7
+    thesis: >
+      Compute demand for training and inference is still supply-constrained,
+      and the constraint has moved from GPUs toward power and networking. The
+      risk is that hyperscaler capex is pulled forward rather than durable.
+    exemplars: [NVDA, AVGO, MSFT]
+
+  - name: "Cash-generative megacap"
+    target_weight_pct: 30.0
+    conviction: 0.6
+    thesis: >
+      Businesses with high gross profitability and a shrinking share count,
+      bought at a non-absurd earnings yield. Deliberately boring; this is the
+      ballast the AI sleeve is measured against.
+    exemplars: [AAPL, GOOGL, JNJ]
+
+  - name: "Defensive / uncorrelated"
+    target_weight_pct: 15.0
+    conviction: 0.4
+    thesis: >
+      Health care and energy, held to blunt drawdown rather than to win.
+    exemplars: [UNH, XOM, JPM]
+
+# Free text, read by the Trader and Fund Manager only. Say things here that are
+# hard to encode as a number -- the numeric ones belong under `risk:` where
+# Python can enforce them.
+constraints:
+  - "Do not add to a position that is already the largest in the book."
+  - "Prefer closing an existing gap to opening a new theme."
+  - "If the macro regime tag shows an inverted curve AND SPY below its 200-day,
+     require materially higher conviction to add risk."
+  - "A HOLD that preserves optionality is a good outcome, not a failure to act."
+
+cadence:
+  max_decisions_per_day: 3
+  # A stale proposal cannot be executed. A proposal generated after Tuesday's
+  # close must not be executable on Thursday -- render_decision() refuses
+  # outright rather than prompting.
+  proposal_ttl_hours: 18
