@@ -1,0 +1,73 @@
+# Model routing (architecture §6).
+#
+# Per-node routing is a dict, deliberately. The one node worth paying for is the
+# fund manager; everything else runs locally and free.
+#
+# Read by llm/router.py at Stage 1. Nothing reads it yet.
+
+providers:
+  ollama:
+    base_url: "${OLLAMA_BASE_URL}"
+    timeout_s: 300
+  anthropic:
+    api_key_env: ANTHROPIC_API_KEY
+
+profiles:
+  quick:
+    provider: ollama
+    model: "qwen3:8b"
+    temperature: 0.3
+    num_ctx: 8192
+  deep_local:
+    provider: ollama
+    model: "qwen3:14b"
+    temperature: 0.5
+    num_ctx: 16384
+  deep_hosted:
+    provider: anthropic
+    # OPEN ITEM: resolve at Stage 5 against rates current at that time. The cost
+    # table in architecture §12 explicitly asks to be re-derived rather than
+    # trusted -- it was written against older per-Mtok rates.
+    model: "claude-sonnet-5"
+    temperature: 0.5
+    max_tokens: 2000
+    # Wire this on day one of Stage 5, not after the first bill. The system
+    # prompts repeat across all 14 calls, so caching them cuts input cost
+    # materially.
+    prompt_caching: true
+
+nodes:
+  market_analyst: quick
+  news_analyst: quick
+  positioning_analyst: quick
+  fundamentals_analyst: quick
+  bull_researcher: quick
+  bear_researcher: quick
+  research_facilitator: deep_local
+  trader: deep_local
+  risky_debater: quick
+  neutral_debater: quick
+  safe_debater: quick
+  fund_manager: deep_hosted      # the one node worth paying for
+  reflection: deep_local
+
+# Whole-run overrides, for ablations and for strategy development.
+presets:
+  all_local:
+    "*": quick
+  all_hosted:
+    "*": deep_hosted             # for eval / strategy development
+
+# Hard caps, enforced in Python. Never let the model alone decide when to stop
+# (architecture §5, §12). Budget always wins.
+budget:
+  max_llm_calls: 20
+  max_wall_s: 900
+  max_usd: 0.50
+
+debate:
+  # 1, not 2 -- start cheap. Raise it only if an ablation shows lift.
+  max_research_rounds: 1
+  max_risk_rounds: 1
+  # Local models loop and restate rather than converge. This is not optional.
+  novelty_jaccard_threshold: 0.85

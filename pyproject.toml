@@ -1,0 +1,58 @@
+[project]
+name = "research-desk"
+version = "0.1.0"
+description = "A multi-agent LLM research desk for daily equities and ETFs"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+
+# LangGraph is pinned EXACTLY, not with `~=` or `>=`. This is not superstition:
+# langgraph-prebuilt 1.0.2 shipped a breaking change under loose constraints and
+# took its dependents down with it. See architecture doc §1, constraint 2.
+# Upgrade these four (five, with the sdk) together and on purpose.
+dependencies = [
+    "langgraph==1.2.11",
+    "langgraph-checkpoint==4.2.0",
+    "langgraph-prebuilt==1.1.0",
+    "langgraph-sdk==0.4.4",
+    "langchain-core==1.6.1",
+
+    # Ours. LangGraph orchestrates; everything below is the part we own.
+    "pydantic==2.13.5",
+    "pyyaml==6.0.3",
+    "httpx==0.28.1",
+
+    # Tracing. langfuse 4.x is an OpenTelemetry wrapper, so node spans land in
+    # Langfuse or in any other OTel collector without changing our code.
+    "langfuse==4.15.1",
+]
+
+[project.optional-dependencies]
+# ib_async lives ONLY here, and is installed ONLY by the `execute` process.
+# The `decide` process must not have it in its dependency tree at all -- that is
+# the §0 split, and tests/test_layering.py asserts it.
+execute = ["ib-async==2.1.0"]
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    # Present for the carried safety tests only. Its presence in the dev group
+    # does not weaken the layering test, which reads imports, not site-packages.
+    "ib-async==2.1.0",
+]
+
+[project.scripts]
+desk = "research_desk.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/research_desk"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

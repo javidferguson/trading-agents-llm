@@ -1,0 +1,119 @@
+# Providers: keys, rate limits, and point-in-time flags (architecture §7.3).
+#
+# `supports_point_in_time` is the load-bearing field. In mode="replay" a provider
+# with `false` must RAISE, not degrade quietly -- look-ahead bias is the number
+# one way agentic backtests produce fictional Sharpe ratios.
+#
+# Read by providers/registry.py at Stage 2. Nothing reads it yet.
+
+defaults:
+  cache_dir: "data/cache"
+  # Cache key = sha256(provider, method, sorted(kwargs), as_of).
+  # In replay the cache is the ONLY permitted source; HTTP is hard-disabled.
+  retry_attempts: 3
+  retry_backoff_s: 2.0
+
+providers:
+
+  stooq:
+    role: "daily OHLCV, primary"
+    base_url: "https://stooq.com/q/d/l/"
+    key_env: null
+    rate_limit_per_s: 2
+    supports_point_in_time: true
+    fallback: ib
+    # yfinance is deliberately demoted to third and is not configured here. It
+    # is an unofficial scrape that has been structurally unreliable since
+    # Yahoo's 2025 redesign -- rate limits, IP blocks, schema churn.
+
+  ib:
+    role: "daily OHLCV, authoritative fallback"
+    key_env: null
+    rate_limit_per_s: 1
+    supports_point_in_time: true
+    # NOTE: only the `execute` process may import ib_async. If `decide` ever
+    # needs this fallback, it must go through a subprocess or a cached artefact.
+    # endDateTime must be timezone-aware: a naive 10:00 returned the 10:30-10:59
+    # bars, an aware 10:00 ET returned 09:30-09:59. Measured, not theorised.
+
+  edgar:
+    role: "fundamentals -- the best free source in the stack"
+    base_url: "https://data.sec.gov"
+    key_env: null
+    rate_limit_per_s: 10          # exceed this and it 429s
+    supports_point_in_time: true  # every fact carries its `filed` date
+    # A missing User-Agent is the usual cause of a 403, and the error does not
+    # say so. Format: "Name email@example.com".
+    user_agent_env: SEC_EDGAR_USER_AGENT
+
+  finnhub:
+    role: "news, earnings calendar, surprises, recommendation trends"
+    base_url: "https://finnhub.io/api/v1"
+    key_env: FINNHUB_API_KEY
+    rate_limit_per_min: 60
+    supports_point_in_time: true  # date-rangeable, 1y history on free
+    # /news-sentiment is a Premium entitlement. We use /company-news for
+    # headlines and article counts only -- verify before assuming otherwise.
+
+  finra:
+    role: "short interest, daily short-sale volume"
+    key_env: null
+    rate_limit_per_s: 2
+    supports_point_in_time: true  # short interest carries a settlement date
+
+  fred:
+    role: "macro, one fetch per run"
+    base_url: "https://api.stlouisfed.org/fred"
+    key_env: FRED_API_KEY
+    supports_point_in_time: true
+    series:
+      - VIXCLS
+      - DGS10
+      - DGS2
+      - T10Y2Y
+      - DFF
+      - CPIAUCSL
+      - UNRATE
+      - BAMLH0A0HYM2   # high-yield OAS -- the cleanest free risk-on/risk-off read
+      - NFCI           # Chicago Fed financial conditions
+
+  gdelt:
+    role: "news tone and coverage volume, across thousands of outlets"
+    base_url: "https://api.gdeltproject.org/api/v2/doc/doc"
+    key_env: null                 # open API, no key, no auth
+    rate_limit_per_s: 1
+    supports_point_in_time: true  # ...but only within the served window:
+    # The open API serves a ROLLING ~3-MONTH WINDOW. You cannot backfill tone for
+    # a replay of 2024. Hence scripts/gdelt_collect.py, which starts accumulating
+    # before the provider layer exists.
+    #
+    # UNVERIFIED, and worth resolving at Stage 2: GDELT's own announcement says
+    # the API searches "a rolling window of the last 3 months" while also
+    # referring to an index reaching back to 2017-01-01. Those are not obviously
+    # reconcilable. `scripts/gdelt_collect.py --probe-window` measures it.
+    #
+    # Any replay earlier than the cache start must return sentiment as None WITH
+    # A STATED REASON -- never zero, never a neutral default. A silent zero is
+    # indistinguishable from genuinely neutral coverage and will quietly corrupt
+    # the ablation that decides whether sentiment earns its place.
+
+  cboe:
+    role: "equity put/call ratio, market-wide sentiment"
+    base_url: "https://cdn.cboe.com/api/global/us_indices/daily_statistics"
+    key_env: null
+    supports_point_in_time: true  # archive back to 2006, backfillable any time
+
+# Deliberately not used, with the reason, so nobody re-litigates it (§7.3):
+#   alpha_vantage  -- 25 requests/day. Unusable for anything but a one-off.
+#   x_twitter      -- no free tier for new developers; full-archive search is
+#                     Enterprise-only. Fails on cost AND point-in-time at once.
+#   single outlets -- a house-view sample, not a measurement; no archive; HTML
+#                     schemas churn (the failure mode that demoted yfinance).
+#   naaim          -- moved to subscription access 2026-08-01.
+#   aaii           -- historical spreadsheet behind membership, so it cannot
+#                     anchor a percentile.
+#   pytrends       -- OPTIONAL and off by default. Its values are relative to the
+#                     requested window, so the same date returns different
+#                     numbers depending on the query range: a genuine replay
+#                     hazard. If ever used, snapshot at as_of, cache, and never
+#                     re-query a cached date.
