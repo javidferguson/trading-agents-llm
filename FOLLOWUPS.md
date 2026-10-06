@@ -59,6 +59,17 @@ fully fixed:
 
 Both were found by reading output, not by tests, and neither blocks the gate.
 
+## Stage 4 residual
+
+- **TSM has no `value` block.** Its share count is not under any concept name
+  we try, and an ADR's share count differs from the ordinary shares anyway, so
+  there is no market cap and therefore no yields. Honest rather than wrong —
+  every one of those metrics states the reason. Fixing it means mapping ADR
+  ratios, which is a real piece of work rather than another alias.
+- **All four analysts frequently return `neutral`.** Sometimes correct, but it
+  reads like hedging. §11's calibration plot is the thing that will actually
+  answer whether their confidence means anything, and that is Stage 8.
+
 ## Smaller things
 
 - **`make gdelt-probe` has never run.** §7.5 flags a contradiction in GDELT's

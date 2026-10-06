@@ -154,3 +154,82 @@ def build_decision_graph(ctx: NodeContext, *, checkpoint: bool = False) -> Any:
         ctx,
         checkpoint=checkpoint,
     )
+
+
+def build_research_graph(ctx: NodeContext, *, checkpoint: bool = False) -> Any:
+    """Stage 4: four analysts in parallel, then a bounded research debate.
+
+        prefetch
+           |
+           +--> market_analyst -------+
+           +--> news_analyst ---------+
+           +--> positioning_analyst --+--> bull -> bear -> facilitator
+           +--> fundamentals_analyst -+              |
+                                           (continue)|(stop)
+                                              ^------+--> trader -> persist
+
+    Two shapes LangGraph is genuinely good at, and the reason §1 kept it: a
+    fan-out whose branches merge, and a conditional edge that loops.
+
+    **The fan-out is where the reducer bug lives.** Four nodes appending to
+    `llm_calls`, `errors` and `debate_turns` will silently overwrite each
+    other without add-reducer annotations -- nothing raises, you just lose
+    three of four. `tests/graph/test_reducers.py` has guarded that since Stage
+    0, which is why this assembly is a few lines rather than a debugging
+    session.
+    """
+    from .nodes.analysts import ANALYSTS, make_analyst
+    from .nodes.market_analyst import market_analyst  # noqa: F401  (Stage 3 shim)
+    from .nodes.persist import persist
+    from .nodes.prefetch import prefetch
+    from .nodes.researchers import make_researcher, research_facilitator
+    from .nodes.trader import trader
+
+    graph = StateGraph(DecisionState)
+
+    for name, fn in (
+        ("prefetch", prefetch),
+        ("bull_researcher", make_researcher("bull")),
+        ("bear_researcher", make_researcher("bear")),
+        ("research_facilitator", research_facilitator),
+        ("trader", trader),
+        ("persist", persist),
+    ):
+        graph.add_node(name, _bind(name, fn, ctx))
+
+    for kind, node_name in ANALYSTS.items():
+        graph.add_node(node_name, _bind(node_name, make_analyst(kind), ctx))
+
+    graph.add_edge(START, "prefetch")
+    for node_name in ANALYSTS.values():
+        graph.add_edge("prefetch", node_name)
+        graph.add_edge(node_name, "bull_researcher")
+
+    graph.add_edge("bull_researcher", "bear_researcher")
+    graph.add_edge("bear_researcher", "research_facilitator")
+
+    graph.add_conditional_edges(
+        "research_facilitator",
+        _debate_router,
+        {"continue": "bull_researcher", "stop": "trader"},
+    )
+    graph.add_edge("trader", "persist")
+    graph.add_edge("persist", END)
+
+    return graph.compile(checkpointer=_saver(checkpoint))
+
+
+def _debate_router(state: DecisionState) -> str:
+    """Another round, or on to the trader?
+
+    Reads the ``stop_reason`` the facilitator already computed rather than
+    re-deciding: one place decides, and the transcript records what it
+    decided. A router with its own opinion is a fifth termination condition
+    nobody documented.
+
+    The ``or "max_rounds"`` is a deadlock guard. A conditional edge that can
+    return "continue" forever is an infinite graph, and a missing stop_reason
+    is a bug in the facilitator rather than licence to loop -- so an
+    unrecognised state stops.
+    """
+    return "stop" if (state.research_debate.stop_reason or "max_rounds") else "continue"

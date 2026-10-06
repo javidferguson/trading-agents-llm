@@ -186,6 +186,70 @@ class AnalystReport(Degradable):
         }
 
 
+class DebateTurn(BaseModel):
+    """One speaker's contribution to one round (§4)."""
+
+    round: int = Field(ge=1)
+    speaker: str
+    claim: str
+    #: Which analyst reports this claim rests on. Named so the facilitator can
+    #: see when two speakers are citing the same single report and calling it
+    #: corroboration -- §15.2's failure in miniature.
+    supporting_report_kinds: list[str] = Field(default_factory=list)
+    rebuts: str | None = None
+
+    #: Facilitator-verified, and it drives the novelty stop. Self-reported
+    #: novelty would be worthless: a model restating itself believes it is
+    #: making a new point.
+    new_information: bool = False
+
+
+class DebateTranscript(BaseModel):
+    """Every turn, plus why the debate stopped (§4)."""
+
+    turns: list[DebateTurn] = Field(default_factory=list)
+    rounds_completed: int = 0
+    stop_reason: Literal[
+        "max_rounds", "converged", "no_novelty", "budget", "error"
+    ] | None = None
+
+    def turns_in(self, round_number: int) -> list[DebateTurn]:
+        return [t for t in self.turns if t.round == round_number]
+
+    def claims_by(self, speaker: str) -> list[str]:
+        return [t.claim for t in self.turns if t.speaker == speaker]
+
+
+class ResearchVerdict(Degradable):
+    """The facilitator's call at the end of the research debate (§4)."""
+
+    winner: Literal["bull", "bear", "tie"]
+    thesis: str
+    #: Required, and never dropped. §4 puts it here because this is where the
+    #: paper's explainability claim cashes out: it becomes FinalDecision.dissent
+    #: and surfaces in the confirmation prompt a human reads before approving.
+    strongest_counterargument: str
+    confidence: float = Field(ge=0, le=1)
+
+    #: The facilitator's own read on whether another round would add anything.
+    #: Advisory only -- conditions 1 and 4 are hard caps in Python, and §5 is
+    #: explicit that the model never decides alone when to stop.
+    converged: bool = False
+    converged_reason: str = ""
+
+    @classmethod
+    def _degraded_defaults(cls) -> dict[str, Any]:
+        return {
+            "winner": "tie",
+            "thesis": "No usable verdict: the facilitator returned nothing valid.",
+            "strongest_counterargument":
+                "No argument was recorded on either side.",
+            "confidence": 0.0,
+            "converged": False,
+            "converged_reason": "",
+        }
+
+
 class TraderProposal(Degradable):
     """What the trader wants to do (§4).
 
@@ -400,12 +464,32 @@ class DecisionState(BaseModel):
     #: keep models/state.py free of a market-data import cycle.
     snapshot: Any | None = None
 
-    analyst_reports: dict[str, AnalystReport] = Field(default_factory=dict)
+    #: Written by FOUR PARALLEL NODES, one key each, so it needs a reducer
+    #: exactly like the lists below. `operator.or_` is dict merge.
+    #:
+    #: §4 warns that parallel appends "will silently overwrite each other"
+    #: without this -- and the list fields were annotated at Stage 0 for that
+    #: reason. This dict was not, and the fan-out failed on the first live run
+    #: with "At key 'analyst_reports': Can receive only one value per step."
+    #:
+    #: Worth recording: LangGraph 1.2 RAISED rather than silently keeping one
+    #: of four. §4 was written against the silent behaviour, so the trap is
+    #: now loud -- but only for fields it can see are concurrent, which is why
+    #: the annotation is still the actual fix.
+    analyst_reports: Annotated[dict[str, AnalystReport], operator.or_] = Field(
+        default_factory=dict
+    )
+
+    #: Accumulating across rounds, so it needs a reducer like llm_calls. The
+    #: bull and bear both append within one round.
+    debate_turns: Annotated[list[DebateTurn], operator.add] = Field(default_factory=list)
+    research_debate: DebateTranscript = Field(default_factory=DebateTranscript)
+    research_verdict: ResearchVerdict | None = None
+
     trader_proposal: TraderProposal | None = None
     final_decision: FinalDecision | None = None
 
     # --- arriving in later stages --------------------------------------------
-    # Stage 4: research_debate, research_verdict
     # Stage 5: risk_debate
     # Stage 6: intent, portfolio, violations
     # Stage 9: memory_hits, regime
@@ -424,7 +508,10 @@ NodePatch = dict[str, Any]
 
 __all__ = [
     "AnalystReport",
+    "DebateTranscript",
+    "DebateTurn",
     "FinalDecision",
+    "ResearchVerdict",
     "TraderProposal",
     "DecisionState",
     "Degradable",

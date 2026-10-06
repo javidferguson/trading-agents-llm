@@ -358,9 +358,12 @@ def cmd_toy_graph(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 
 
-async def _run_decide(symbol: str, as_of: date, preset: str | None) -> int:
-    from .graph.build import build_decision_graph
+async def _run_decide(
+    symbol: str, as_of: date, preset: str | None, slice_only: bool = False
+) -> int:
+    from .graph.build import build_decision_graph, build_research_graph
     from .llm.router import LLMRouter
+    from .models.budget import RunBudget
     from .models.state import DecisionState
     from .prompts import prompt_pack_version
     from .providers.registry import ProviderRegistry
@@ -377,10 +380,17 @@ async def _run_decide(symbol: str, as_of: date, preset: str | None) -> int:
     router = LLMRouter.from_config(settings, preset=preset)
     registry = ProviderRegistry.from_config(settings)
 
+    models_cfg = load_yaml("models.yaml")
+    debate_cfg = models_cfg.get("debate") or {}
+    budget = RunBudget.from_config(models_cfg)
+
     ctx = NodeContext(
         settings=settings, mode=settings.mode, as_of=as_of,
         config_hash=hashed, prompt_pack_version=prompt_pack_version(),
-        extras={"router": router, "registry": registry},
+        extras={
+            "router": router, "registry": registry, "budget": budget,
+            "max_research_rounds": int(debate_cfg.get("max_research_rounds", 1)),
+        },
     )
 
     initial = DecisionState(
@@ -392,8 +402,8 @@ async def _run_decide(symbol: str, as_of: date, preset: str | None) -> int:
     print(f"prompts={ctx.prompt_pack_version}  config={hashed}  mode={ctx.mode.value}\n")
 
     try:
-        graph = build_decision_graph(ctx)
-        result = await graph.ainvoke(initial)
+        graph = (build_decision_graph if slice_only else build_research_graph)(ctx)
+        result = await graph.ainvoke(initial, {"recursion_limit": 60})
     finally:
         await router.aclose()
         flush_tracing()
@@ -413,6 +423,19 @@ async def _run_decide(symbol: str, as_of: date, preset: str | None) -> int:
             print(f"  - {' '.join(point.split())}")
         if report.data_gaps:
             print(f"  gaps: {'; '.join(report.data_gaps)}")
+        print()
+
+    debate = state.research_debate
+    if debate.turns:
+        print(f"DEBATE  {debate.rounds_completed} round(s), "
+              f"stopped: {debate.stop_reason}")
+        for turn in debate.turns:
+            flag = "" if turn.new_information else "  [no new information]"
+            print(f"  r{turn.round} {turn.speaker:<5} {' '.join(turn.claim.split())[:120]}{flag}")
+        verdict = state.research_verdict
+        if verdict is not None:
+            print(f"  verdict: {verdict.winner} @ {verdict.confidence:.2f}"
+                  + (f" (converged: {verdict.converged_reason})" if verdict.converged else ""))
         print()
 
     if decision is None:
@@ -446,7 +469,7 @@ def cmd_decide(args: argparse.Namespace) -> int:
     """Run the vertical slice and write proposal.json."""
     setup_logging()
     as_of = date.fromisoformat(args.as_of) if args.as_of else date.today()
-    return asyncio.run(_run_decide(args.symbol.upper(), as_of, args.preset))
+    return asyncio.run(_run_decide(args.symbol.upper(), as_of, args.preset, args.slice))
 
 
 # --------------------------------------------------------------------------- #
@@ -670,6 +693,8 @@ def build_parser() -> argparse.ArgumentParser:
     dec = sub.add_parser("decide", help="Stage 3 exit gate: a real decision -> proposal.json")
     dec.add_argument("--symbol", default="MSFT")
     dec.add_argument("--as-of", default=None, help="YYYY-MM-DD (default: today)")
+    dec.add_argument("--slice", action="store_true",
+                     help="Stage 3 shape: one analyst, no debate")
     dec.add_argument("--preset", default="all_local",
                      help="models.yaml preset (default all_local -- hosted is Stage 5)")
     dec.set_defaults(func=cmd_decide)

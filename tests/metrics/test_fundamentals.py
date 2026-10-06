@@ -381,3 +381,70 @@ def test_an_amended_statement_still_counts_as_provenance() -> None:
     ]})
     filed, form = f.latest_filing
     assert form == "10-K/A" and filed == date(2026, 3, 15)
+
+
+# --------------------------------------------------------------------------- #
+# Foreign private issuers -- found by a live Stage 4 run
+# --------------------------------------------------------------------------- #
+
+
+def facts_multi(concepts: dict[str, dict[str, list[dict]]]) -> CompanyFacts:
+    """Facts with explicit taxonomy and unit nesting."""
+    built: dict[str, dict] = {}
+    for key, units in concepts.items():
+        taxonomy, name = key.split("/", 1)
+        built.setdefault(taxonomy, {})[name] = {"units": units}
+    return CompanyFacts(symbol="TSM", cik="0001046179", entity_name="TSMC",
+                        facts=built, as_of=date(2026, 10, 6))
+
+
+def test_ifrs_concepts_are_found_for_a_20f_filer() -> None:
+    """A 20-F filer uses IFRS exclusively.
+
+    Measured: TSM's company facts carry 334 `ifrs-full` concepts and ZERO
+    `us-gaap` ones, so a us-gaap-only lookup found nothing and the fundamentals
+    analyst reported having no data at all -- for a company that files
+    perfectly good financials.
+    """
+    f = facts_multi({"ifrs-full/Revenue": {"USD": [
+        year("2025-01-01", "2025-12-31", 88_000_000_000, "2026-04-16"),
+    ]}})
+    assert fun.ttm(f, fun.REVENUE) == pytest.approx(88e9)
+
+
+def test_a_concept_never_mixes_two_currencies() -> None:
+    """The subtler half, and the more dangerous.
+
+    TSM reports Revenue, Assets, Equity and ProfitLoss under BOTH 'TWD' and
+    'USD'. Flattening every unit into one series interleaved two currencies
+    and sorted by date, so whichever happened to be last won -- and
+    book_to_price would divide a Taiwan-dollar equity by a US-dollar market
+    cap, producing a number roughly 32x wrong that looks entirely plausible.
+    """
+    f = facts_multi({"ifrs-full/Revenue": {
+        "TWD": [year("2025-01-01", "2025-12-31", 2_894_000_000_000, "2026-04-16")],
+        "USD": [year("2025-01-01", "2025-12-31", 88_000_000_000, "2026-04-16")],
+    }})
+
+    assert f.unit_for("Revenue") == "USD", "USD is preferred; the price side is USD"
+    revenue = fun.ttm(f, fun.REVENUE)
+    assert revenue == pytest.approx(88e9)
+    assert revenue != pytest.approx(2.894e12), "the TWD series must not leak in"
+
+
+def test_a_single_currency_filer_gets_that_currency() -> None:
+    """Not every foreign filer helpfully reports USD too."""
+    f = facts_multi({"ifrs-full/Revenue": {
+        "TWD": [year("2025-01-01", "2025-12-31", 2_894_000_000_000, "2026-04-16")],
+    }})
+    assert f.unit_for("Revenue") == "TWD"
+    assert fun.ttm(f, fun.REVENUE) == pytest.approx(2.894e12)
+
+
+def test_us_gaap_wins_when_a_filer_has_both_taxonomies() -> None:
+    """Order matters: a domestic filer's us-gaap series is the canonical one."""
+    f = facts_multi({
+        "us-gaap/Revenues": {"USD": [year("2025-01-01", "2025-12-31", 100, "2026-02-01")]},
+        "ifrs-full/Revenue": {"USD": [year("2025-01-01", "2025-12-31", 999, "2026-02-01")]},
+    })
+    assert fun.ttm(f, fun.REVENUE) == pytest.approx(100)

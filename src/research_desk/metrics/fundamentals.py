@@ -32,36 +32,87 @@ from .indicators import _Block
 logger = logging.getLogger(__name__)
 
 # --- concept aliases, in preference order ---------------------------------- #
+#
+# Each list mixes US GAAP and IFRS spellings, because a 20-F filer uses the
+# latter exclusively. `CompanyFacts.concept` searches us-gaap then ifrs-full,
+# so an IFRS name only has to be present somewhere in the list.
+#
+# Measured on TSM, whose facts carry 334 ifrs-full concepts and no us-gaap at
+# all -- a us-gaap-only lookup reported "no fundamentals data" for a company
+# that files perfectly good financials.
 
 REVENUE = [
     "RevenueFromContractWithCustomerExcludingAssessedTax",
     "Revenues",
     "RevenueFromContractWithCustomerIncludingAssessedTax",
     "SalesRevenueNet",
+    "Revenue",                              # IFRS
+    "RevenueFromContractsWithCustomers",     # IFRS
 ]
-NET_INCOME = ["NetIncomeLoss", "ProfitLoss"]
+NET_INCOME = [
+    "NetIncomeLoss",
+    "ProfitLoss",                            # IFRS (and some US filers)
+    "ProfitLossAttributableToOwnersOfParent",
+]
 GROSS_PROFIT = ["GrossProfit"]
-OPERATING_INCOME = ["OperatingIncomeLoss"]
-CFO = ["NetCashProvidedByUsedInOperatingActivities",
-       "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"]
-CAPEX = ["PaymentsToAcquirePropertyPlantAndEquipment",
-         "PaymentsToAcquireProductiveAssets"]
+OPERATING_INCOME = [
+    "OperatingIncomeLoss",
+    "ProfitLossFromOperatingActivities",      # IFRS
+]
+CFO = [
+    "NetCashProvidedByUsedInOperatingActivities",
+    "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+    "CashFlowsFromUsedInOperatingActivities",  # IFRS
+]
+CAPEX = [
+    "PaymentsToAcquirePropertyPlantAndEquipment",
+    "PaymentsToAcquireProductiveAssets",
+    "PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities",  # IFRS
+]
 ASSETS = ["Assets"]
-ASSETS_CURRENT = ["AssetsCurrent"]
-LIABILITIES_CURRENT = ["LiabilitiesCurrent"]
-EQUITY = ["StockholdersEquity",
-          "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"]
-LONG_TERM_DEBT = ["LongTermDebtNoncurrent", "LongTermDebt"]
+ASSETS_CURRENT = ["AssetsCurrent", "CurrentAssets"]
+LIABILITIES_CURRENT = ["LiabilitiesCurrent", "CurrentLiabilities"]
+EQUITY = [
+    "StockholdersEquity",
+    "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+    "Equity",                                 # IFRS
+    "EquityAttributableToOwnersOfParent",
+]
+LONG_TERM_DEBT = [
+    "LongTermDebtNoncurrent",
+    "LongTermDebt",
+    "NoncurrentPortionOfNoncurrentBorrowings",  # IFRS
+]
 SHORT_TERM_DEBT = ["ShortTermBorrowings", "LongTermDebtCurrent"]
-CASH = ["CashAndCashEquivalentsAtCarryingValue",
-        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"]
-INTEREST = ["InterestExpense", "InterestExpenseDebt",
-            "InterestIncomeExpenseNet"]
-DA = ["DepreciationDepletionAndAmortization", "DepreciationAmortizationAndAccretionNet",
-      "DepreciationAndAmortization"]
-EPS = ["EarningsPerShareDiluted", "EarningsPerShareBasic"]
-SHARES = ["CommonStockSharesOutstanding", "WeightedAverageNumberOfDilutedSharesOutstanding",
-          "WeightedAverageNumberOfSharesOutstandingBasic"]
+CASH = [
+    "CashAndCashEquivalentsAtCarryingValue",
+    "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+    "CashAndCashEquivalents",                 # IFRS
+]
+INTEREST = [
+    "InterestExpense",
+    "InterestExpenseDebt",
+    "InterestIncomeExpenseNet",
+    "FinanceCosts",                           # IFRS
+]
+DA = [
+    "DepreciationDepletionAndAmortization",
+    "DepreciationAmortizationAndAccretionNet",
+    "DepreciationAndAmortization",
+    "DepreciationAndAmortisationExpense",     # IFRS (note the s)
+]
+EPS = [
+    "EarningsPerShareDiluted",
+    "EarningsPerShareBasic",
+    "DilutedEarningsLossPerShare",            # IFRS
+    "BasicEarningsLossPerShare",
+]
+SHARES = [
+    "CommonStockSharesOutstanding",
+    "WeightedAverageNumberOfDilutedSharesOutstanding",
+    "WeightedAverageNumberOfSharesOutstandingBasic",
+    "NumberOfSharesOutstanding",               # IFRS
+]
 
 #: A duration fact counts as a quarter or a year if its span is near these.
 QUARTER_DAYS = (80, 100)

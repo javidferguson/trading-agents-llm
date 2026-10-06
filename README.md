@@ -28,7 +28,7 @@ Two processes that communicate through a file, never a shared event loop:
 | **1** | LLM router + structured output | **done** |
 | 2 | Providers, cache, metrics | **2a-2c done** (76 metrics); Finnhub + FRED need keys |
 | **3** | Vertical slice → `proposal.json` | **done** |
-| 4 | Analysts + research debate | not started |
+| **4** | Analysts + research debate | **done** |
 | 5 | Risk debate + fund manager | not started |
 | 6 | Intent, sizing, compliance | not started |
 | 7 | Execution + confirmation gate | not started |

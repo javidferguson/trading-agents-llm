@@ -465,13 +465,52 @@ class CompanyFacts:
         self.facts = facts
         self.as_of = as_of
 
-    def concept(self, name: str, taxonomy: str = "us-gaap") -> list[dict[str, Any]]:
-        """Every visible fact for one XBRL concept, oldest first."""
+    #: Taxonomies searched, in order. **`ifrs-full` is not optional.**
+    #:
+    #: A foreign private issuer files a 20-F under IFRS, not US GAAP. Measured:
+    #: TSM's company facts carry 334 `ifrs-full` concepts and ZERO `us-gaap`
+    #: ones, so a us-gaap-only lookup found nothing and the fundamentals
+    #: analyst correctly reported having no data at all -- for a company that
+    #: files perfectly good financials.
+    TAXONOMIES = ("us-gaap", "ifrs-full")
+
+    def concept(self, name: str, taxonomy: str | None = None) -> list[dict[str, Any]]:
+        """Every visible fact for one XBRL concept, oldest first.
+
+        Searches US GAAP then IFRS unless a taxonomy is named.
+        """
+        if taxonomy is None:
+            for candidate in self.TAXONOMIES:
+                rows = self.concept(name, candidate)
+                if rows:
+                    return rows
+            return []
+
         node = (self.facts.get(taxonomy) or {}).get(name) or {}
-        rows: list[dict[str, Any]] = []
-        for unit_rows in (node.get("units") or {}).values():
-            rows.extend(unit_rows)
+        units = node.get("units") or {}
+        if not units:
+            return []
+
+        # ONE UNIT, NEVER A MIX. Measured: TSM reports Revenue, Assets, Equity
+        # and ProfitLoss under BOTH 'TWD' and 'USD'. Flattening every unit into
+        # one series interleaved two currencies and then sorted by date, so
+        # whichever happened to be last won -- and `book_to_price` would divide
+        # a Taiwan-dollar equity by a US-dollar market cap, producing a number
+        # roughly 32x wrong that looks entirely plausible.
+        #
+        # USD is preferred because the price side of every ratio is USD. A
+        # filer reporting in one currency only gets that one.
+        unit = "USD" if "USD" in units else sorted(units)[0]
+        rows = list(units[unit])
         return sorted(rows, key=lambda r: (r.get("end") or "", r.get("filed") or ""))
+
+    def unit_for(self, name: str) -> str | None:
+        """Which currency a concept is reported in, after the USD preference."""
+        for taxonomy in self.TAXONOMIES:
+            units = ((self.facts.get(taxonomy) or {}).get(name) or {}).get("units") or {}
+            if units:
+                return "USD" if "USD" in units else sorted(units)[0]
+        return None
 
     def has(self, name: str, taxonomy: str = "us-gaap") -> bool:
         return bool(self.concept(name, taxonomy))

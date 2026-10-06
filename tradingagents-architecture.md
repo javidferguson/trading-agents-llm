@@ -309,6 +309,24 @@ class DecisionState(BaseModel):
     errors: list[NodeError] = []
 ```
 
+**Reducers, as found at Stage 4.** The list fields were annotated at Stage 0
+because §4 names them. `analyst_reports` is a **dict**, was not annotated, and
+the four-way fan-out failed on its first live run:
+
+```
+InvalidUpdateError: At key 'analyst_reports': Can receive only one value
+per step. Use an Annotated key to handle multiple values.
+```
+
+Two things worth keeping. LangGraph 1.2 **raises** where this section expected
+a silent overwrite, so the trap is louder than documented — but only for
+fields it can see are concurrent, so the annotation (`operator.or_` for dicts)
+is still the fix. And a reducer test covering only the shapes a doc happened to
+list is a test covering the bugs you already knew about;
+`test_every_concurrently_written_field_has_a_reducer` now asserts statically
+that every collection on `DecisionState` carries one, which is what will catch
+the risk trio at Stage 5.
+
 Three details that pay for themselves:
 
 - **`LLMCallRecord` stores the raw response**, enabling `mode="replay_llm"`:
@@ -728,6 +746,24 @@ the other 11 are surfaced separately so a small discretionary count is visibly
 now returns **403**. The third provider after Stooq and Stooq's bulk archive to
 have closed. It costs the put/call raw field but **not** the regime tag, which
 §7.2 deliberately built from VIX, the curve and SPY's 200-day only.
+
+**Foreign private issuers, found by a live Stage 4 run.** Two bugs, one
+subtle and dangerous:
+
+- **A 20-F filer uses IFRS, not US GAAP.** TSM's company facts carry 334
+  `ifrs-full` concepts and **zero** `us-gaap` ones, so a us-gaap-only lookup
+  reported "no fundamentals data" for a company that files perfectly good
+  financials. The concept-alias lists now carry both spellings and
+  `CompanyFacts.concept` searches us-gaap then ifrs-full. TSM went from 52 to
+  67 populated metrics.
+- **The same concept can be reported in two currencies.** TSM reports Revenue,
+  Assets, Equity and ProfitLoss under **both `TWD` and `USD`**. Flattening
+  every unit into one series interleaved two currencies and sorted by date, so
+  whichever happened to be last won — and `book_to_price` would divide a
+  Taiwan-dollar equity by a US-dollar market cap, producing a number roughly
+  32x wrong *that looks entirely plausible*. One unit per concept now, USD
+  preferred because the price side of every ratio is USD. Verified: TSM's
+  gross margin comes back at 56.1%, which is correct.
 
 Deliberately **not** used:
 

@@ -152,6 +152,104 @@ def render_snapshot(snapshot: MarketSnapshot, *, include_gaps: bool = True) -> s
     return "\n".join(lines).rstrip() + "\n"
 
 
+#: Which metric blocks each analyst sees. **Deliberately disjoint.**
+#:
+#: §15.2: *"Multi-agent debate manufactures confident consensus. Three agents
+#: agreeing is not three pieces of evidence -- they read the same reports."*
+#: If all four analysts read the whole snapshot they will agree, and the
+#: debate becomes theatre performed over one opinion held four times.
+#:
+#: §3 already applies this reasoning once: a separate sentiment node was
+#: rejected because it "would have read the same articles as the news node and
+#: then agreed with it -- which is precisely the 'three agents agreeing is not
+#: three pieces of evidence' failure". Disjoint slices are that rule enforced
+#: rather than hoped for.
+ANALYST_BLOCKS: dict[str, tuple[str, ...]] = {
+    "market": ("trend", "risk", "mean_reversion", "relative_strength"),
+    "news": ("sentiment",),
+    "positioning": ("positioning",),
+    "fundamentals": ("value", "quality", "growth"),
+}
+
+#: The minimum shared context. Without a price level a fundamentals analyst
+#: cannot say whether a yield is attractive, and every analyst needs to know
+#: which symbol and date it is looking at. Kept deliberately thin: anything
+#: added here is seen by all four and erodes their independence.
+def _shared_header(snapshot: MarketSnapshot) -> list[str]:
+    lines = [
+        f"Symbol: {snapshot.symbol}",
+        f"As of: {snapshot.as_of.isoformat()}",
+    ]
+    close = snapshot.trend.available().get("close")
+    if close is not None:
+        lines.append(f"Last close: {_format(close)}")
+    return lines
+
+
+def render_for_analyst(snapshot: MarketSnapshot, kind: str) -> str:
+    """The facts ONE analyst sees. Its own blocks, and nothing else.
+
+    Returns the slice even when empty; ``has_facts_for`` tells the caller
+    whether a model call is worth making at all.
+    """
+    blocks = ANALYST_BLOCKS.get(kind, ())
+    lines = _shared_header(snapshot) + [""]
+
+    gaps: dict[str, str] = {}
+    for name in blocks:
+        block = getattr(snapshot, name, None)
+        if block is None:
+            continue
+        for metric, reason in block.gaps.items():
+            gaps[f"{name}.{metric}"] = reason
+        available = block.available()
+        if not available:
+            continue
+        lines.append(BLOCK_TITLES.get(name, name))
+        for key, value in available.items():
+            unit = UNITS.get(key)
+            suffix = f"   [{unit}]" if unit else ""
+            lines.append(f"  {key:<32} {_format(value)}{suffix}")
+        lines.append("")
+
+    if gaps:
+        lines.append(
+            f"NOT AVAILABLE in your area ({len(gaps)}). These are absent, not "
+            "zero -- do not estimate them, and name them in data_gaps if they "
+            "matter to your read:"
+        )
+        by_reason: dict[str, list[str]] = {}
+        for metric, reason in sorted(gaps.items()):
+            by_reason.setdefault(reason, []).append(metric)
+        for reason, metrics in sorted(by_reason.items(), key=lambda kv: -len(kv[1])):
+            if len(metrics) == 1:
+                lines.append(f"  {metrics[0]}: {reason}")
+            else:
+                lines.append(f"  {', '.join(metrics)}")
+                lines.append(f"      -> {reason}")
+        lines.append("")
+
+    lines.append(
+        "You have deliberately NOT been shown the other analysts' areas. Your "
+        "report is one independent reading, not a summary of the whole picture."
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def has_facts_for(snapshot: MarketSnapshot, kind: str) -> bool:
+    """Whether this analyst has anything at all to read.
+
+    A model call over an empty slice costs ~30 s of local inference to produce
+    a confident report about nothing. The caller degrades instead, with the
+    reason -- which is both cheaper and more honest.
+    """
+    return any(
+        getattr(snapshot, name).available()
+        for name in ANALYST_BLOCKS.get(kind, ())
+        if getattr(snapshot, name, None) is not None
+    )
+
+
 def render_intent(intent: dict[str, Any]) -> str:
     """Portfolio intent, for the TRADER and FUND MANAGER only (§8).
 
