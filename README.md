@@ -25,7 +25,7 @@ Two processes that communicate through a file, never a shared event loop:
 | Stage | Deliverable | State |
 |---|---|---|
 | **0** | Skeleton, pinned deps, compose, Langfuse, toy graph | **done** |
-| 1 | LLM router + structured output | not started |
+| **1** | LLM router + structured output | **done** |
 | 2 | Providers, cache, metrics | not started |
 | 3 | Vertical slice → `proposal.json` | not started |
 | 4 | Analysts + research debate | not started |
@@ -62,6 +62,12 @@ report.
   letting Stage 1 die on a 404 that looks like a router bug.
 - `make toy-graph` — the Stage 0 exit gate: a two-node LangGraph run whose nodes
   both appear as spans in Langfuse.
+- `make smoke` — the Stage 1 exit gate: a real `AnalystReport` out of a local 8B
+  model, showing attempts, latency, tokens and the model digest.
+
+The live model tests are deselected from `make test` (they add ~30s and need
+Ollama up); `make test-smoke` runs them explicitly, and `make verify` includes
+them.
 
 ## Never run both IB Gateways at once
 

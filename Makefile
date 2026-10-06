@@ -131,6 +131,14 @@ print('\n'.join(sorted({v['model'] for v in p.values() if v.get('provider')=='ol
 toy-graph:  ## THE STAGE 0 GATE: run two nodes, see two spans in Langfuse
 	$(UV) run desk toy-graph --symbol $${SYMBOL:-SPY}
 
+.PHONY: smoke
+smoke:  ## THE STAGE 1 GATE: a real AnalystReport from a local 8B model
+	$(UV) run desk smoke
+
+.PHONY: test-smoke
+test-smoke:  ## Run the live model tests, failing if they are skipped
+	$(UV) run pytest tests/llm/test_smoke_ollama.py -p no:randomly -q -rs -m smoke
+
 # --------------------------------------------------------------------------- #
 # Containers
 # --------------------------------------------------------------------------- #
@@ -197,14 +205,17 @@ test-layering:  ## Just the architectural boundary tests -- fast, and the ones t
 
 .PHONY: verify
 verify:  ## Run the whole Stage 0 gate in order, stopping at the first failure
-	@echo "=== 1/4  config ============================================"
+	@echo "=== 1/5  config ============================================"
 	@$(MAKE) --no-print-directory config-check
 	@echo
-	@echo "=== 2/4  tests ============================================="
+	@echo "=== 2/5  tests ============================================="
 	@$(UV) run pytest -q
 	@echo
-	@echo "=== 3/4  environment ======================================="
+	@echo "=== 3/5  environment ======================================="
 	@$(MAKE) --no-print-directory doctor
 	@echo
-	@echo "=== 4/4  Stage 0 exit gate ================================="
+	@echo "=== 4/5  Stage 0 exit gate ================================="
 	@$(MAKE) --no-print-directory toy-graph
+	@echo
+	@echo "=== 5/5  Stage 1 exit gate ================================="
+	@$(MAKE) --no-print-directory smoke

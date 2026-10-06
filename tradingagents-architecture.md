@@ -383,6 +383,55 @@ repair turn with the validation error appended → on second failure, return
 `schema.degraded()` with `parse_failed=True`. A degraded analyst report beats a
 crashed 8-minute run.
 
+### What constrained decode actually enforces (measured at Stage 1)
+
+The §2 bet is that constraining the decode beats asking politely. It does — but
+not uniformly, and the gaps are exactly where Pydantic validators have to live.
+Measured against `qwen3:8b` through Ollama's `format=<json_schema>`:
+
+| Constraint | Enforced? |
+|---|---|
+| `enum`, JSON types | **Yes.** `stance` never came back off-list |
+| `$defs` / `$ref`, nested models | **Yes**, including a nested `Evidence` with a `datetime` |
+| `minItems` / `maxItems` | **Yes — but by padding.** Asked for two items against `minItems: 3` it returned `['…', '…', '\n\n']`. The grammar is satisfied and the report is junk |
+| `minimum` / `maximum` | **No.** Asked for a percentage it returned `confidence: 85` against `maximum: 1.0` |
+| Word/sentence counts | Not expressible at all |
+
+Two consequences worth stating plainly, because both were discovered by running
+the thing rather than by reading docs:
+
+1. **Schema-valid is not the same as usable.** The padding case is the clearest
+   example: nothing errors, and a key point is a newline. Anything with a
+   `minItems` needs a validator rejecting blanks.
+2. **The repair turn is a routine path, not an exotic one.** Range violations
+   and length violations both reach it on ordinary runs. Building it at Stage 1
+   rather than Stage 4 was the right call.
+
+### Two things the repair prompt must say, both learned the hard way
+
+- **Ask for margin, not compliance.** Told *"summary is 412 words; the limit is
+  200"*, qwen3:8b returned **304** — it shortened and still failed, burning the
+  only retry. Counting words is arithmetic, and §2's "never let an LLM do
+  arithmetic" applies to the constraints we hand a model, not only to the
+  numbers we ask it for. State limits structurally ("at most 6 short
+  sentences") and tell it to go clearly inside the limit.
+- **The correction must claim priority over the original request.** Asked for
+  confidence *"as a PERCENTAGE"*, the model returned `85`; told it must be
+  `<= 1`, it returned `82`, then `80`. It was still obeying the earlier, more
+  specific instruction, because a validation error states a constraint without
+  saying what to do about it. The repair prompt now says explicitly that it
+  overrides anything conflicting earlier. This is not only an artificial case:
+  any system prompt that disagrees with a schema produces it.
+
+### `think:` is a cost dial, and a large one
+
+qwen3 is a hybrid reasoning model and **thinks by default**. On an identical
+prompt: thinking on produced 579 eval tokens in 8.7 s, thinking off produced 64
+in 2.7 s — the same answer, ~9× the tokens. Structured output stays valid either
+way (reasoning returns in its own field rather than contaminating the JSON), so
+this is purely cost/quality. Default off; raise it only where reasoning is the
+product and an ablation shows it earns the time.
+
 ---
 
 ## 7. Metrics, and the free sources reverse-engineered from them

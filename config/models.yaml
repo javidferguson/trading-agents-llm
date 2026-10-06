@@ -3,7 +3,38 @@
 # Per-node routing is a dict, deliberately. The one node worth paying for is the
 # fund manager; everything else runs locally and free.
 #
-# Read by llm/router.py at Stage 1. Nothing reads it yet.
+# Read by llm/router.py.
+#
+# ---------------------------------------------------------------------------
+# `think:` -- measured, not guessed
+# ---------------------------------------------------------------------------
+# qwen3 is a hybrid reasoning model and thinks BY DEFAULT. On an identical
+# prompt against qwen3:8b: thinking on produced 579 eval tokens in 8.7s;
+# thinking off produced 64 in 2.7s -- the same answer, ~9x the tokens. Across
+# 14 nodes that is the difference between a pipeline you iterate on and one you
+# quietly stop running (§4 of the migration plan: "anywhere, if `decide` stops
+# being fun to iterate on").
+#
+# Structured output stays valid either way -- the reasoning comes back in a
+# separate field rather than contaminating the JSON -- so this is purely a
+# cost/quality dial. Off by default; turn it on for the nodes where the
+# reasoning IS the product, and only if an ablation shows it earns the time.
+#
+# ---------------------------------------------------------------------------
+# What Ollama's constrained decode does and does not enforce
+# ---------------------------------------------------------------------------
+# Measured against qwen3:8b, and it decides which constraints need a Pydantic
+# validator behind them:
+#
+#   enum, types          ENFORCED
+#   minItems/maxItems    ENFORCED -- but satisfied by PADDING. Asked for 2
+#                        items with minItems 3, it returned ['x', 'y', '\n\n'].
+#                        Schema-valid, useless. models/state.py rejects blanks.
+#   minimum/maximum      NOT ENFORCED. Asked for a percentage it returned
+#                        confidence: 85 against maximum: 1.0.
+#   word counts          not expressible at all.
+#
+# So the repair turn is a routine path, not an exotic one.
 
 providers:
   ollama:
@@ -18,11 +49,13 @@ profiles:
     model: "qwen3:8b"
     temperature: 0.3
     num_ctx: 8192
+    think: false   # analysts summarise pre-computed facts; there is nothing to reason out
   deep_local:
     provider: ollama
     model: "qwen3:14b"
     temperature: 0.5
     num_ctx: 16384
+    think: false   # revisit at Stage 4: the facilitator and trader may earn the tokens
   deep_hosted:
     provider: anthropic
     # OPEN ITEM: resolve at Stage 5 against rates current at that time. The cost

@@ -355,6 +355,77 @@ def cmd_toy_graph(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# smoke -- the Stage 1 exit gate
+# --------------------------------------------------------------------------- #
+
+
+async def _run_smoke(node: str, preset: str | None) -> int:
+    from .llm.router import LLMRouter
+    from .llm.structured import structured
+    from .models.state import AnalystReport
+
+    settings = load_settings()
+    router = LLMRouter.from_config(settings, preset=preset)
+    profile = router.profile_for(node)
+    print(f"{node} -> profile {profile.name} ({profile.provider}/{profile.model}, "
+          f"think={profile.think})\n")
+
+    try:
+        result = await structured(
+            router, node, AnalystReport,
+            [
+                {"role": "system", "content":
+                 "You are a market analyst. You are given pre-computed facts. Do not "
+                 "recalculate any number and do not invent numbers that are not shown. "
+                 "Output only JSON matching the schema."},
+                {"role": "user", "content":
+                 "Symbol: SPY\n  Last close 678.42\n  Price above SMA 20/50/200\n"
+                 "  RSI-14 71.2\n  52-week percentile 0.94\n  ATR-14 4.10\n"
+                 "  Fundamentals: unavailable (SPY is an ETF)\n\n"
+                 "Produce your market report."},
+            ],
+            degraded_fields={"kind": "market"},
+        )
+    finally:
+        await router.aclose()
+
+    for record in result.records:
+        status = "parse FAILED" if record.parse_failed else "ok"
+        print(f"  attempt {record.attempt}: {status}  "
+              f"{record.latency_ms}ms  "
+              f"{record.prompt_tokens}->{record.completion_tokens} tok  "
+              f"digest={(record.model_digest or '?')[:12]}")
+
+    report = result.value
+    print()
+    print(f"  stance      {report.stance}  (confidence {report.confidence})")
+    print(f"  summary     {report.summary[:140]}")
+    print(f"  key_points  {len(report.key_points)}")
+    print(f"  data_gaps   {report.data_gaps}")
+    print()
+
+    if result.degraded:
+        print("DEGRADED -- the model never produced a valid report.")
+        print(f"  reason: {report.degraded_reason}")
+        print("This is correct behaviour (architecture §5 -- never fail toward a")
+        print("trade), but the Stage 1 gate is NOT met by a degraded result.")
+        return 1
+
+    print(f"Valid AnalystReport in {result.attempts} attempt(s). Stage 1 gate met.")
+    return 0
+
+
+def cmd_smoke(args: argparse.Namespace) -> int:
+    """Ask a local model for a real AnalystReport and show what came back."""
+    setup_logging()
+    try:
+        return asyncio.run(_run_smoke(args.node, args.preset))
+    except Exception as exc:
+        print(f"FAILED: {exc}", file=sys.stderr)
+        return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="desk", description=__doc__)
     parser.add_argument("--version", action="version", version=__version__)
@@ -366,6 +437,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("config-check", help="parse and validate config/").set_defaults(
         func=cmd_config_check
     )
+
+    smoke = sub.add_parser("smoke", help="Stage 1 exit gate: a real AnalystReport from a local model")
+    smoke.add_argument("--node", default="market_analyst")
+    smoke.add_argument("--preset", default="all_local",
+                       help="models.yaml preset (default all_local -- hosted is Stage 5)")
+    smoke.set_defaults(func=cmd_smoke)
 
     toy = sub.add_parser("toy-graph", help="Stage 0 exit gate: two nodes, two spans")
     toy.add_argument("--symbol", default="SPY")
