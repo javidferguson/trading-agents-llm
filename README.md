@@ -132,6 +132,13 @@ Host ports are deliberately different so a connection is never ambiguous:
 | ORB+GEX `ajj-ib-gateway` | 4002 | 5900 |
 | Research desk `desk-ib-gateway` | **4012** | **5912** |
 
+## Known gaps
+
+[`FOLLOWUPS.md`](FOLLOWUPS.md) lists what is deliberately missing and what
+unblocks it — chiefly two free API keys (Finnhub, FRED), the regime tag that
+depends on FRED, and the GDELT collection, which is the one gap whose cost
+is irreversible.
+
 ## Corrections to the design docs, found while building Stage 0
 
 The two design documents were written before any code existed, so a few claims

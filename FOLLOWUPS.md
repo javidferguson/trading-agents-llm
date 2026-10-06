@@ -1,0 +1,56 @@
+# Known gaps and follow-ups
+
+Deliberate omissions, with what unblocks each. Nothing here is a stub pretending
+to work: every provider that exists is verified against live data, and every
+metric that cannot be computed says why in the snapshot itself.
+
+## Blocked on a free API key
+
+| What | Needs | Consequence today |
+|---|---|---|
+| **Finnhub** — company news, earnings calendar, EPS surprises, recommendation trends | `FINNHUB_API_KEY` (free, 60/min) | No events block. The earnings-blackout compliance check (§9) has no input, so Stage 6 will need this |
+| **FRED** — VIXCLS, DGS10, DGS2, T10Y2Y, DFF, CPIAUCSL, UNRATE, BAMLH0A0HYM2, NFCI | `FRED_API_KEY` (free) | No macro block |
+| **`regime.py`** — §7.2's twelve buckets | FRED, above | **No regime tag.** Two of its three axes are VIX and the curve. Memory retrieval (§3 node 1) keys on `(symbol, regime)`, so Stage 9 is blocked on this |
+
+These were left out rather than written unverified: the two bugs in
+`scripts/fetch_bars.py` were both in code that had never executed, and the
+lesson stuck.
+
+## Retired providers
+
+| Provider | What happened | Replacement |
+|---|---|---|
+| **Stooq** (was §7.3's primary OHLCV) | CSV endpoint serves a JavaScript proof-of-work challenge; bulk archive 401s | IB via the cache bridge |
+| **CBOE** equity put/call | Every documented endpoint 403s | None. Costs a raw field, not the regime tag (§7.2 kept put/call out of the key) |
+
+## GDELT collection is incomplete, and the window is closing
+
+The API throttles aggressively — one request per 5 seconds, enforced with
+sustained per-IP blocks. Collection is **intermittent, not banned**: one run
+got four of fifteen symbols through before being refused.
+
+**Collected (full 90 days):** SPY, MSFT, TSM, BRK.B
+**Not collected:** AAPL, NVDA, AVGO, AMZN, GOOGL, META, JPM, XOM, UNH, JNJ, MRVL
+
+```bash
+uv run python scripts/gdelt_collect.py --days 90      # re-run opportunistically
+uv run python scripts/gdelt_collect.py --status       # see what is missing
+```
+
+This is the **only** gap with an irreversible cost. GDELT serves a rolling ~3
+months, so a day not collected is permanently absent from the Stage 8
+evaluation (§7.5). Re-running picks up where it left off; it is idempotent.
+
+## Smaller things
+
+- **`make gdelt-probe` has never run.** §7.5 flags a contradiction in GDELT's
+  own docs (3-month rolling window vs an index back to 2017) and asks for it to
+  be measured. The probe exists; the throttle has prevented it.
+- **`deep_hosted` points at a placeholder model.** `config/models.yaml` names
+  one; §12 asks for the cost table to be re-derived against current rates at
+  Stage 5.
+- **`confirmation.py` is uncarried.** Its renderer rewrite needs
+  `FinalDecision`, so it lands at Stage 7. The original is in the ORB+GEX repo
+  and at `git show 2005f11:confirmation.py`.
+- **Sector ETFs have no fundamentals and no sentiment.** Expected — they are
+  supporting series for relative strength only.
