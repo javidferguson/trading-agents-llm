@@ -71,11 +71,44 @@ CACHE_DIR = REPO_ROOT / "data" / "cache" / "gdelt"
 
 API = "https://api.gdeltproject.org/api/v2/doc/doc"
 
-#: GDELT is an open API with no key and no published quota, which is not the
-#: same as no limit. One request per second, and we make two per symbol.
-REQUEST_INTERVAL_S = 1.5
+#: GDELT's own rate limit, quoted verbatim from the body of a 429 it returned:
+#:
+#:     "Please limit requests to one every 5 seconds or contact
+#:      kalev.leetaru5@gmail.com for larger queries. All high-traffic users
+#:      should switch to our ngrams dataset..."
+#:
+#: This is not a guess and it is not negotiable by being polite about it. An
+#: earlier value of 1.5s here was over three times too fast and got the IP
+#: throttled, which then looks exactly like the API being down.
+REQUEST_INTERVAL_S = 5.0
 TIMEOUT_S = 45
 USER_AGENT = "research-desk/0.1 (gdelt sentiment cache; contact via repo)"
+
+#: Backoff schedule for 429 and 5xx. GDELT sends NO Retry-After header (checked
+#: against the live API), so the schedule has to be ours.
+#:
+#: DELIBERATELY SHORT, and this is the counter-intuitive part. GDELT's 429 has
+#: two quite different causes:
+#:
+#:   * a momentary burst -- you went faster than one request / 5s. Clears in
+#:     seconds, and one retry fixes it.
+#:   * a SUSTAINED per-IP block, earned by sustained over-use. Measured: an IP
+#:     in this state was still refused after 150s of backoff across four
+#:     retries. It is a penalty box, not a rolling window.
+#:
+#: Retrying hard cannot distinguish them, and in the second case every extra
+#: request is more traffic from an IP that is being punished for traffic --
+#: plausibly extending the block. So: two retries, ~40s. If the second fails we
+#: are in the second case, and the correct move is to stop and wait, which is
+#: what the error then says.
+RETRY_BACKOFF_S = (10.0, 30.0)
+
+#: Status codes worth trying again. 429 is the throttle; 5xx is GDELT having a
+#: moment. Everything else (404, 400) is our bug and retrying just hides it.
+RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
+#: Monotonic timestamp of the last request, for the inter-request gate below.
+_last_request_at: float | None = None
 
 
 class GdeltError(RuntimeError):
@@ -108,23 +141,94 @@ _SSL = _ssl_context()
 # --------------------------------------------------------------------------- #
 
 
-def _get(params: dict[str, str]) -> Any:
-    """One GET, returning parsed JSON.
+def _throttle() -> None:
+    """Block until at least ``REQUEST_INTERVAL_S`` has passed since the last request.
 
-    GDELT answers a malformed or over-broad query with an HTTP 200 carrying a
-    plain-text error, so a status check alone is not enough -- the JSON parse
-    failure is the real signal and it gets reported with the body attached.
+    A clock gate rather than a trailing ``sleep()`` after each call. The
+    difference matters: a trailing sleep ignores how long the request itself
+    took, and it leaves the gap between two back-to-back requests dependent on
+    every call site remembering to sleep. Gating on a monotonic timestamp makes
+    "never less than 5s apart" true by construction, wherever ``_get`` is
+    called from.
+
+    ``time.monotonic`` rather than ``time.time`` so that an NTP correction or a
+    DST change cannot produce a negative interval and let a burst through.
+    """
+    global _last_request_at
+    if _last_request_at is not None:
+        waited = time.monotonic() - _last_request_at
+        remaining = REQUEST_INTERVAL_S - waited
+        if remaining > 0:
+            time.sleep(remaining)
+    _last_request_at = time.monotonic()
+
+
+def _describe(body: str, limit: int = 300) -> str:
+    """Collapse a server message to one readable line."""
+    return " ".join(body.split())[:limit]
+
+
+def _get(params: dict[str, str]) -> Any:
+    """One GET, returning parsed JSON. Rate-limited and retried.
+
+    Three failure shapes, all of which GDELT actually produces:
+
+    1. **HTTP 429 with the explanation in the body.** The body is the only place
+       the rate limit is stated -- there is no Retry-After header. An earlier
+       version of this function formatted ``exc.reason`` ("Too Many Requests")
+       and discarded ``exc.read()``, so the API told us exactly what was wrong
+       and we printed a generic status line. ``HTTPError`` is file-like; read it.
+    2. **HTTP 200 with a plain-text error**, for a malformed or over-broad
+       query. A status check alone will not catch this; the JSON parse failure
+       is the real signal, so the body is attached to the error.
+    3. **Transient network errors**, which get the same backoff as 429.
     """
     url = f"{API}?{urllib.parse.urlencode(params)}"
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    mode = params.get("mode", "?")
 
-    try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT_S, context=_SSL) as response:
-            body = response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        raise GdeltError(f"HTTP {exc.code} for {params.get('mode')}: {exc.reason}") from exc
-    except urllib.error.URLError as exc:
-        raise GdeltError(f"Network error for {params.get('mode')}: {exc.reason}") from exc
+    last_error = ""
+    for attempt in range(len(RETRY_BACKOFF_S) + 1):
+        _throttle()
+        try:
+            with urllib.request.urlopen(request, timeout=TIMEOUT_S, context=_SSL) as response:
+                body = response.read().decode("utf-8", errors="replace")
+            break
+        except urllib.error.HTTPError as exc:
+            # The body carries GDELT's own words. Read it before deciding
+            # anything, including whether to retry.
+            try:
+                detail = _describe(exc.read().decode("utf-8", errors="replace"))
+            except Exception:
+                detail = exc.reason or ""
+            last_error = f"HTTP {exc.code} for {mode}: {detail or exc.reason}"
+            if exc.code not in RETRYABLE_STATUS or attempt >= len(RETRY_BACKOFF_S):
+                if exc.code == 429:
+                    raise GdeltError(
+                        f"{last_error}\n"
+                        "  This survived the full backoff, so it is a SUSTAINED "
+                        "per-IP block rather than a momentary burst.\n"
+                        "  Retrying now adds traffic from an IP already being "
+                        "throttled and may extend it.\n"
+                        "  Wait ~15 minutes, then re-run. Nothing was lost -- "
+                        "`--status` shows what is still missing."
+                    ) from exc
+                raise GdeltError(last_error) from exc
+        except urllib.error.URLError as exc:
+            last_error = f"Network error for {mode}: {exc.reason}"
+            if attempt >= len(RETRY_BACKOFF_S):
+                raise GdeltError(last_error) from exc
+
+        pause = RETRY_BACKOFF_S[attempt]
+        print(
+            f"    {last_error}\n"
+            f"    retrying in {pause:.0f}s "
+            f"({attempt + 1}/{len(RETRY_BACKOFF_S)})",
+            file=sys.stderr,
+        )
+        time.sleep(pause)
+    else:  # pragma: no cover - the loop always breaks or raises
+        raise GdeltError(last_error or f"Gave up on {mode}")
 
     stripped = body.strip()
     if not stripped:
@@ -132,11 +236,34 @@ def _get(params: dict[str, str]) -> Any:
     try:
         return json.loads(stripped)
     except json.JSONDecodeError as exc:
-        raise GdeltError(f"Non-JSON reply for {params.get('mode')}: {stripped[:200]!r}") from exc
+        raise GdeltError(f"Non-JSON reply for {mode}: {_describe(stripped, 200)!r}") from exc
 
 
 def _stamp(day: date, end: bool = False) -> str:
     return day.strftime("%Y%m%d") + ("235959" if end else "000000")
+
+
+def _has_timeline(payload: Any) -> bool:
+    """Did GDELT actually answer, or just hand back something contentless?
+
+    This is the difference between "no articles that day" and "no reply", and
+    conflating them is the single most damaging thing this script could do.
+
+    Observed in the wild: GDELT returns **HTTP 200 with an empty body** when it
+    is unhappy -- still throttled, or the query produced nothing it wants to
+    discuss. An earlier version parsed that into zero series, found no data for
+    any day in the window, and dutifully recorded `articles: 0, observed: True`
+    for every one of them. Those days then look COLLECTED: `--status` shows no
+    gap, nothing ever re-fetches them, and ~3 months later the real numbers are
+    unrecoverable. A false zero is worse than a hole, because a hole is visible.
+
+    So: a payload is an observation only if it carries a `timeline` with at
+    least one series. Anything else is a failed fetch and must not be written.
+    """
+    if not isinstance(payload, dict):
+        return False
+    timeline = payload.get("timeline")
+    return isinstance(timeline, list) and len(timeline) > 0
 
 
 def _series(payload: Any, wanted: str) -> dict[str, float]:
@@ -233,9 +360,21 @@ def collect_symbol(entry: dict[str, Any], start: date, end: date, keep_raw: bool
         "enddatetime": _stamp(end, end=True),
     }
 
+    # No sleep between these two: _get() gates on the clock, so the 5s gap is
+    # enforced whether or not a caller remembers to wait.
     tone_raw = _get({**base, "mode": "timelinetone"})
-    time.sleep(REQUEST_INTERVAL_S)
     volume_raw = _get({**base, "mode": "timelinevolraw"})
+
+    # Refuse to record anything from a contentless reply. See _has_timeline:
+    # writing observed-zero here would permanently fake "no coverage" for every
+    # day in the window, and the window cannot be re-fetched later.
+    if not _has_timeline(volume_raw):
+        raise GdeltError(
+            f"{symbol}: GDELT returned no timeline for "
+            f"{start}..{end} (HTTP 200, empty or unrecognised body). "
+            "Refusing to record -- writing zeros here would look like 'no "
+            "coverage' forever. Left as a gap; `--status` will show it."
+        )
 
     tone = _series(tone_raw, "tone")
     counts = _series(volume_raw, "article count")
@@ -295,10 +434,19 @@ def cmd_collect(args: argparse.Namespace) -> int:
         print("Nothing to collect.", file=sys.stderr)
         return 1
 
-    print(f"GDELT {start} .. {end}  ({args.days} days, {len(universe)} symbols)\n")
+    # At 5s/request and two requests per symbol, this run takes at least
+    # 2 * 5 * len(universe) seconds. Say so up front, and print each symbol
+    # BEFORE fetching it -- otherwise correct, patient behaviour is
+    # indistinguishable from a hang.
+    floor_s = 2 * REQUEST_INTERVAL_S * len(universe)
+    print(f"GDELT {start} .. {end}  ({args.days} days, {len(universe)} symbols)")
+    print(f"Rate limit is one request / {REQUEST_INTERVAL_S:.0f}s, so this takes "
+          f">= {floor_s / 60:.1f} min.\n")
+
     failures = 0
     for index, entry in enumerate(universe):
         symbol = entry["symbol"]
+        print(f"  {symbol:<6} [{index + 1}/{len(universe)}] fetching...", flush=True)
         try:
             recorded = collect_symbol(entry, start, end, keep_raw=args.keep_raw)
         except GdeltError as exc:
@@ -311,8 +459,6 @@ def cmd_collect(args: argparse.Namespace) -> int:
             toned = [d["tone"] for d in window.values() if d["tone"] is not None]
             mean = f"{sum(toned) / len(toned):+.2f}" if toned else "  n/a"
             print(f"  {symbol:<6} {recorded:>3}d  {articles:>6} articles  mean tone {mean}")
-        if index < len(universe) - 1:
-            time.sleep(REQUEST_INTERVAL_S)
 
     print(f"\nCache: {CACHE_DIR}")
     if failures:
@@ -438,7 +584,9 @@ def cmd_probe(args: argparse.Namespace) -> int:
     probe_query = '"stock market"'
     offsets = [7, 30, 60, 90, 120, 180, 365, 730, 1825, 3650]
 
-    print(f"Probing with query {probe_query}, one-day windows.\n")
+    print(f"Probing with query {probe_query}, one-day windows.")
+    print(f"{len(offsets)} requests at one / {REQUEST_INTERVAL_S:.0f}s "
+          f"= ~{len(offsets) * REQUEST_INTERVAL_S / 60:.1f} min.\n")
     print(f"{'days back':>10}  {'date':<12}  result")
     print("-" * 46)
 
@@ -461,7 +609,6 @@ def cmd_probe(args: argparse.Namespace) -> int:
                 print(f"{offset:>10}  {day}  empty")
         except GdeltError as exc:
             print(f"{offset:>10}  {day}  {exc}")
-        time.sleep(REQUEST_INTERVAL_S)
 
     print()
     if deepest is None:
@@ -477,6 +624,11 @@ def cmd_probe(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Module-level because _get()'s clock gate reads it, and _get() is reached
+    # from four different commands. Declared up here because the argparse
+    # defaults below already reference the name.
+    global REQUEST_INTERVAL_S
+
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -491,7 +643,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--inspect", metavar="SYMBOL", help="print recent headlines for one query")
     parser.add_argument("--probe-window", action="store_true",
                         help="measure how far back the API serves")
+    parser.add_argument("--interval", type=float, default=REQUEST_INTERVAL_S,
+                        help=f"seconds between requests (default {REQUEST_INTERVAL_S:.0f}; "
+                             "GDELT asks for one every 5s -- lowering this gets you a 429)")
     args = parser.parse_args(argv)
+    REQUEST_INTERVAL_S = args.interval
 
     if args.status:
         return cmd_status(args)

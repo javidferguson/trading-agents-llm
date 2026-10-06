@@ -142,3 +142,49 @@ def test_benchmark_is_present_and_has_no_sector() -> None:
         "SPY has no EDGAR companyfacts -- this is the ETF case that makes a "
         "naive fundamentals path throw at Stage 2."
     )
+
+
+def test_every_theme_exemplar_is_in_the_universe() -> None:
+    """Exemplars are symbols, not prose, so they need a data path.
+
+    This gap appeared for real: MRVL, TSM and BRK.B were added as exemplars and
+    silently collected no sentiment, because nothing tied the two files
+    together. The GDELT window is ~3 months, so the damage would have been
+    invisible until Stage 8 and unrecoverable by then.
+    """
+    known = {s["symbol"] for s in load_yaml("universe.yaml")["symbols"]}
+    for theme in load_yaml("portfolio-intent.yaml")["themes"]:
+        exemplars = {e for e in theme["exemplars"] if e}
+        missing = exemplars - known
+        assert not missing, (
+            f"theme {theme['name']!r} names {sorted(missing)}, which are absent "
+            "from universe.yaml. They would collect no GDELT history, and that "
+            "history cannot be backfilled."
+        )
+
+
+def test_no_blank_exemplars() -> None:
+    """A trailing comma in a YAML flow sequence is harmless; a stray one is not.
+
+    `[AAPL, MSFT, JNJ, ]` parses to three items, but `[AAPL, , JNJ]` parses to
+    a None that would reach a prompt as the string "None".
+    """
+    for theme in load_yaml("portfolio-intent.yaml")["themes"]:
+        assert all(theme["exemplars"]), f"theme {theme['name']!r} has a blank exemplar"
+
+
+def test_share_class_tickers_declare_their_provider_spellings() -> None:
+    """The failure mode here is an empty price series, not an error.
+
+    Stooq, IB and Yahoo each spell BRK.B differently. A symbol containing a
+    dot or a dash almost certainly needs the mapping, so require it rather
+    than discovering the gap as missing data.
+    """
+    for entry in load_yaml("universe.yaml")["symbols"]:
+        symbol = entry["symbol"]
+        if "." in symbol or "-" in symbol:
+            mapped = entry.get("provider_symbols") or {}
+            assert {"stooq", "ib"} <= set(mapped), (
+                f"{symbol} has a share-class separator but no provider_symbols "
+                "for stooq/ib. Stooq wants brk-b.us, IB wants 'BRK B'."
+            )

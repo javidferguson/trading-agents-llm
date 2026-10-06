@@ -92,6 +92,17 @@ providers:
     # referring to an index reaching back to 2017-01-01. Those are not obviously
     # reconcilable. `scripts/gdelt_collect.py --probe-window` measures it.
     #
+    # RATE LIMIT, measured against the live API: one request every 5 seconds.
+    # It is stated ONLY in the body of the 429 -- there is no quota page and no
+    # Retry-After header. Two requests per symbol, so a 15-symbol run takes
+    # ~2.5 min minimum. A 429 that survives backoff is a SUSTAINED per-IP block,
+    # not a burst; stop and wait rather than retrying harder.
+    #
+    # GDELT's own 429 points high-traffic users at the web ngrams dataset:
+    #   https://blog.gdeltproject.org/using-the-new-web-ngrams-dataset-to-find-relevant-coverage/
+    # Not needed at this universe size. It is the supported answer if the
+    # universe grows past the point where 5-second pacing is tolerable.
+    #
     # Any replay earlier than the cache start must return sentiment as None WITH
     # A STATED REASON -- never zero, never a neutral default. A silent zero is
     # indistinguishable from genuinely neutral coverage and will quietly corrupt

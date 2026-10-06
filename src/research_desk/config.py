@@ -113,9 +113,19 @@ class Settings:
     sec_user_agent: str | None = None
 
     # IB. Read by `execute` only; `decide` must not even import ib_async.
-    # 4004 from inside `trading-network`, 4002 from the host.
-    ib_host: str = "ajj-ib-gateway"
+    #
+    # This project runs its OWN Gateway (`desk-ib-gateway`), not the ORB+GEX
+    # engine's. Two ports because there genuinely are two: 4004 is socat-paper
+    # inside the container, reachable as desk-ib-gateway:4004 over
+    # trading-llm-network; 4012 is its published host mapping. The ORB engine
+    # publishes 4002, and the numbers are kept distinct so you always know
+    # which Gateway you reached.
+    #
+    # Both Gateways must never run at once -- one IB username, one session.
+    # scripts/check_gateway_exclusive.py enforces it.
+    ib_host: str = "desk-ib-gateway"
     ib_port: int = 4004
+    ib_host_port: int = 4012
     #: 11 is the research desk's `execute` slot. The ORB engine owns 2, and
     #: ib_async connections that collide on clientId do not error -- they
     #: silently fail to connect. See migration plan §0.
@@ -169,8 +179,9 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         finnhub_api_key=src.get("FINNHUB_API_KEY") or None,
         fred_api_key=src.get("FRED_API_KEY") or None,
         sec_user_agent=src.get("SEC_EDGAR_USER_AGENT") or None,
-        ib_host=src.get("IB_HOST", "ajj-ib-gateway"),
+        ib_host=src.get("IB_HOST", "desk-ib-gateway"),
         ib_port=int(src.get("IB_PORT", "4004")),
+        ib_host_port=int(src.get("IB_HOST_PORT", "4012")),
         ib_client_id=int(src.get("IB_CLIENT_ID", "11")),
     )
 

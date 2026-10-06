@@ -49,35 +49,57 @@ So, concretely:
   must be applied twice**, and nothing will remind you. This is written into
   §15.11 of the architecture doc so it is at least on the record.
 
-### One IB Gateway, two consumers
+### Two Gateways, never concurrent
 
-Both repos need IB. Running two Gateway containers means two logins to the same
-IB account, which IB handles by evicting one of them. So: **one Gateway, owned
-by this repo, joined by the new one.**
+> **Revised during Stage 0.** This section originally read *"One IB Gateway, two
+> consumers"* and had the new repo join the ORB engine's Gateway over a shared
+> `trading-network`. That is reversed: **this repo runs its own Gateway.** The
+> reasoning below is kept rather than deleted, because the constraint it
+> identified is real and is now handled explicitly instead of designed around.
 
-The Gateway service already declares a named network:
+The original argument was sound as far as it went: both repos need IB, and
+running two Gateway containers means two logins to the same IB account, which IB
+resolves by evicting one of them. What it got wrong was the conclusion. Sharing
+infrastructure across repos buys one avoided conflict and costs a permanent
+coupling — `make gateway-start` in *another repository* becomes a precondition
+for this one, and the two projects' lifecycles are welded together for the
+duration. Two further facts settled it:
 
-```yaml
-networks:
-  trading-network:
-    driver: bridge
-    name: trading-network
-```
+- **The shared network evaporated.** `trading-network` was removed from the
+  machine at some point, and because the compose file declared it
+  `external: true`, `docker compose up execute` began failing on a missing
+  network — an error about infrastructure this repo does not own and cannot
+  fix from here.
+- **Independence is nearly free.** The Gateway is one well-understood service
+  block. Copying it costs ~70 lines; depending on another repo for it costs
+  attention forever.
 
-The new repo's compose file therefore declares it **external** and does not
-define a Gateway service at all:
+So: **this repo owns `desk-ib-gateway`, on its own `trading-llm-network`.**
 
-```yaml
-networks:
-  trading-network:
-    external: true
-    name: trading-network
-```
+#### The constraint does not go away
 
-Practical consequence: `make gateway-start` stays a command you run *in this
-repo*. The new repo assumes a Gateway is already up and fails with a clear
-message if not. Worth a `make check-gateway` target that says so in one line
-rather than surfacing an `ib_async` connection timeout.
+One IB username supports one Gateway/TWS session. Both repos use the same
+credentials. Therefore:
+
+> **Never run `desk-ib-gateway` and `ajj-ib-gateway` at the same time.**
+
+This is enforced in two places, deliberately at different depths:
+
+| Where | What it does |
+|---|---|
+| `scripts/check_gateway_exclusive.py`, run by `make gateway-start` | Refuses to start if `ajj-ib-gateway` is running **or** `127.0.0.1:4002` is listening. Two checks because they miss different things: the container check misses a Gateway started outside Docker, the port check misses one with unpublished ports. Either alone is conclusive |
+| `EXISTING_SESSION_DETECTED_ACTION=secondary` on the container | IBC's answer to IB's "Existing session detected" dialog. **The ORB engine uses `primary`** — "take over". Ours steps aside. Taking over would silently kill a running ORB session, possibly mid-position; failing to start costs ten seconds |
+
+The guard is the one that matters in practice, because it fires before an image
+is pulled and says *why*. The container setting is the backstop for the case
+where the guard was bypassed.
+
+#### What was carried from the ORB compose
+
+The Gateway service block is a near-copy of
+`docker/docker-compose-options-trader.yml`, **comments included**. Those comments
+record measured behaviour — the socat relay, the timezone trap, two healthcheck
+mistakes — and re-deriving them is pure loss. See architecture §14.
 
 ### Client ID allocation
 
@@ -94,15 +116,34 @@ write it down:
 | 12 | Research desk — ad-hoc scripts, `whatIf` probes, snapshot fetches |
 | 13–19 | Reserved: research desk |
 
+The allocation is **unchanged by the two-Gateway split** and still worth
+honouring: the two engines may not run simultaneously, but they do share a
+machine and a credential, and a collision debugged once is a collision debugged
+too often.
+
 Note that **only `execute` connects to IB at all**. The `decide` process must
 not import `ib_async` — that is the §0 split, and the cheapest way to enforce it
 is a test that asserts the import is absent from the `decide` dependency tree.
 
 ### Ports
 
-Unchanged and already correct: `ajj-ib-gateway:4004` from inside
-`trading-network`, `127.0.0.1:4002` from the host. The new repo's `execute` runs
-in a container on that network, so it uses **4004**.
+The container-side numbering is a property of the `gnzsnz/ib-gateway` image and
+is the same for both repos: the Gateway binds container-localhost `4001` (live)
+and `4002` (paper), and socat relays `4003 -> 4001` and `4004 -> 4002`. Anything
+connecting from outside the container must use the socat port, so `execute`
+uses **4004**.
+
+**Host ports differ between the two repos on purpose**, so that a connection can
+never be ambiguous about which Gateway it reached, and so the exclusivity guard
+has something unambiguous to probe:
+
+| | Container (socat, paper) | Host | VNC (host) |
+|---|---|---|---|
+| ORB+GEX `ajj-ib-gateway` | 4004 | **4002** | 5900 |
+| Research desk `desk-ib-gateway` | 4004 | **4012** | 5912 |
+
+Live (`4003`) stays commented out in both. With `TRADING_MODE=paper` nothing is
+behind it, but it becomes a live API endpoint the moment that flips.
 
 ---
 
@@ -159,7 +200,7 @@ a shared package.
 
 | Artefact | Disposition |
 |---|---|
-| `docker/docker-compose-options-trader.yml` — Gateway service block | **Stays here, shared.** All those port and healthcheck comments are hard-won; do not re-derive them |
+| `docker/docker-compose-options-trader.yml` — Gateway service block | **Copied, not shared** (revised — see §0). This repo runs its own `desk-ib-gateway` on its own network. The port and healthcheck comments are hard-won and came across verbatim; do not re-derive them. The two copies may now diverge, and the same warning as `safety.py` applies |
 | Trader service block | Adapted into **two services**: `decide` (no IB, no `ib_async`) and `execute` (IB, no LLM) |
 | `Makefile` | Copy the *conventions* — `make help`, `make config-check`, `make test-connection`. Not the targets |
 | `example.env` | New file. The two-mode split (`TRADING_MODE` account vs `DATA_MODE` data) carries as a principle; the new variables differ |

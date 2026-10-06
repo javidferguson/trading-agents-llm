@@ -227,6 +227,12 @@ __marimo__/
 logs/
 data/
 
+# .env is listed above, but a backup or variant of it is still a file full of
+# secrets. Anything that starts with .env is excluded, with example.env the one
+# deliberate exception since it holds only placeholders.
+.env.*
+!example.env
+
 # uv.lock IS committed, deliberately. Architecture §1 pins the LangGraph set to
 # exact versions because langgraph-prebuilt 1.0.2 shipped a breaking change under
 # loose constraints; a lockfile that is not in version control makes that pin

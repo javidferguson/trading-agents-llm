@@ -44,7 +44,7 @@ risk:
   per_trade_risk_pct: 0.75        # % of equity at risk if the stop fills
   default_stop_pct: 8.0
   max_position_pct: 10.0
-  max_sector_pct: 30.0
+  max_sector_pct: 65.0
   min_cash_pct: 10.0
   max_gross_exposure_pct: 95.0
   max_positions: 8
@@ -61,35 +61,36 @@ universe:
   # Drawn from config/universe.yaml. Listing it separately keeps "what we may
   # trade" distinct from "what we collect sentiment for" -- the second should be
   # wider, because its cost rises with delay and the first's does not.
-  include: [AAPL, MSFT, NVDA, AVGO, AMZN, GOOGL, META, JPM, XOM, UNH, JNJ]
+  include: [AAPL, MSFT, NVDA, AVGO, AMZN, GOOGL, META, JPM, XOM, UNH, JNJ,
+            MRVL, TSM, BRK.B]
   exclude: []
   allow_shorts: false             # long-only for now; §9 sizing assumes it
 
 themes:
   - name: "AI infrastructure"
-    target_weight_pct: 25.0
-    conviction: 0.7
+    target_weight_pct: 35.0  # 25.0 - Original default value [JF-change]
+    conviction: 0.8  # 0.7 - Original default value [JF-change]
     thesis: >
       Compute demand for training and inference is still supply-constrained,
       and the constraint has moved from GPUs toward power and networking. The
       risk is that hyperscaler capex is pulled forward rather than durable.
-    exemplars: [NVDA, AVGO, MSFT]
+    exemplars: [NVDA, AVGO, GOOGL, AMZN, MRVL, TSM]
 
   - name: "Cash-generative megacap"
-    target_weight_pct: 30.0
+    target_weight_pct: 25.0  # 30.0 - Original default value [JF-change]
     conviction: 0.6
     thesis: >
       Businesses with high gross profitability and a shrinking share count,
       bought at a non-absurd earnings yield. Deliberately boring; this is the
       ballast the AI sleeve is measured against.
-    exemplars: [AAPL, GOOGL, JNJ]
+    exemplars: [AAPL, MSFT, JNJ]
 
   - name: "Defensive / uncorrelated"
-    target_weight_pct: 15.0
-    conviction: 0.4
+    target_weight_pct: 12.5  # 15.0 - Original default value [JF-change]
+    conviction: 0.3  # 0.4 - Original default value [JF-change]
     thesis: >
       Health care and energy, held to blunt drawdown rather than to win.
-    exemplars: [UNH, XOM, JPM]
+    exemplars: [UNH, XOM, JPM, BRK.B]
 
 # Free text, read by the Trader and Fund Manager only. Say things here that are
 # hard to encode as a number -- the numeric ones belong under `risk:` where

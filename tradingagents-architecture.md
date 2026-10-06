@@ -545,10 +545,32 @@ considerably longer than 90 sessions.
 | News | **Finnhub** `/company-news` | SEC 8-K feed; Yahoo RSS | free, 60/min | Finnhub is date-rangeable (1y history on free), which is exactly what replay needs. **RSS is not date-rangeable, so it is `supports_point_in_time=False` and must raise in replay** |
 | Events/estimates | **Finnhub** earnings calendar, surprises, recommendation trends | — | free, 60/min | |
 | Positioning | **FINRA** short interest + daily short-sale volume; **SEC EDGAR** Form 4 | — | none | Short interest carries a settlement date; Form 4 carries a filing date. Both point-in-time |
-| **News tone / volume** | **GDELT** DOC 2.0 (`TimelineTone`, `TimelineVol`) | Finnhub article counts | **none** | Open API, no key, no auth. Aggregates thousands of outlets across 100+ countries — see §7.6 on why breadth is the whole point. **Rolling 3-month window only**, which drives a build-order requirement (§7.5) |
+| **News tone / volume** | **GDELT** DOC 2.0 (`TimelineTone`, `TimelineVol`) | Finnhub article counts | **none** | Open API, no key, no auth — but **not unlimited**, see below. Aggregates thousands of outlets across 100+ countries — see §7.6 on why breadth is the whole point. **Rolling 3-month window only**, which drives a build-order requirement (§7.5) |
 | Market sentiment | **CBOE** daily options statistics — equity put/call ratio | — | none | Free daily files with an archive back to 2006. The cleanest free sentiment series in the stack |
 | Search attention | pytrends (Google Trends) | — | none | **Optional.** Unofficial, rate-limited, and its values are *relative to the requested window*, so the same date returns different numbers depending on the query range — a genuine replay hazard. If used at all: snapshot at `as_of`, cache, and never re-query a cached date |
 | Macro | **FRED** | — | free key | Generous limits, one fetch per run |
+
+**GDELT's rate limit, measured rather than documented.** "No key, no auth" is
+not "no limit", and the limit is stated in a place that is easy to throw away:
+
+- The rule is **one request every 5 seconds**, and it appears *only in the body
+  of the 429* — there is no published quota page and no `Retry-After` header.
+  Code that formats `HTTPError.reason` and discards `HTTPError.read()` turns
+  actionable guidance into a bare "Too Many Requests". (That is not
+  hypothetical; it is what the first version of `scripts/gdelt_collect.py` did.)
+- A 429 has **two causes that want opposite responses**. A momentary burst
+  clears in seconds and one retry fixes it. A *sustained per-IP block*, earned
+  by sustained over-use, does not: an IP in that state was still refused after
+  150 s of backoff across four retries. Retrying hard cannot tell them apart,
+  and in the second case each retry is more traffic from an IP already being
+  punished for traffic. So the collector retries **twice, briefly**, then stops
+  and says to wait — deliberately less robust-looking, and more effective.
+- Consequence for planning: at one request per 5 s and two per symbol, a daily
+  collection over a 15-symbol universe takes **~2.5 minutes minimum**. That is
+  fine for a cron job and worth knowing before assuming the run has hung.
+- GDELT's own 429 points high-traffic users at the **web ngrams dataset** as the
+  supported alternative. Not needed at this universe size; the right answer if
+  the universe ever grows past the point where 5-second pacing is tolerable.
 
 Deliberately **not** used:
 
@@ -895,6 +917,32 @@ Worth lifting rather than rewriting — each cost real debugging:
 - **Paper accounts need their own credentials**, and the paper account must be
   *created* in Client Portal → Account Configuration first. Client Portal will
   accept live credentials while the Gateway rejects them.
+
+**Gateway container lessons**, carried with the service block when this repo
+took its own Gateway (migration plan §0, revised). All measured, none obvious:
+
+- **The API port you connect to is not the port the Gateway listens on.** The
+  `gnzsnz/ib-gateway` image binds the Gateway to *container*-localhost `4001`
+  (live) / `4002` (paper), which nothing outside can reach, and runs socat to
+  relay `4003 → 4001` and `4004 → 4002`. Connect to the socat port. Host
+  mappings are then a third set of numbers again.
+- **Two ways to get the healthcheck wrong**, and both leave you misinformed
+  rather than broken: `nc` is not installed in the image, so a check using it
+  errors and the container is permanently "unhealthy"; and probing `4004` tests
+  *socat*, which listens from container start regardless of the Gateway, so it
+  reports healthy while the Gateway sits on the login screen. Probe `4002` with
+  `bash -c "echo > /dev/tcp/127.0.0.1/4002"`.
+- **`EXISTING_SESSION_DETECTED_ACTION` decides who wins a credential clash.**
+  One IB username supports one session. `primary` takes the session over —
+  which, across two repos on one account, means silently killing a possibly
+  mid-position trading session. `secondary` steps aside. The research desk uses
+  `secondary` and guards it further with a preflight check; the ORB engine uses
+  `primary`. Without *any* value, IBC has no instruction for the dialog and the
+  Gateway simply sits on it forever with no further log output.
+- **VNC is the only way to see a login or 2FA prompt.** The image starts x11vnc
+  only when `VNC_SERVER_PASSWORD` is set — unset, the port is published and
+  nothing listens. There is no noVNC, so `localhost:6080` never works; use a
+  real client.
 
 ---
 

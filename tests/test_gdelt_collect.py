@@ -302,3 +302,271 @@ def test_status_counts_gaps_in_the_middle_of_a_range(monkeypatch, capsys) -> Non
     gdelt.main(["--status"])
     out = capsys.readouterr().out
     assert "7 missing day(s)" in out
+
+
+# --------------------------------------------------------------------------- #
+# Rate limiting and retry
+#
+# GDELT states its limit only in the BODY of a 429, and sends no Retry-After.
+# Both facts were confirmed against the live API, and getting either wrong is
+# what produced "GDELT unavailable: HTTP 429 ... Too Many Requests" with no hint
+# that the fix was simply to slow down.
+# --------------------------------------------------------------------------- #
+
+
+class _FakeHTTPError(Exception):
+    """Stands in for urllib.error.HTTPError, which is file-like."""
+
+    def __init__(self, code: int, body: bytes, reason: str = "error"):
+        self.code = code
+        self.reason = reason
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+
+@pytest.fixture
+def no_waiting(monkeypatch):
+    """Record sleeps instead of taking them. Keeps the suite fast."""
+    slept: list[float] = []
+    monkeypatch.setattr(gdelt.time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(gdelt, "_last_request_at", None)
+    return slept
+
+
+THROTTLE_BODY = (
+    b"Please limit requests to one every 5 seconds or contact "
+    b"kalev.leetaru5@gmail.com for larger queries."
+)
+
+
+def test_gdelts_own_words_reach_the_user(monkeypatch, no_waiting) -> None:
+    """The regression that started this.
+
+    The limit is stated ONLY in the 429 body. Formatting exc.reason and
+    discarding exc.read() turned actionable guidance into a generic status line.
+    """
+    monkeypatch.setattr(gdelt.urllib.error, "HTTPError", _FakeHTTPError)
+
+    def always_throttled(*a, **k):
+        raise _FakeHTTPError(429, THROTTLE_BODY, "Too Many Requests")
+
+    monkeypatch.setattr(gdelt.urllib.request, "urlopen", always_throttled)
+
+    with pytest.raises(gdelt.GdeltError) as caught:
+        gdelt._get({"mode": "artlist"})
+
+    message = str(caught.value)
+    assert "one every 5 seconds" in message, "the body must survive into the error"
+    assert "429" in message
+
+
+def test_a_429_is_retried_and_can_succeed(monkeypatch, no_waiting) -> None:
+    monkeypatch.setattr(gdelt.urllib.error, "HTTPError", _FakeHTTPError)
+    calls = {"n": 0}
+
+    class Ok:
+        def read(self):
+            return b'{"timeline": []}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise _FakeHTTPError(429, THROTTLE_BODY, "Too Many Requests")
+        return Ok()
+
+    monkeypatch.setattr(gdelt.urllib.request, "urlopen", flaky)
+
+    assert gdelt._get({"mode": "timelinetone"}) == {"timeline": []}
+    assert calls["n"] == 3
+    # Backoff grows rather than hammering a throttle that is already angry.
+    waits = [s for s in no_waiting if s >= 1]
+    assert waits == [gdelt.RETRY_BACKOFF_S[0], gdelt.RETRY_BACKOFF_S[1]]
+
+
+def test_backoff_gives_up_after_the_schedule(monkeypatch, no_waiting) -> None:
+    monkeypatch.setattr(gdelt.urllib.error, "HTTPError", _FakeHTTPError)
+    calls = {"n": 0}
+
+    def always(*a, **k):
+        calls["n"] += 1
+        raise _FakeHTTPError(429, THROTTLE_BODY, "Too Many Requests")
+
+    monkeypatch.setattr(gdelt.urllib.request, "urlopen", always)
+
+    with pytest.raises(gdelt.GdeltError):
+        gdelt._get({"mode": "artlist"})
+
+    assert calls["n"] == len(gdelt.RETRY_BACKOFF_S) + 1
+
+
+def test_a_client_error_is_not_retried(monkeypatch, no_waiting) -> None:
+    """404 and 400 are our bug. Retrying just hides it behind a delay."""
+    monkeypatch.setattr(gdelt.urllib.error, "HTTPError", _FakeHTTPError)
+    calls = {"n": 0}
+
+    def not_found(*a, **k):
+        calls["n"] += 1
+        raise _FakeHTTPError(404, b"no such endpoint", "Not Found")
+
+    monkeypatch.setattr(gdelt.urllib.request, "urlopen", not_found)
+
+    with pytest.raises(gdelt.GdeltError, match="404"):
+        gdelt._get({"mode": "artlist"})
+    assert calls["n"] == 1, "a 404 must fail immediately"
+
+
+def test_requests_are_never_closer_than_the_interval(monkeypatch) -> None:
+    """The clock gate, which is what actually keeps us under the limit.
+
+    Asserted on the sleeps requested rather than on elapsed time, so the test
+    stays fast and deterministic.
+    """
+    clock = {"t": 1000.0}
+    slept: list[float] = []
+
+    def fake_sleep(seconds):
+        slept.append(seconds)
+        clock["t"] += seconds
+
+    monkeypatch.setattr(gdelt.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(gdelt.time, "sleep", fake_sleep)
+    monkeypatch.setattr(gdelt, "_last_request_at", None)
+    monkeypatch.setattr(gdelt, "REQUEST_INTERVAL_S", 5.0)
+
+    class Ok:
+        def read(self):
+            return b"{}"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    # Each request "takes" 1.2s of wall clock, so a naive trailing sleep would
+    # leave only 5s between starts but the gate must still see 5s of gap.
+    def urlopen(*a, **k):
+        clock["t"] += 1.2
+        return Ok()
+
+    monkeypatch.setattr(gdelt.urllib.request, "urlopen", urlopen)
+
+    for _ in range(3):
+        gdelt._get({"mode": "timelinetone"})
+
+    # First request waits for nobody; the next two each wait out the remainder.
+    assert len(slept) == 2
+    for wait in slept:
+        assert wait == pytest.approx(5.0 - 1.2, abs=0.01)
+
+
+def test_interval_is_configurable_from_the_cli(monkeypatch) -> None:
+    """So a backfill can be slowed further without editing the source."""
+    monkeypatch.setattr(gdelt, "load_universe", lambda only=None: [])
+    original = gdelt.REQUEST_INTERVAL_S
+    try:
+        gdelt.main(["--status", "--interval", "9"])
+        assert gdelt.REQUEST_INTERVAL_S == 9.0
+    finally:
+        gdelt.REQUEST_INTERVAL_S = original
+
+
+def test_a_sustained_block_says_to_stop_rather_than_retry(monkeypatch, no_waiting) -> None:
+    """Measured behaviour: an IP in the penalty box stays 429 well past 150s.
+
+    When that happens the useful advice is the opposite of "try again" -- more
+    requests from a throttled IP plausibly extend the block.
+    """
+    monkeypatch.setattr(gdelt.urllib.error, "HTTPError", _FakeHTTPError)
+    monkeypatch.setattr(
+        gdelt.urllib.request,
+        "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(
+            _FakeHTTPError(429, THROTTLE_BODY, "Too Many Requests")
+        ),
+    )
+
+    with pytest.raises(gdelt.GdeltError) as caught:
+        gdelt._get({"mode": "artlist"})
+
+    message = str(caught.value)
+    assert "SUSTAINED" in message
+    assert "Wait ~15 minutes" in message
+    assert "may extend it" in message
+
+
+def test_backoff_is_short_on_purpose() -> None:
+    """Guard the reasoning above against a well-meaning 'make it more robust'.
+
+    Lengthening this schedule makes the sustained-block case worse, not better.
+    """
+    assert len(gdelt.RETRY_BACKOFF_S) == 2
+    assert sum(gdelt.RETRY_BACKOFF_S) <= 60, (
+        "Long backoff against a per-IP penalty box is counterproductive -- see "
+        "the comment on RETRY_BACKOFF_S before raising this."
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The false-zero bug
+#
+# Found by running the collector live for the first time. GDELT answered HTTP
+# 200 with an EMPTY BODY; the collector parsed that into "no data for any day"
+# and wrote articles=0, observed=True across the whole window. Those days then
+# look collected -- no gap in --status, never re-fetched -- and ~3 months later
+# the real numbers are gone. A false zero is strictly worse than a hole.
+# --------------------------------------------------------------------------- #
+
+
+def test_an_empty_200_is_not_recorded_as_zero_coverage(monkeypatch) -> None:
+    """The regression. Must raise, and must write nothing at all."""
+    monkeypatch.setattr(gdelt, "_get", lambda params: {})
+
+    with pytest.raises(gdelt.GdeltError, match="no timeline"):
+        gdelt.collect_symbol(ENTRY, date(2026, 10, 3), date(2026, 10, 5), keep_raw=False)
+
+    assert not gdelt.store_path("AAPL").exists(), (
+        "a failed fetch must leave no trace -- a partially written store is "
+        "indistinguishable from a successful one"
+    )
+
+
+def test_a_real_timeline_with_a_quiet_day_still_records_zero(monkeypatch) -> None:
+    """The legitimate case, which must keep working.
+
+    GDELT answered properly and simply had nothing for the middle day. That IS
+    observed zero coverage and should be recorded as such -- the point of the
+    fix is to separate this from silence, not to stop recording zeros.
+    """
+    _stub_get(
+        monkeypatch,
+        tone={"2026-10-03": 1.5, "2026-10-05": -0.5},
+        counts={"2026-10-03": 12, "2026-10-05": 7},
+    )
+    gdelt.collect_symbol(ENTRY, date(2026, 10, 3), date(2026, 10, 5), keep_raw=False)
+
+    days = gdelt.read_store("AAPL")["days"]
+    assert days["2026-10-03"]["articles"] == 12
+    assert days["2026-10-04"] == {
+        **days["2026-10-04"],
+        "articles": 0,
+        "tone": None,
+        "observed": True,
+    }
+    assert days["2026-10-05"]["articles"] == 7
+
+
+def test_has_timeline_discriminates() -> None:
+    assert gdelt._has_timeline({"timeline": [{"series": "Article Count", "data": []}]})
+    assert not gdelt._has_timeline({})
+    assert not gdelt._has_timeline({"timeline": []})
+    assert not gdelt._has_timeline(None)
+    assert not gdelt._has_timeline("Please limit requests to one every 5 seconds")
