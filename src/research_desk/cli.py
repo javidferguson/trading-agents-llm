@@ -354,6 +354,102 @@ def cmd_toy_graph(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# decide -- the Stage 3 exit gate
+# --------------------------------------------------------------------------- #
+
+
+async def _run_decide(symbol: str, as_of: date, preset: str | None) -> int:
+    from .graph.build import build_decision_graph
+    from .llm.router import LLMRouter
+    from .models.state import DecisionState
+    from .prompts import prompt_pack_version
+    from .providers.registry import ProviderRegistry
+
+    settings = load_settings()
+    configure_tracing(settings)
+
+    try:
+        hashed = config_hash(load_config())
+    except ConfigError as exc:
+        print(f"FAILED: {exc}", file=sys.stderr)
+        return 1
+
+    router = LLMRouter.from_config(settings, preset=preset)
+    registry = ProviderRegistry.from_config(settings)
+
+    ctx = NodeContext(
+        settings=settings, mode=settings.mode, as_of=as_of,
+        config_hash=hashed, prompt_pack_version=prompt_pack_version(),
+        extras={"router": router, "registry": registry},
+    )
+
+    initial = DecisionState(
+        run_id=ctx.run_id, symbol=symbol, as_of=as_of, mode=ctx.mode,
+        config_hash=hashed, prompt_pack_version=ctx.prompt_pack_version,
+    )
+
+    print(f"{symbol}  as_of={as_of}  run={ctx.run_id}")
+    print(f"prompts={ctx.prompt_pack_version}  config={hashed}  mode={ctx.mode.value}\n")
+
+    try:
+        graph = build_decision_graph(ctx)
+        result = await graph.ainvoke(initial)
+    finally:
+        await router.aclose()
+        flush_tracing()
+
+    state = DecisionState.model_validate(result)
+    decision = state.final_decision
+
+    for note in state.notes:
+        print(f"  {note}")
+    print()
+
+    report = state.analyst_reports.get("market")
+    if report is not None:
+        print(f"ANALYST  {report.stance} @ {report.confidence:.2f}")
+        print(f"  {' '.join(report.summary.split())}")
+        for point in report.key_points:
+            print(f"  - {' '.join(point.split())}")
+        if report.data_gaps:
+            print(f"  gaps: {'; '.join(report.data_gaps)}")
+        print()
+
+    if decision is None:
+        print("No decision was produced.", file=sys.stderr)
+        return 1
+
+    print(f"DECISION  {decision.action}  {decision.target_weight_pct:.1f}% of equity"
+          f"  conviction {decision.conviction:.2f}  horizon {decision.horizon_days}d")
+    print(f"  rationale    {' '.join(decision.rationale.split())}")
+    print(f"  invalidation {' '.join(decision.invalidation.split())}")
+    print(f"  dissent      {' '.join(decision.dissent.split())}")
+    print(f"  expires      {decision.expires_at:%Y-%m-%d %H:%M}")
+    print()
+
+    spend = sum(r.usd for r in state.llm_calls)
+    attempts = len(state.llm_calls)
+    repairs = sum(1 for r in state.llm_calls if r.parse_failed)
+    wall = sum(r.latency_ms or 0 for r in state.llm_calls) / 1000
+    print(f"{attempts} model call(s), {repairs} repair turn(s), "
+          f"{wall:.1f}s of inference, ${spend:.4f}")
+
+    if decision.degraded:
+        print()
+        print("DEGRADED -- this HOLD is a failure, not a judgement.")
+        print(f"  {state.degraded_reason()}")
+        return 1
+    return 0
+
+
+def cmd_decide(args: argparse.Namespace) -> int:
+    """Run the vertical slice and write proposal.json."""
+    setup_logging()
+    as_of = date.fromisoformat(args.as_of) if args.as_of else date.today()
+    return asyncio.run(_run_decide(args.symbol.upper(), as_of, args.preset))
+
+
+# --------------------------------------------------------------------------- #
 # data -- what is cached, from where, and how stale
 # --------------------------------------------------------------------------- #
 
@@ -570,6 +666,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("config-check", help="parse and validate config/").set_defaults(
         func=cmd_config_check
     )
+
+    dec = sub.add_parser("decide", help="Stage 3 exit gate: a real decision -> proposal.json")
+    dec.add_argument("--symbol", default="MSFT")
+    dec.add_argument("--as-of", default=None, help="YYYY-MM-DD (default: today)")
+    dec.add_argument("--preset", default="all_local",
+                     help="models.yaml preset (default all_local -- hosted is Stage 5)")
+    dec.set_defaults(func=cmd_decide)
 
     sub.add_parser("data", help="what is in the provider cache, and is it real").set_defaults(
         func=cmd_data

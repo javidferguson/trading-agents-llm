@@ -41,6 +41,24 @@ This is the **only** gap with an irreversible cost. GDELT serves a rolling ~3
 months, so a day not collected is permanently absent from the Stage 8
 evaluation (§7.5). Re-running picks up where it left off; it is idempotent.
 
+## Stage 3 reasoning quality — residual issues
+
+The vertical slice produces defensible decisions, found by reading ten of them
+as the plan requires. Two things qwen3:8b still does that prompting has not
+fully fixed:
+
+- **It occasionally calls a momentum setup a "mean-reversion setup."** The
+  decision is usually coherent anyway, but the label is wrong. Likely a
+  genuine model limitation rather than a prompt gap.
+- **It still infers a current position occasionally** ("the position is
+  small"), despite the prompt stating that portfolio state is unknown. This
+  resolves itself at Stage 6, when `compute_gaps()` supplies the real drift
+  table — and §8 predicts exactly that: the drift table is *"the biggest
+  reliability win"* because it turns an open-ended "how much should we buy"
+  into a bounded "close this gap or don't".
+
+Both were found by reading output, not by tests, and neither blocks the gate.
+
 ## Smaller things
 
 - **`make gdelt-probe` has never run.** §7.5 flags a contradiction in GDELT's

@@ -186,6 +186,143 @@ class AnalystReport(Degradable):
         }
 
 
+class TraderProposal(Degradable):
+    """What the trader wants to do (§4).
+
+    Note ``target_weight_pct``: **a desired percentage of equity, not a share
+    count.** Share counts come from ``intent/sizing.py`` at Stage 6, which
+    takes the minimum of four caps. A model that names a share count is doing
+    position sizing in its head, which is arithmetic, which §2 forbids.
+    """
+
+    action: Literal["BUY", "SELL", "HOLD"]
+    conviction: float = Field(ge=0, le=1)
+    target_weight_pct: float = Field(ge=0, le=100)
+    horizon_days: int = Field(ge=1, le=750)
+    rationale: str
+    #: "What would prove this wrong." Required, and it is half of what makes
+    #: the confirmation prompt at Stage 7 worth reading.
+    invalidation: str
+
+    #: The strongest case AGAINST this proposal, in the trader's own words.
+    #:
+    #: At Stage 4 this comes from the bear researcher, and §4 is emphatic that
+    #: dissent is "REQUIRED, never dropped". There is no bear researcher yet,
+    #: so the trader has to argue against itself -- which is weaker, and far
+    #: better than a FinalDecision carrying an empty `dissent` through to a
+    #: human gate that was built to show it.
+    strongest_counterargument: str
+
+    #: Which theme or gap this closes. Blank until Stage 6 wires the drift
+    #: table; the field exists now so the prompt can ask for it once it does.
+    intent_alignment: str = ""
+
+    @field_validator("rationale", "invalidation", "strongest_counterargument")
+    @classmethod
+    def _substantive(cls, value: str) -> str:
+        """Reject a field that technically parses but says nothing.
+
+        A one-word invalidation ("price") is indistinguishable from a missing
+        one downstream, and the confirmation gate exists to show a human this
+        text. Caught here so the repair turn asks for a real answer.
+        """
+        if len(value.split()) < 4:
+            raise ValueError(
+                "too short to be useful -- write a full sentence naming the "
+                "specific condition, not a word"
+            )
+        return value
+
+    @classmethod
+    def _degraded_defaults(cls) -> dict[str, Any]:
+        return {
+            # HOLD, zero conviction, no position. §5: never fail toward a trade.
+            "action": "HOLD",
+            "conviction": 0.0,
+            "target_weight_pct": 0.0,
+            "horizon_days": 1,
+            "rationale": "Degraded: the trader produced no usable proposal.",
+            "invalidation": "Not applicable; no position is being taken.",
+            "strongest_counterargument":
+                "No analysis was produced, so no case either way exists.",
+            "intent_alignment": "",
+        }
+
+
+class FinalDecision(BaseModel):
+    """The artefact `execute` reads (§4). Broker-agnostic on purpose.
+
+    ``FinalDecision -> OrderPlan -> ib_async Contract/Order`` (§9), so the
+    first two layers run with no broker at all. Nothing here names a share
+    count, a contract or an exchange.
+    """
+
+    schema_version: int = 1
+    action: Literal["BUY", "SELL", "HOLD"]
+    symbol: str
+    conviction: float = Field(ge=0, le=1)
+    target_weight_pct: float = Field(ge=0, le=100)
+
+    #: Marketable limit, never market. With delayed data you are looking at a
+    #: 15-minute-old price (§9).
+    order_type: Literal["LMT", "MKT"] = "LMT"
+    limit_offset_bps: int = 10
+    stop_loss_pct: float | None = None
+    take_profit_pct: float | None = None
+    horizon_days: int
+
+    rationale: str
+    #: The preserved case against. §4 lists `dissent` and `invalidation` as
+    #: REQUIRED because "this is where the paper's explainability claim
+    #: actually cashes out -- both surface in the confirmation prompt."
+    dissent: str
+    invalidation: str
+
+    #: A stale proposal cannot be executed. `render_decision()` at Stage 7
+    #: refuses outright rather than prompting: a proposal generated after
+    #: Tuesday's close must not be executable on Thursday.
+    expires_at: datetime
+    fund_manager_adjustment: str | None = None
+
+    #: True when any node degraded. Carried so `execute` can see that a HOLD
+    #: was a failure rather than a judgement.
+    degraded: bool = False
+
+    @classmethod
+    def from_proposal(
+        cls,
+        proposal: "TraderProposal",
+        symbol: str,
+        *,
+        expires_at: datetime,
+        stop_loss_pct: float | None = None,
+        degraded: bool = False,
+    ) -> "FinalDecision":
+        """Promote a trader proposal with no fund manager in between.
+
+        **A Stage 3 shim.** At Stage 5 the fund manager approves, adjusts or
+        vetoes and produces this itself; until then the promotion is
+        deterministic so the vertical slice reaches `proposal.json`. It is
+        deliberately a plain copy with no judgement of its own -- anything
+        cleverer here would be a fund manager written by accident, in the wrong
+        file, untested.
+        """
+        return cls(
+            action=proposal.action,
+            symbol=symbol.upper(),
+            conviction=proposal.conviction,
+            target_weight_pct=proposal.target_weight_pct,
+            horizon_days=proposal.horizon_days,
+            rationale=proposal.rationale,
+            dissent=proposal.strongest_counterargument,
+            invalidation=proposal.invalidation,
+            stop_loss_pct=stop_loss_pct,
+            expires_at=expires_at,
+            fund_manager_adjustment=None,
+            degraded=degraded or proposal.parse_failed,
+        )
+
+
 class LLMCallRecord(BaseModel):
     """One model call, recorded in full enough detail to replay it."""
 
@@ -259,13 +396,19 @@ class DecisionState(BaseModel):
     #: something to write; harmless to keep.
     notes: Annotated[list[str], operator.add] = Field(default_factory=list)
 
+    #: The deterministic prefetch every LLM node reads (§2). Typed as Any to
+    #: keep models/state.py free of a market-data import cycle.
+    snapshot: Any | None = None
+
+    analyst_reports: dict[str, AnalystReport] = Field(default_factory=dict)
+    trader_proposal: TraderProposal | None = None
+    final_decision: FinalDecision | None = None
+
     # --- arriving in later stages --------------------------------------------
-    # Stage 2: intent, portfolio, snapshot, regime
-    # Stage 3: analyst_reports, trader_proposal, final_decision
     # Stage 4: research_debate, research_verdict
     # Stage 5: risk_debate
-    # Stage 6: violations
-    # Stage 9: memory_hits
+    # Stage 6: intent, portfolio, violations
+    # Stage 9: memory_hits, regime
 
     def degraded_reason(self) -> str | None:
         """Why this run should fail toward HOLD, or ``None`` if it is healthy."""
@@ -281,6 +424,8 @@ NodePatch = dict[str, Any]
 
 __all__ = [
     "AnalystReport",
+    "FinalDecision",
+    "TraderProposal",
     "DecisionState",
     "Degradable",
     "Evidence",

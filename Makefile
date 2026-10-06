@@ -180,6 +180,10 @@ bars:  ## Fetch daily bars from IB into the cache (needs the Gateway up)
 snapshot:  ## THE STAGE 2 GATE: every §7.1 metric for a symbol, no LLM
 	$(RUN) desk snapshot --symbol $${SYMBOL:-SPY}
 
+.PHONY: decide
+decide:  ## THE STAGE 3 GATE: a real decision end to end -> proposal.json
+	$(RUN) desk decide --symbol $${SYMBOL:-MSFT}
+
 .PHONY: smoke
 smoke:  ## THE STAGE 1 GATE: a real AnalystReport from a local 8B model
 	$(RUN) desk smoke
@@ -257,20 +261,23 @@ test-layering:  ## Just the architectural boundary tests -- fast, and the ones t
 verify:  ## Run the whole Stage 0 gate in order, stopping at the first failure
 	@echo "running in: $(IN)"
 	@echo
-	@echo "=== 1/6  config ============================================"
+	@echo "=== 1/7  config ============================================"
 	@$(MAKE) --no-print-directory config-check
 	@echo
-	@echo "=== 2/6  tests ============================================="
+	@echo "=== 2/7  tests ============================================="
 	@$(UV) run pytest -q
 	@echo
-	@echo "=== 3/6  environment ======================================="
+	@echo "=== 3/7  environment ======================================="
 	@$(MAKE) --no-print-directory doctor
 	@echo
-	@echo "=== 4/6  Stage 0 exit gate ================================="
+	@echo "=== 4/7  Stage 0 exit gate ================================="
 	@$(MAKE) --no-print-directory toy-graph
 	@echo
-	@echo "=== 5/6  Stage 1 exit gate ================================="
+	@echo "=== 5/7  Stage 1 exit gate ================================="
 	@$(MAKE) --no-print-directory smoke
 	@echo
-	@echo "=== 6/6  Stage 2 exit gate ================================="
+	@echo "=== 6/7  Stage 2 exit gate ================================="
 	@$(MAKE) --no-print-directory snapshot
+	@echo
+	@echo "=== 7/7  Stage 3 exit gate ================================="
+	@$(MAKE) --no-print-directory decide

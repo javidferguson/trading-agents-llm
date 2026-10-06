@@ -27,7 +27,7 @@ Two processes that communicate through a file, never a shared event loop:
 | **0** | Skeleton, pinned deps, compose, Langfuse, toy graph | **done** |
 | **1** | LLM router + structured output | **done** |
 | 2 | Providers, cache, metrics | **2a-2c done** (76 metrics); Finnhub + FRED need keys |
-| 3 | Vertical slice → `proposal.json` | not started |
+| **3** | Vertical slice → `proposal.json` | **done** |
 | 4 | Analysts + research debate | not started |
 | 5 | Risk debate + fund manager | not started |
 | 6 | Intent, sizing, compliance | not started |
@@ -102,6 +102,8 @@ report.
 - `make gdelt` — collect news tone. **Its window closes**: GDELT serves a
   rolling ~3 months, so uncollected days are unrecoverable. Run
   `--days 90` once to backfill.
+- `make decide` — the Stage 3 exit gate: a real decision end to end,
+  written to `data/proposals/`. `SYMBOL=NVDA make decide` for another name.
 - `make smoke` — the Stage 1 exit gate: a real `AnalystReport` out of a local 8B
   model, showing attempts, latency, tokens and the model digest.
 

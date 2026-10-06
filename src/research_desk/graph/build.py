@@ -122,3 +122,35 @@ def build_fanout_graph(
     graph.add_edge(after[0], END)
 
     return graph.compile(checkpointer=_saver(checkpoint))
+
+
+def build_decision_graph(ctx: NodeContext, *, checkpoint: bool = False) -> Any:
+    """The Stage 3 vertical slice: ``prefetch -> market_analyst -> trader -> persist``.
+
+    Three nodes plus a writer, one of them not an LLM. The plan is emphatic
+    about why this shape comes first:
+
+    > *"This is the highest-value de-risking step in the plan and it is worth
+    > protecting from the temptation to build stage 4 first. If market analyst
+    > -> trader does not produce something sane, more agents will not fix it;
+    > they will produce a more confident version of the same nonsense."*
+
+    Stage 4 inserts the three remaining analysts as a parallel fan-out between
+    prefetch and the researchers, which is why ``build_fanout_graph`` already
+    exists and is already tested for the reducer bug.
+    """
+    from .nodes.market_analyst import market_analyst
+    from .nodes.persist import persist
+    from .nodes.prefetch import prefetch
+    from .nodes.trader import trader
+
+    return build_linear_graph(
+        [
+            ("prefetch", prefetch),
+            ("market_analyst", market_analyst),
+            ("trader", trader),
+            ("persist", persist),
+        ],
+        ctx,
+        checkpoint=checkpoint,
+    )
