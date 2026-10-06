@@ -26,6 +26,7 @@ from .config import (
     ConfigError,
     config_hash,
     load_config,
+    ib_endpoints,
     load_settings,
     load_yaml,
 )
@@ -138,10 +139,7 @@ def _check_gateway(settings: Any) -> bool:
     "unreachable", because the two have opposite fixes: one means *start*
     something, the other means *stop* something.
     """
-    candidates = [
-        (settings.ib_host, settings.ib_port),
-        ("127.0.0.1", settings.ib_host_port),
-    ]
+    candidates = ib_endpoints(settings)
 
     for host, port in candidates:
         try:

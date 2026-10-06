@@ -25,7 +25,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from research_desk.config import load_settings, load_yaml  # noqa: E402
+from research_desk.config import (  # noqa: E402
+    ConfigError,
+    load_settings,
+    load_yaml,
+    resolve_ib_endpoint,
+)
 from research_desk.execution.bars import DEFAULT_DURATION, fetch_and_cache  # noqa: E402
 from research_desk.logging_setup import setup_logging  # noqa: E402
 from research_desk.providers.cache import Cache  # noqa: E402
@@ -76,15 +81,23 @@ def main(argv: list[str] | None = None) -> int:
     symbols = [s.upper() for s in (args.symbols or universe_symbols())]
     end = date.fromisoformat(args.end) if args.end else None
 
-    print(f"Fetching {len(symbols)} symbol(s) from {settings.ib_host}:{settings.ib_port}")
+    # This script runs on the HOST, so the container hostname in .env will not
+    # resolve. Probe both and say which one answered.
+    try:
+        host, port = resolve_ib_endpoint(settings)
+    except ConfigError as exc:
+        print(f"FAILED: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Fetching {len(symbols)} symbol(s) from {host}:{port}")
     print(f"  {', '.join(symbols)}\n")
 
     try:
         written = asyncio.run(fetch_and_cache(
             symbols,
             Cache(settings.cache_dir),
-            host=settings.ib_host,
-            port=settings.ib_port,
+            host=host,
+            port=port,
             # 12, not 11: 11 is `execute`'s slot and a clientId collision does
             # not error, it silently fails to connect (migration plan §0).
             client_id=12,

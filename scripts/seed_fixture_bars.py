@@ -109,6 +109,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--symbols", nargs="*", default=None)
     parser.add_argument("--days", type=int, default=1300, help="~5 years of weekdays")
     parser.add_argument("--end", default=None, help="YYYY-MM-DD (default: today)")
+    parser.add_argument("--force", action="store_true",
+                        help="overwrite symbols that already hold real IB bars")
     args = parser.parse_args(argv)
 
     universe = load_yaml("universe.yaml")
@@ -123,6 +125,25 @@ def main(argv: list[str] | None = None) -> int:
 
     end = date.fromisoformat(args.end) if args.end else date.today()
     cache = Cache(load_settings().cache_dir)
+
+    # Refuse to clobber real bars. This script writes to the SAME cache keys
+    # `make bars` does, so without this a stray run silently replaces market
+    # data with a random walk -- and the only sign would be a beta of 0.13
+    # where it should be 0.68, which nobody checks.
+    if not args.force:
+        real = []
+        for symbol in symbols:
+            entry = cache.get("ib", "daily_bars", as_of=None, symbol=symbol)
+            if entry and (entry.get("payload") or {}).get("source") == "ib":
+                real.append(symbol)
+        if real:
+            print(f"REFUSING: {len(real)} symbol(s) already hold REAL IB bars:",
+                  file=sys.stderr)
+            print(f"  {', '.join(real)}", file=sys.stderr)
+            print("\nOverwriting them with synthetic data would be silent and "
+                  "hard to notice.\nUse --force if that is genuinely what you "
+                  "want, or --symbols to pick others.", file=sys.stderr)
+            return 1
 
     print("!! SYNTHETIC DATA -- not market prices. source=fixture on every bar.\n")
     for symbol in symbols:

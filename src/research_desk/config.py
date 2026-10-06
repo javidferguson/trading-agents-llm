@@ -186,6 +186,53 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
     )
 
 
+def ib_endpoints(settings: Settings) -> list[tuple[str, int]]:
+    """Candidate ``(host, port)`` pairs for the Gateway, in order to try.
+
+    There are genuinely two, and which one works depends on where the calling
+    process runs -- a distinction that is invisible until it bites:
+
+    * ``desk-ib-gateway:4004`` -- the container name and the socat paper port.
+      Resolvable only from inside ``trading-llm-network``.
+    * ``127.0.0.1:4012`` -- the published mapping. Works from a host shell and
+      does not exist inside the network.
+
+    ``scripts/fetch_bars.py`` runs on the host via ``uv run`` while its
+    defaults name the container, which produced exactly the confusing failure
+    this exists to prevent: ``gaierror(8, 'nodename nor servname provided')``
+    from a Gateway that was up, healthy and logged in.
+    """
+    return [
+        (settings.ib_host, settings.ib_port),
+        ("127.0.0.1", settings.ib_host_port),
+    ]
+
+
+def resolve_ib_endpoint(settings: Settings, *, timeout: float = 3.0) -> tuple[str, int]:
+    """The first Gateway endpoint that actually accepts a TCP connection.
+
+    Raises ``ConfigError`` naming both attempts when neither answers, because
+    "connection failed" without saying *what was dialled* is most of why this
+    class of problem takes twenty minutes.
+    """
+    import socket
+
+    tried = []
+    for host, port in ib_endpoints(settings):
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return host, port
+        except OSError as exc:
+            tried.append(f"{host}:{port} ({exc.strerror or type(exc).__name__})")
+
+    raise ConfigError(
+        "No IB Gateway reachable. Tried:\n"
+        + "\n".join(f"    {t}" for t in tried)
+        + "\n  Start it with `make gateway-start`, and check `make gateway-logs`"
+        "\n  if it is running but not yet logged in."
+    )
+
+
 def load_yaml(name: str, *, config_dir: Path | None = None) -> dict[str, Any]:
     """Load one config file. Raises ``ConfigError`` with a path, not a traceback."""
     path = (config_dir or CONFIG_DIR) / name
