@@ -8,7 +8,7 @@
 # So err WIDE. Caching a symbol you never trade costs a few API calls a day;
 # adding one later costs three months of unrecoverable history.
 
-benchmark: SPY
+benchmark: SPY # Similar: [QQQ, VOO, IVV, VTI, DIA] | Alternatives: [QQQM, VUG, VGT, ONEQ, QQEW]
 
 # ---------------------------------------------------------------------------
 # gdelt_query
@@ -102,6 +102,47 @@ symbols:
     name: "Johnson & Johnson"
     sector_etf: XLV
     gdelt_query: '("Johnson & Johnson" OR "Johnson and Johnson")'
+
+  # ---------------------------------------------------------------------------
+  # Added because they appear as theme exemplars in portfolio-intent.yaml.
+  # An exemplar with no universe entry collects no sentiment, and the GDELT
+  # window is ~3 months -- so the gap would have been silent and permanent.
+  # tests/test_config.py now asserts every exemplar is listed here.
+  # ---------------------------------------------------------------------------
+
+  - symbol: MRVL
+    name: "Marvell Technology, Inc."
+    sector_etf: XLK
+    gdelt_query: '("Marvell Technology" OR "Marvell Semiconductor")'
+    # Bare "Marvell" collects Marvel Entertainment coverage -- one letter apart
+    # and vastly more numerous. Both terms kept explicit for that reason.
+
+  - symbol: TSM
+    name: "Taiwan Semiconductor Manufacturing Company Limited"
+    sector_etf: XLK
+    gdelt_query: '("Taiwan Semiconductor" OR TSMC)'
+    # ADR. It files 20-F, not 10-K, so the EDGAR companyfacts shape differs
+    # from every other name here -- several us-gaap tags are absent and the
+    # Piotroski F-score (§7.1) cannot be computed the same way. Expect the
+    # fundamentals path to need a branch at Stage 2, and prefer an explicit
+    # `None with a reason` over a silently partial score.
+    files_20f: true
+
+  - symbol: BRK.B
+    name: "Berkshire Hathaway Inc. Class B"
+    sector_etf: XLF
+    gdelt_query: '("Berkshire Hathaway" OR "Warren Buffett")'
+    # Share-class tickers are spelled differently by every provider, and the
+    # failure mode is a silently EMPTY price series rather than an error.
+    provider_symbols:
+      stooq: "brk-b.us"
+      ib: "BRK B"            # IB uses a space; SMART/USD
+      yahoo: "BRK-B"
+    # Financials screening does not transfer to a conglomerate holding company:
+    # gross profitability and accruals (§7.1) are close to meaningless here,
+    # and book/price is the metric that actually means something. Worth a
+    # prompt caveat rather than pretending the usual quality stack applies.
+    quality_metrics_apply: false
 
 # The eleven SPDR sector ETFs, for reference. Add a symbol's mapping above
 # rather than inferring one at runtime.

@@ -5,6 +5,17 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
+# `uv run`, with VIRTUAL_ENV cleared. If you have another venv active (a global
+# dev env, say), uv prints a warning on EVERY command:
+#
+#   warning: `VIRTUAL_ENV=...` does not match the project environment path
+#   `.venv` and will be ignored
+#
+# It is only a warning -- uv already does the right thing -- but it buries real
+# output. Clearing the variable for the subprocess silences it without changing
+# which environment is used.
+UV := VIRTUAL_ENV= uv
+
 # --env-file is not optional here. Compose resolves ${VAR} interpolation against
 # a .env in the PROJECT directory, which defaults to the first -f file's parent
 # -- docker/, not the repo root. Without this the Langfuse init keys silently
@@ -25,7 +36,7 @@ help:  ## List targets
 
 .PHONY: setup
 setup: .env  ## Create .env and install the pinned dependency set
-	uv sync --all-extras
+	$(UV) sync --all-extras
 	@echo
 	@echo "Next: make langfuse-up, then make doctor"
 
@@ -35,7 +46,7 @@ setup: .env  ## Create .env and install the pinned dependency set
 
 .PHONY: lock
 lock:  ## Re-resolve uv.lock. LangGraph pins are exact ON PURPOSE (§1) -- upgrade deliberately.
-	uv lock
+	$(UV) lock
 
 # --------------------------------------------------------------------------- #
 # Checks
@@ -43,11 +54,11 @@ lock:  ## Re-resolve uv.lock. LangGraph pins are exact ON PURPOSE (§1) -- upgra
 
 .PHONY: doctor
 doctor:  ## Full environment report: config, dirs, ollama, langfuse, gateway
-	uv run desk doctor
+	$(UV) run desk doctor
 
 .PHONY: config-check
 config-check:  ## Parse and validate config/, and print the config hash
-	uv run desk config-check
+	$(UV) run desk config-check
 
 .PHONY: check-ollama
 check-ollama:  ## Curl Ollama /api/tags FROM INSIDE THE CONTAINER -- see architecture §10
@@ -68,17 +79,49 @@ check-ollama:  ## Curl Ollama /api/tags FROM INSIDE THE CONTAINER -- see archite
 		}
 
 .PHONY: check-gateway
-check-gateway:  ## One line on whether the IB Gateway is up. This repo never starts one.
-	@nc -z -G 3 $${IB_HOST_LOCAL:-127.0.0.1} $${IB_PORT_LOCAL:-4002} 2>/dev/null \
-		&& echo "ok   IB Gateway reachable on 127.0.0.1:4002" \
-		|| echo "warn IB Gateway not reachable. It is owned by the ORB+GEX repo -- run \`make gateway-start\` THERE. Not needed until Stage 7."
+check-gateway:  ## Is our Gateway up? And is the ORB engine's conflicting?
+	@$(UV) run python scripts/check_gateway_exclusive.py || true
+	@nc -z -G 3 127.0.0.1 $${IB_HOST_PORT:-4012} 2>/dev/null \
+		&& echo "ok   desk-ib-gateway reachable on 127.0.0.1:$${IB_HOST_PORT:-4012}" \
+		|| echo "warn desk-ib-gateway not running. \`make gateway-start\`. Not needed until Stage 7."
 
-.PHONY: check-network
-check-network:  ## Ensure the shared trading-network exists (the ORB+GEX repo creates it)
-	@docker network inspect trading-network >/dev/null 2>&1 \
-		&& echo "ok   trading-network exists" \
-		|| { echo "warn trading-network missing. Start the ORB+GEX stack, or:"; \
-		     echo "       docker network create trading-network"; }
+# --------------------------------------------------------------------------- #
+# IB Gateway -- OURS. Never run it alongside the ORB+GEX engine's.
+# --------------------------------------------------------------------------- #
+
+.PHONY: gateway-start
+gateway-start:  ## Start this project's IB Gateway (refuses if the ORB one is up)
+	@$(UV) run python scripts/check_gateway_exclusive.py
+	@grep -qE '^IB_USERNAME=.+' .env \
+		|| { echo "IB_USERNAME is empty in .env -- the Gateway will start and sit"; \
+		     echo "on the login screen forever. Fill it in first."; exit 1; }
+	$(COMPOSE) --profile execute up -d ib-gateway
+	@echo
+	@echo "Starting. First login can take a minute, and if IB asks for 2FA you"
+	@echo "will only see it over VNC:  open vnc://localhost:5912"
+	@echo "Watch progress with: make gateway-logs"
+
+.PHONY: gateway-stop
+gateway-stop:  ## Stop this project's IB Gateway. Never touches ajj-ib-gateway.
+	$(COMPOSE) --profile execute stop ib-gateway
+
+.PHONY: gateway-logs
+gateway-logs:  ## Tail the Gateway log -- where login and 2FA problems surface
+	$(COMPOSE) --profile execute logs -f --tail=100 ib-gateway
+
+.PHONY: gateway-vnc
+gateway-vnc:  ## Open the Gateway UI (needs VNC_PASSWORD set in .env)
+	@grep -qE '^VNC_PASSWORD=.+' .env \
+		|| { echo "VNC_PASSWORD is empty in .env, so the image never starts x11vnc"; \
+		     echo "and nothing is listening on 5912. Set it and restart the Gateway."; exit 1; }
+	open vnc://localhost:5912
+
+.PHONY: models
+models:  ## Pull every Ollama model config/models.yaml asks for
+	@$(UV) run python -c "import yaml,sys; \
+p=yaml.safe_load(open('config/models.yaml'))['profiles']; \
+print('\n'.join(sorted({v['model'] for v in p.values() if v.get('provider')=='ollama'})))" \
+	| while read -r m; do echo ">> ollama pull $$m"; ollama pull "$$m"; done
 
 # --------------------------------------------------------------------------- #
 # Stage 0 exit gate
@@ -86,7 +129,7 @@ check-network:  ## Ensure the shared trading-network exists (the ORB+GEX repo cr
 
 .PHONY: toy-graph
 toy-graph:  ## THE STAGE 0 GATE: run two nodes, see two spans in Langfuse
-	uv run desk toy-graph --symbol $${SYMBOL:-SPY}
+	$(UV) run desk toy-graph --symbol $${SYMBOL:-SPY}
 
 # --------------------------------------------------------------------------- #
 # Containers
@@ -111,7 +154,9 @@ langfuse-down:  ## Stop Langfuse, keeping its volumes
 	$(COMPOSE) --profile langfuse down
 
 .PHONY: down
-down:  ## Stop everything this repo started. Never touches the IB Gateway.
+down:  ## Stop everything this repo started -- including OUR Gateway, never the ORB one.
+	# Scoped to this compose project, so ajj-ib-gateway is untouched by
+	# construction: it belongs to a different project and is not in these files.
 	$(COMPOSE) --profile langfuse --profile execute --profile ollama down
 
 .PHONY: logs
@@ -124,15 +169,15 @@ logs:  ## Tail logs from every running service
 
 .PHONY: gdelt
 gdelt:  ## Collect one day of GDELT tone/volume for the universe. Run it daily.
-	uv run python scripts/gdelt_collect.py
+	$(UV) run python scripts/gdelt_collect.py
 
 .PHONY: gdelt-status
 gdelt-status:  ## How many days of sentiment history exist, and where the gaps are
-	uv run python scripts/gdelt_collect.py --status
+	$(UV) run python scripts/gdelt_collect.py --status
 
 .PHONY: gdelt-probe
 gdelt-probe:  ## Measure how far back GDELT's API actually serves (architecture §7.5 asks)
-	uv run python scripts/gdelt_collect.py --probe-window
+	$(UV) run python scripts/gdelt_collect.py --probe-window
 
 # --------------------------------------------------------------------------- #
 # Tests
@@ -140,8 +185,26 @@ gdelt-probe:  ## Measure how far back GDELT's API actually serves (architecture 
 
 .PHONY: test
 test:  ## Run the test suite
-	uv run pytest -q
+	$(UV) run pytest -q
 
 .PHONY: test-layering
 test-layering:  ## Just the architectural boundary tests -- fast, and the ones that erode
-	uv run pytest -q tests/test_layering.py
+	$(UV) run pytest -q tests/test_layering.py
+
+# --------------------------------------------------------------------------- #
+# The one command to run after a pull
+# --------------------------------------------------------------------------- #
+
+.PHONY: verify
+verify:  ## Run the whole Stage 0 gate in order, stopping at the first failure
+	@echo "=== 1/4  config ============================================"
+	@$(MAKE) --no-print-directory config-check
+	@echo
+	@echo "=== 2/4  tests ============================================="
+	@$(UV) run pytest -q
+	@echo
+	@echo "=== 3/4  environment ======================================="
+	@$(MAKE) --no-print-directory doctor
+	@echo
+	@echo "=== 4/4  Stage 0 exit gate ================================="
+	@$(MAKE) --no-print-directory toy-graph

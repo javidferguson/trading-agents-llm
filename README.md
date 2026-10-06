@@ -41,20 +41,50 @@ Two processes that communicate through a file, never a shared event loop:
 make setup
 ```
 
-Then check the environment is actually wired up:
+Then, after any pull, the one command that checks everything:
 
 ```bash
-make doctor
+make verify
 ```
+
+It runs the Stage 0 gate in order — config, tests, environment, toy graph — and
+stops at the first real failure. `make doctor` alone gives just the environment
+report.
 
 `make help` lists everything. The three checks worth knowing:
 
 - `make check-ollama` — curls `/api/tags` **from inside the container**, which is
   where the `OLLAMA_HOST=127.0.0.1` trap actually bites (architecture §10).
-- `make check-gateway` — one line telling you whether the IB Gateway owned by the
-  ORB+GEX repo is up. This repo never starts one.
+- `make check-gateway` — whether **our** Gateway is up, and whether the ORB+GEX
+  engine's is conflicting with it. See the warning below.
+- `make models` — pulls every Ollama model `config/models.yaml` names. `doctor`
+  warns with the exact `ollama pull` command when one is missing, rather than
+  letting Stage 1 die on a 404 that looks like a router bug.
 - `make toy-graph` — the Stage 0 exit gate: a two-node LangGraph run whose nodes
   both appear as spans in Langfuse.
+
+## Never run both IB Gateways at once
+
+This repo runs **its own** Gateway, `desk-ib-gateway`, started with `make
+gateway-start`. The ORB+GEX engine runs `ajj-ib-gateway`. They use the **same IB
+credentials**, and one IB username supports exactly one Gateway session — so
+starting the second one means IB evicts somebody, possibly the one holding
+orders.
+
+Two guards, and neither is decoration:
+
+- `make gateway-start` runs `scripts/check_gateway_exclusive.py` first and
+  refuses if the other Gateway is up, naming what it found and how to stop it.
+- The container defaults to `EXISTING_SESSION_DETECTED_ACTION=secondary`, so it
+  steps aside rather than taking the session over. The ORB engine uses
+  `primary`. Overriding ours to `primary` will kill a running ORB session.
+
+Host ports are deliberately different so a connection is never ambiguous:
+
+| | Host API | Host VNC |
+|---|---|---|
+| ORB+GEX `ajj-ib-gateway` | 4002 | 5900 |
+| Research desk `desk-ib-gateway` | **4012** | **5912** |
 
 ## Corrections to the design docs, found while building Stage 0
 
@@ -75,7 +105,21 @@ did not survive contact. Recording them here rather than silently diverging:
    want to assert on spans programmatically, query ClickHouse's `events_full`
    table, not the REST API.
 
-3. **GDELT's reachable window is still unverified.** §7.5 flags a contradiction
+3. **The Gateway is no longer shared, and `trading-network` is gone.** Migration
+   plan §0 originally had this repo join the ORB engine's Gateway over an
+   external `trading-network`. That network was later removed from the machine,
+   so `docker compose up execute` failed on missing infrastructure this repo
+   does not own. Reversed: we run our own Gateway on our own
+   **`trading-llm-network`**. §0 has been rewritten rather than patched.
+
+4. **GDELT is rate-limited, and says so only in the 429 body.** The rule is one
+   request per 5 seconds, with no `Retry-After` and no published quota page.
+   Worse, a 429 has two causes wanting opposite responses — a momentary burst
+   (retry) and a sustained per-IP block (stop and wait; an IP in that state was
+   still refused after 150 s of backoff). The collector now paces on a clock
+   gate, retries twice briefly, and then tells you to wait.
+
+5. **GDELT's reachable window is still unverified.** §7.5 flags a contradiction
    in GDELT's own documentation and asks for it to be measured. `make
    gdelt-probe` measures it. That has *not* been run yet — GDELT was unreachable
    from the network this was built on, so the collector's live path is untested.

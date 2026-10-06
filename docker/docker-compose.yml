@@ -72,16 +72,120 @@ services:
     stdin_open: true
     tty: true
     environment:
-      IB_HOST: ${IB_HOST:-ajj-ib-gateway}
-      # 4004 from inside trading-network; 4002 from the host.
+      IB_HOST: ${IB_HOST:-desk-ib-gateway}
+      # 4004 is socat-paper INSIDE the gateway container (see ib-gateway below).
+      # From the host it is 4012.
       IB_PORT: ${IB_PORT:-4004}
       # 11 is the research desk's execute slot. ib_async connections that
       # collide on clientId do NOT error -- they silently fail to connect.
       IB_CLIENT_ID: ${IB_CLIENT_ID:-11}
       # Must match the exchange, or IB stamps bars in UTC.
       TZ: ${TZ:-America/New_York}
-    networks: [default, trading-network]
+    depends_on:
+      ib-gateway:
+        condition: service_started
+    networks: [default, trading-llm-network]
     profiles: [execute]     # Stage 7. Not started by `make up`.
+
+  # ---------------------------------------------------------------------------
+  # ib-gateway -- THIS PROJECT'S OWN Gateway. Not the ORB+GEX engine's.
+  #
+  # Reverses migration plan §0 ("One IB Gateway, two consumers"). Independence
+  # beat sharing, but the reason §0 gave for sharing is real and does not go
+  # away: ONE IB USERNAME SUPPORTS ONE GATEWAY SESSION. Running this at the
+  # same time as the ORB engine's `ajj-ib-gateway` means two logins to one
+  # account, and one of them loses.
+  #
+  #   >> NEVER RUN BOTH. `make gateway-start` refuses if the other is up. <<
+  #
+  # Most of what follows is carried from
+  #   automated-trading-engine/docker/docker-compose-options-trader.yml
+  # with its comments. Each line there cost real debugging; re-deriving them
+  # here would be pure loss.
+  # ---------------------------------------------------------------------------
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:latest
+    container_name: desk-ib-gateway
+    env_file: [../.env]
+    environment:
+      TWS_USERID: ${IB_USERNAME:-}
+      TWS_PASSWORD: ${IB_PASSWORD:-}
+
+      # Paper only. There is no live path in this project.
+      TRADING_MODE: ${TRADING_MODE:-paper}
+
+      # Without this the image writes TimeZone=Etc/UTC into jts.ini and IB
+      # returns historical bar timestamps in UTC. The ORB engine lost a session
+      # to this: bars stamped 13:30 matched nothing looking for 09:30.
+      TIME_ZONE: ${TIME_ZONE:-America/New_York}
+
+      # The image starts x11vnc ONLY when this is set. Unset, port 5900 is
+      # published but nothing listens -- and you cannot see a login dialog that
+      # is waiting for input, which is exactly when you need to.
+      VNC_SERVER_PASSWORD: ${VNC_PASSWORD:-}
+
+      IBC_HEADLESS: "true"
+      READ_ONLY_API: "no"
+      RELOGIN_AFTER_TWOFA_TIMEOUT: "yes"
+      TWOFA_TIMEOUT_ACTION: restart
+
+      # THE DELIBERATE DIVERGENCE FROM THE ORB CONFIG, which uses `primary`.
+      #
+      # This is IBC's answer to IB's "Existing session detected" dialog.
+      # `primary` means "take over" -- and taking over would silently kill a
+      # running ORB trading session, mid-position, from a container you started
+      # to do research. `secondary` means this Gateway steps aside and does not
+      # start.
+      #
+      # Failing to start is recoverable in ten seconds. A half-killed trading
+      # session is not. If you genuinely want this one to win, set it in .env
+      # deliberately rather than changing the default here.
+      EXISTING_SESSION_DETECTED_ACTION: ${EXISTING_SESSION_DETECTED_ACTION:-secondary}
+
+    # -------------------------------------------------------------------------
+    # PORTS -- read before "fixing" these numbers. They are correct.
+    #
+    # The gnzsnz image runs IB Gateway bound to CONTAINER-localhost on 4001
+    # (live) / 4002 (paper). Those are NOT reachable from outside. The image
+    # runs socat to relay:
+    #
+    #     container 4003  ->  gateway 4001  (live)
+    #     container 4004  ->  gateway 4002  (paper)
+    #
+    # So anything connecting from outside must use the socat ports.
+    #
+    # HOST PORTS DIFFER FROM THE ORB ENGINE ON PURPOSE (it uses 4002 and 5900).
+    # Distinct numbers mean you always know which Gateway you reached, and the
+    # exclusivity guard can probe for the other one unambiguously.
+    #
+    #   execute container -> desk-ib-gateway:4004   (over trading-llm-network)
+    #   your Mac          -> 127.0.0.1:4012
+    # -------------------------------------------------------------------------
+    ports:
+      - "127.0.0.1:4012:4004"   # paper API  (host 4012 -> socat paper)
+      # Live (host 4011 -> socat live). Left commented deliberately: with
+      # TRADING_MODE=paper nothing is behind it, but it becomes a LIVE API
+      # endpoint the moment TRADING_MODE flips.
+      # - "127.0.0.1:4011:4003"
+      - "127.0.0.1:5912:5900"   # VNC
+
+    restart: unless-stopped
+    networks: [trading-llm-network]
+    profiles: [execute]     # Stage 7. Not started by `make up`.
+
+    # Two things this must NOT do:
+    #   1. Use `nc` -- not installed in the gnzsnz image, so the check errors
+    #      and the container is permanently "unhealthy".
+    #   2. Probe 4004 -- that is socat, which listens from container start
+    #      whether or not the Gateway is up, so it reports healthy while the
+    #      Gateway is still sitting on the login screen.
+    # Probe the Gateway's own port, with bash, which is present.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/127.0.0.1/4002"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   # ---------------------------------------------------------------------------
   # ollama -- Linux/NVIDIA and CI only. On macOS run it natively (§10).
@@ -101,8 +205,14 @@ services:
     profiles: [ollama]
 
 networks:
-  # Declared external: it belongs to the ORB+GEX repo's compose file, which
-  # creates it. `docker network create trading-network` if it does not exist.
-  trading-network:
-    external: true
-    name: trading-network
+  # OURS, created by this compose project. Named distinctly from the ORB+GEX
+  # engine's `trading-network` so the two projects can never accidentally share
+  # a bridge -- and so that a stale reference fails loudly instead of silently
+  # attaching to the wrong stack.
+  #
+  # It used to be `external: true` pointing at the ORB engine's network, which
+  # broke the moment that network was removed: `docker compose up execute`
+  # failed on a missing external network rather than on anything to do with us.
+  trading-llm-network:
+    driver: bridge
+    name: trading-llm-network

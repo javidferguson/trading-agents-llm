@@ -14,13 +14,21 @@ import argparse
 import asyncio
 import json
 import socket
+import subprocess
 import sys
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .config import ConfigError, config_hash, load_config, load_settings
+from .config import (
+    REPO_ROOT,
+    ConfigError,
+    config_hash,
+    load_config,
+    load_settings,
+    load_yaml,
+)
 from .context import NodeContext
 from .logging_setup import setup_logging
 from .models.state import DecisionState
@@ -67,16 +75,73 @@ def _check_ollama(settings: Any) -> bool:
     return True
 
 
-def _check_gateway(settings: Any) -> bool:
-    """TCP-only. This repo never starts a Gateway; the ORB+GEX repo owns it.
+def _check_models(settings: Any) -> bool:
+    """Are the models config/models.yaml names actually pulled?
 
-    Two addresses, because there are genuinely two. ``ajj-ib-gateway:4004`` is
-    the name from inside ``trading-network`` and cannot resolve from the host;
-    ``127.0.0.1:4002`` is the host mapping and does not exist inside the network.
-    Checking only the configured one makes `desk doctor` warn forever when run
-    from a shell, which trains you to ignore it.
+    A warning, never a failure. The desk starts fine without them -- Stage 0
+    needs no model at all -- but Stage 1's first run would otherwise die inside
+    the Ollama client with a 404 on a model name, which reads like a bug in the
+    router rather than a missing download.
+
+    Prints the literal fix, because "pull the model" is less useful than the
+    command that pulls it.
     """
-    candidates = [(settings.ib_host, settings.ib_port), ("127.0.0.1", 4002)]
+    import httpx
+
+    try:
+        profiles = load_yaml("models.yaml").get("profiles") or {}
+    except ConfigError:
+        return True  # the config check already reported this
+
+    # profile name -> model, for ollama profiles only. Hosted profiles have
+    # nothing to pull.
+    wanted: dict[str, str] = {
+        name: body["model"]
+        for name, body in profiles.items()
+        if body.get("provider") == "ollama" and body.get("model")
+    }
+    if not wanted:
+        return True
+
+    try:
+        response = httpx.get(f"{settings.ollama_base_url}/api/tags", timeout=5.0)
+        response.raise_for_status()
+        present = {m.get("model", "") for m in response.json().get("models", [])}
+    except Exception:
+        # Ollama being down is _check_ollama's story to tell, not ours.
+        _line(WARN, "models", "could not ask Ollama which models are pulled")
+        return True
+
+    missing = {n: m for n, m in wanted.items() if m not in present}
+    if not missing:
+        _line(OK, "models", f"{len(wanted)} configured model(s) present: "
+                            f"{', '.join(sorted(set(wanted.values())))}")
+        return True
+
+    _line(WARN, "models", f"{len(missing)} of {len(wanted)} configured model(s) not pulled")
+    for profile, model in sorted(missing.items(), key=lambda kv: kv[1]):
+        print(f"         ollama pull {model:<22} # profile: {profile}")
+    print("         or just:  make models")
+    return True
+
+
+def _check_gateway(settings: Any) -> bool:
+    """TCP-only, and it reports the ORB conflict as its own condition.
+
+    Two addresses, because there genuinely are two. ``desk-ib-gateway:4004`` is
+    the socat-paper port inside the container and cannot resolve from the host;
+    ``127.0.0.1:4012`` is its published mapping and does not exist inside the
+    network. Probing only the configured one makes `desk doctor` warn forever
+    when run from a shell, which trains you to ignore it.
+
+    A detected ORB Gateway is surfaced separately rather than folded into
+    "unreachable", because the two have opposite fixes: one means *start*
+    something, the other means *stop* something.
+    """
+    candidates = [
+        (settings.ib_host, settings.ib_port),
+        ("127.0.0.1", settings.ib_host_port),
+    ]
 
     for host, port in candidates:
         try:
@@ -84,14 +149,49 @@ def _check_gateway(settings: Any) -> bool:
                 pass
         except OSError:
             continue
-        _line(OK, "ib gateway", f"{host}:{port} reachable")
+        _line(OK, "ib gateway", f"{host}:{port} reachable (desk-ib-gateway)")
         return True
 
+    # Ours is down. Is the other one up? That changes the advice entirely.
+    conflict = _orb_gateway_detected()
     tried = ", ".join(f"{h}:{p}" for h, p in candidates)
+
+    if conflict:
+        _line(WARN, "ib gateway", f"ours is down, but the ORB+GEX Gateway IS up ({conflict})")
+        print("         Both use the same IB credentials and one username supports")
+        print("         one session, so they must never run together.")
+        print("         Stop it first:  docker stop ajj-ib-gateway")
+        return False
+
     _line(WARN, "ib gateway", f"not reachable ({tried})")
-    print("         not needed until Stage 7. The Gateway is owned by the")
-    print("         ORB+GEX repo -- run `make gateway-start` *there*.")
+    print("         not needed until Stage 7. Start it with `make gateway-start`")
+    print("         once IB_USERNAME / IB_PASSWORD are set in .env.")
     return False
+
+
+def _orb_gateway_detected() -> str | None:
+    """Describe the ORB+GEX Gateway if it is running, else None.
+
+    Delegates to the standalone guard so there is one definition of "the other
+    Gateway is up" rather than two that can drift.
+    """
+    script = REPO_ROOT / "scripts" / "check_gateway_exclusive.py"
+    if not script.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [sys.executable, str(script), "--quiet"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if result.returncode != 1:
+        return None
+    for line in result.stderr.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            return stripped[2:]
+    return "see `make check-gateway`"
 
 
 def _check_langfuse(settings: Any) -> bool:
@@ -143,6 +243,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         _check_config(),
         _check_dirs(settings),
         _check_ollama(settings),
+        _check_models(settings),
         _check_langfuse(settings),
     ]
     # The Gateway is a warning, never a failure, until Stage 7.
