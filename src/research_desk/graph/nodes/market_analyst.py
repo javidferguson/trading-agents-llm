@@ -33,6 +33,14 @@ async def market_analyst(state: DecisionState, ctx: NodeContext) -> NodePatch:
     if router is None:
         return {"errors": [NodeError(node=NODE, kind="misconfigured",
                                      message="no LLM router on the context")]}
+    budget = ctx.extras.get("budget")
+    if budget is not None and (spent := budget.exhausted()):
+        return {
+            "errors": [NodeError(node=NODE, kind="budget",
+                                 message=f"budget exhausted before this node: {spent}")],
+            "notes": [f"{NODE}: skipped, budget exhausted ({spent})"],
+        }
+
     if state.snapshot is None:
         return {
             "errors": [NodeError(node=NODE, kind="no_snapshot",
@@ -53,6 +61,9 @@ async def market_analyst(state: DecisionState, ctx: NodeContext) -> NodePatch:
         ],
         degraded_fields={"kind": "market"},
     )
+
+    if budget is not None:
+        budget.record(calls=len(result.records), usd=result.usd)
 
     patch: NodePatch = {
         "analyst_reports": {"market": result.value},

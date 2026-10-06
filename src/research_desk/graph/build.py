@@ -233,3 +233,86 @@ def _debate_router(state: DecisionState) -> str:
     unrecognised state stops.
     """
     return "stop" if (state.research_debate.stop_reason or "max_rounds") else "continue"
+
+
+def build_full_graph(ctx: NodeContext, *, checkpoint: bool = False) -> Any:
+    """Stage 5: the whole desk. §3's node list, end to end.
+
+        prefetch -> {4 analysts} -> bull -> bear -> facilitator
+                                              |
+                                      (loop)  v (stop)
+                                            trader
+                                              |
+                       risky -> neutral -> safe -> fund_manager
+                                              |
+                                      (loop)  v (stop)
+                                           persist
+
+    13 LLM calls at one round each, against a 20-call budget that leaves room
+    for repair turns and nothing more. Both debates enforce the same four
+    termination conditions through the same helpers (§5), and budget is
+    checked before every call rather than after -- a check after the fact is
+    an audit, not a cap.
+    """
+    from .nodes.analysts import ANALYSTS, make_analyst
+    from .nodes.persist import persist
+    from .nodes.prefetch import prefetch
+    from .nodes.researchers import make_researcher, research_facilitator
+    from .nodes.risk import RISK_TRIO, fund_manager, make_risk_debater
+    from .nodes.trader import trader
+
+    graph = StateGraph(DecisionState)
+
+    for name, fn in (
+        ("prefetch", prefetch),
+        ("bull_researcher", make_researcher("bull")),
+        ("bear_researcher", make_researcher("bear")),
+        ("research_facilitator", research_facilitator),
+        ("trader", trader),
+        ("fund_manager", fund_manager),
+        ("persist", persist),
+    ):
+        graph.add_node(name, _bind(name, fn, ctx))
+
+    for kind, node_name in ANALYSTS.items():
+        graph.add_node(node_name, _bind(node_name, make_analyst(kind), ctx))
+    for speaker, node_name in RISK_TRIO:
+        graph.add_node(node_name, _bind(node_name, make_risk_debater(speaker, node_name), ctx))
+
+    graph.add_edge(START, "prefetch")
+    for node_name in ANALYSTS.values():
+        graph.add_edge("prefetch", node_name)
+        graph.add_edge(node_name, "bull_researcher")
+
+    graph.add_edge("bull_researcher", "bear_researcher")
+    graph.add_edge("bear_researcher", "research_facilitator")
+    graph.add_conditional_edges(
+        "research_facilitator", _debate_router,
+        {"continue": "bull_researcher", "stop": "trader"},
+    )
+
+    # The trio argue in order, each seeing the last: that is what makes it a
+    # debate rather than three parallel opinions, and the neutral member's
+    # whole job is arbitrating between the other two.
+    graph.add_edge("trader", RISK_TRIO[0][1])
+    for (_, before), (_, after) in zip(RISK_TRIO, RISK_TRIO[1:]):
+        graph.add_edge(before, after)
+    graph.add_edge(RISK_TRIO[-1][1], "fund_manager")
+
+    graph.add_conditional_edges(
+        "fund_manager", _risk_router,
+        {"continue": RISK_TRIO[0][1], "stop": "persist"},
+    )
+    graph.add_edge("persist", END)
+
+    return graph.compile(checkpointer=_saver(checkpoint))
+
+
+def _risk_router(state: DecisionState) -> str:
+    """Another risk round, or write the decision?
+
+    Same contract as `_debate_router`: read the stop_reason the fund manager
+    computed rather than re-deciding, and treat a missing one as a stop. A
+    conditional edge that can return "continue" forever is an infinite graph.
+    """
+    return "stop" if (state.risk_debate.stop_reason or "max_rounds") else "continue"

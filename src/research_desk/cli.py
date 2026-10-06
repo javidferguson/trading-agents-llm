@@ -359,9 +359,14 @@ def cmd_toy_graph(args: argparse.Namespace) -> int:
 
 
 async def _run_decide(
-    symbol: str, as_of: date, preset: str | None, slice_only: bool = False
+    symbol: str, as_of: date, preset: str | None,
+    slice_only: bool = False, research_only: bool = False,
 ) -> int:
-    from .graph.build import build_decision_graph, build_research_graph
+    from .graph.build import (
+        build_decision_graph,
+        build_full_graph,
+        build_research_graph,
+    )
     from .llm.router import LLMRouter
     from .models.budget import RunBudget
     from .models.state import DecisionState
@@ -390,6 +395,7 @@ async def _run_decide(
         extras={
             "router": router, "registry": registry, "budget": budget,
             "max_research_rounds": int(debate_cfg.get("max_research_rounds", 1)),
+            "max_risk_rounds": int(debate_cfg.get("max_risk_rounds", 1)),
         },
     )
 
@@ -402,7 +408,12 @@ async def _run_decide(
     print(f"prompts={ctx.prompt_pack_version}  config={hashed}  mode={ctx.mode.value}\n")
 
     try:
-        graph = (build_decision_graph if slice_only else build_research_graph)(ctx)
+        builder = (
+            build_decision_graph if slice_only
+            else build_research_graph if research_only
+            else build_full_graph
+        )
+        graph = builder(ctx)
         result = await graph.ainvoke(initial, {"recursion_limit": 60})
     finally:
         await router.aclose()
@@ -438,6 +449,21 @@ async def _run_decide(
                   + (f" (converged: {verdict.converged_reason})" if verdict.converged else ""))
         print()
 
+    risk = state.risk_debate
+    if risk.turns:
+        print(f"RISK COMMITTEE  {risk.rounds_completed} round(s), "
+              f"stopped: {risk.stop_reason}")
+        for turn in risk.turns:
+            print(f"  r{turn.round} {turn.speaker:<8} "
+                  f"{' '.join(turn.claim.split())[:110]}")
+        rv = state.risk_verdict
+        if rv is not None:
+            print(f"  fund manager: {rv.decision.upper()} -> {rv.action} "
+                  f"{rv.target_weight_pct:.1f}% @ {rv.conviction:.2f}")
+            if rv.adjustment:
+                print(f"    adjusted: {' '.join(rv.adjustment.split())}")
+        print()
+
     if decision is None:
         print("No decision was produced.", file=sys.stderr)
         return 1
@@ -456,6 +482,11 @@ async def _run_decide(
     wall = sum(r.latency_ms or 0 for r in state.llm_calls) / 1000
     print(f"{attempts} model call(s), {repairs} repair turn(s), "
           f"{wall:.1f}s of inference, ${spend:.4f}")
+    exhausted = budget.exhausted()
+    print(f"budget: {budget.calls}/{budget.max_llm_calls} calls, "
+          f"{budget.elapsed_s:.0f}/{budget.max_wall_s:.0f}s, "
+          f"${budget.usd:.4f}/${budget.max_usd:.2f}"
+          + (f"  EXHAUSTED ({exhausted})" if exhausted else ""))
 
     if decision.degraded:
         print()
@@ -469,7 +500,9 @@ def cmd_decide(args: argparse.Namespace) -> int:
     """Run the vertical slice and write proposal.json."""
     setup_logging()
     as_of = date.fromisoformat(args.as_of) if args.as_of else date.today()
-    return asyncio.run(_run_decide(args.symbol.upper(), as_of, args.preset, args.slice))
+    return asyncio.run(_run_decide(
+        args.symbol.upper(), as_of, args.preset, args.slice, args.research
+    ))
 
 
 # --------------------------------------------------------------------------- #
@@ -695,6 +728,8 @@ def build_parser() -> argparse.ArgumentParser:
     dec.add_argument("--as-of", default=None, help="YYYY-MM-DD (default: today)")
     dec.add_argument("--slice", action="store_true",
                      help="Stage 3 shape: one analyst, no debate")
+    dec.add_argument("--research", action="store_true",
+                     help="Stage 4 shape: analysts + research debate, no risk committee")
     dec.add_argument("--preset", default="all_local",
                      help="models.yaml preset (default all_local -- hosted is Stage 5)")
     dec.set_defaults(func=cmd_decide)

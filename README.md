@@ -29,7 +29,7 @@ Two processes that communicate through a file, never a shared event loop:
 | 2 | Providers, cache, metrics | **2a-2c done** (76 metrics); Finnhub + FRED need keys |
 | **3** | Vertical slice → `proposal.json` | **done** |
 | **4** | Analysts + research debate | **done** |
-| 5 | Risk debate + fund manager | not started |
+| **5** | Risk debate + fund manager | **done** (local judge; hosted deferred) |
 | 6 | Intent, sizing, compliance | not started |
 | 7 | Execution + confirmation gate | not started |
 | 8 | Evaluation, B0–B4, the go/no-go | not started |

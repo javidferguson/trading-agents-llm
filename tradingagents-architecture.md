@@ -465,6 +465,31 @@ Two further consequences, both found by running it rather than reading docs:
   overrides anything conflicting earlier. This is not only an artificial case:
   any system prompt that disagrees with a schema produces it.
 
+### The fund manager runs locally for now (Stage 5)
+
+§6 routes `fund_manager` to `deep_hosted` and calls it "the one node worth
+paying for". It is routed to a **local quantized model** instead:
+`qwen3:32b`, Q4_K_M — 20.2 GB for 32.8B parameters is ~4.9 bits per parameter,
+where unquantized FP16 would be 65.6 GB and would not fit alongside anything
+else.
+
+Three reasons this is the right starting point rather than a compromise:
+
+- **A full run now costs $0 and needs no API key.** §12's table can be
+  re-derived against real rates when it matters rather than before anything
+  works.
+- **§11 already has the experiment.** The `trader→deep_hosted` ablation and
+  the `all_hosted` preset exist precisely to answer "is the paid node worth
+  paying for". Running local first and measuring later is what that machinery
+  is *for*; deciding by assumption now would waste it.
+- **It is a distinct model.** A fund manager sharing weights with the trader
+  is not a second opinion, and §3 node 13 exists to be a separate judgement.
+  A test asserts it never shares a model with trader, analyst or facilitator.
+
+`deep_hosted` stays defined and unrouted, and `AnthropicClient` still raises a
+clear unimplemented error — reachable only through `all_hosted`, so a routing
+mistake cannot quietly start spending.
+
 ### `think:` is a cost dial, and a large one
 
 qwen3 is a hybrid reasoning model and **thinks by default**. On an identical
@@ -1070,6 +1095,13 @@ curve may be fiction.
 | Containerized Ollama on macOS | 20–60+ min — not viable |
 | Hybrid (fund_manager hosted only) | ~3–8 min + **~$0.03** (~$40/yr at 5 symbols daily) |
 | All 14 calls hosted | seconds + **~$0.40** (~$500/yr daily; a 90-day × 5-symbol replay ≈ $180) |
+
+**As built at Stage 5: a full run is $0.** Every node including the fund
+manager runs on a local quantized model, so the table above describes a
+configuration that exists (`all_hosted`) but is not the default. Measured on
+an M5 Max: 12 model calls, ~83-112 s of inference in ~56-67 s of wall clock —
+the gap is the four-analyst fan-out genuinely running in parallel. Well inside
+`RunBudget(max_llm_calls=20, max_wall_s=900, max_usd=0.50)`.
 
 *Order-of-magnitude. Re-derive against current per-Mtok rates. Prompt caching on
 the repeated system prompts cuts input cost materially — wire it on day one.*

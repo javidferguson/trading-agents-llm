@@ -70,6 +70,20 @@ Both were found by reading output, not by tests, and neither blocks the gate.
   reads like hedging. §11's calibration plot is the thing that will actually
   answer whether their confidence means anything, and that is Stage 8.
 
+## The hosted path is still unverified
+
+`deep_hosted` is defined, `AnthropicClient` raises a clear unimplemented error,
+and nothing routes to it — so Stage 5 runs fully local at $0. What remains:
+
+- **Implement and verify `AnthropicClient`** against a real key. Deliberately
+  not written blind: the two bugs in `scripts/fetch_bars.py` were both in code
+  that had never executed.
+- **Then run §11's `trader→deep_hosted` ablation** and the `all_hosted`
+  preset, which is the actual answer to whether the one paid node earns its
+  cost. The question is live, not settled.
+- **Re-derive §12's cost table** against rates current at that time, as §12
+  explicitly asks.
+
 ## Smaller things
 
 - **`make gdelt-probe` has never run.** §7.5 flags a contradiction in GDELT's

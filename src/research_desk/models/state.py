@@ -28,7 +28,7 @@ import operator
 from datetime import date, datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .modes import RunMode
 
@@ -250,6 +250,73 @@ class ResearchVerdict(Degradable):
         }
 
 
+class RiskVerdict(Degradable):
+    """The fund manager's decision (§3 node 13). Approve, adjust or veto.
+
+    The last judgement before a human sees the order. Everything upstream was
+    advice; this is the decision, and §4 requires it to carry its own dissent
+    because that is the text the confirmation gate displays.
+    """
+
+    decision: Literal["approve", "adjust", "veto"]
+    action: Literal["BUY", "SELL", "HOLD"]
+    conviction: float = Field(ge=0, le=1)
+    target_weight_pct: float = Field(ge=0, le=100)
+    horizon_days: int = Field(ge=1, le=750)
+
+    rationale: str
+    #: The strongest SURVIVING argument against this decision. §4: this is
+    #: where the paper's explainability claim cashes out.
+    dissent: str
+    invalidation: str
+    #: What was changed and why. Empty when approved unchanged.
+    adjustment: str = ""
+
+    @field_validator("rationale", "dissent", "invalidation")
+    @classmethod
+    def _substantive(cls, value: str) -> str:
+        if len(value.split()) < 4:
+            raise ValueError(
+                "too short to be useful -- write a full sentence naming the "
+                "specific condition, not a word"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _veto_means_hold(self) -> "RiskVerdict":
+        """A veto cannot carry a trade.
+
+        Enforced in the schema rather than downstream because a vetoed BUY is
+        the single most dangerous shape this object could take -- §5's
+        "never fail toward a trade" applies doubly when the failure is a model
+        contradicting itself.
+        """
+        if self.decision == "veto" and self.action != "HOLD":
+            raise ValueError(
+                f"decision is 'veto' but action is {self.action!r}. A veto means "
+                "the trade is not made, so the action must be HOLD."
+            )
+        if self.decision == "veto" and self.target_weight_pct > 0:
+            raise ValueError(
+                "a vetoed proposal cannot carry a target weight above zero"
+            )
+        return self
+
+    @classmethod
+    def _degraded_defaults(cls) -> dict[str, Any]:
+        return {
+            "decision": "veto",
+            "action": "HOLD",
+            "conviction": 0.0,
+            "target_weight_pct": 0.0,
+            "horizon_days": 1,
+            "rationale": "Degraded: the fund manager produced no usable decision.",
+            "dissent": "No argument was recorded, so none survives.",
+            "invalidation": "Not applicable; no position is being taken.",
+            "adjustment": "",
+        }
+
+
 class TraderProposal(Degradable):
     """What the trader wants to do (§4).
 
@@ -387,6 +454,37 @@ class FinalDecision(BaseModel):
         )
 
 
+def _final_from_verdict(
+    verdict: "RiskVerdict",
+    symbol: str,
+    *,
+    expires_at: datetime,
+    stop_loss_pct: float | None = None,
+    degraded: bool = False,
+) -> "FinalDecision":
+    """Promote the fund manager's verdict. The Stage 5 replacement for the shim.
+
+    At Stage 3 ``FinalDecision.from_proposal`` promoted the trader directly
+    because there was no fund manager. There is one now, so the trader's
+    proposal is advice and this is the decision -- which is the whole point of
+    §3 node 13 and the reason `adjust` exists as a distinct outcome.
+    """
+    return FinalDecision(
+        action=verdict.action,
+        symbol=symbol.upper(),
+        conviction=verdict.conviction,
+        target_weight_pct=verdict.target_weight_pct,
+        horizon_days=verdict.horizon_days,
+        rationale=verdict.rationale,
+        dissent=verdict.dissent,
+        invalidation=verdict.invalidation,
+        stop_loss_pct=stop_loss_pct,
+        expires_at=expires_at,
+        fund_manager_adjustment=verdict.adjustment or None,
+        degraded=degraded or verdict.parse_failed,
+    )
+
+
 class LLMCallRecord(BaseModel):
     """One model call, recorded in full enough detail to replay it."""
 
@@ -487,10 +585,15 @@ class DecisionState(BaseModel):
     research_verdict: ResearchVerdict | None = None
 
     trader_proposal: TraderProposal | None = None
+
+    #: Appended to by the risk trio, so it needs a reducer like debate_turns.
+    risk_turns: Annotated[list[DebateTurn], operator.add] = Field(default_factory=list)
+    risk_debate: DebateTranscript = Field(default_factory=DebateTranscript)
+    risk_verdict: RiskVerdict | None = None
+
     final_decision: FinalDecision | None = None
 
     # --- arriving in later stages --------------------------------------------
-    # Stage 5: risk_debate
     # Stage 6: intent, portfolio, violations
     # Stage 9: memory_hits, regime
 
@@ -512,6 +615,7 @@ __all__ = [
     "DebateTurn",
     "FinalDecision",
     "ResearchVerdict",
+    "RiskVerdict",
     "TraderProposal",
     "DecisionState",
     "Degradable",

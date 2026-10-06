@@ -56,6 +56,14 @@ async def trader(state: DecisionState, ctx: NodeContext) -> NodePatch:
         return {"errors": [NodeError(node=NODE, kind="misconfigured",
                                      message="no LLM router on the context")]}
 
+    budget = ctx.extras.get("budget")
+    if budget is not None and (spent := budget.exhausted()):
+        return {
+            "errors": [NodeError(node=NODE, kind="budget",
+                                 message=f"budget exhausted before this node: {spent}")],
+            "notes": [f"{NODE}: skipped, budget exhausted ({spent})"],
+        }
+
     facts = render_snapshot(state.snapshot) if state.snapshot is not None else \
         "No market facts were available for this symbol.\n"
 
@@ -71,6 +79,9 @@ async def trader(state: DecisionState, ctx: NodeContext) -> NodePatch:
             )},
         ],
     )
+
+    if budget is not None:
+        budget.record(calls=len(result.records), usd=result.usd)
 
     patch: NodePatch = {
         "trader_proposal": result.value,

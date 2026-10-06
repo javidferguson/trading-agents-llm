@@ -22,7 +22,13 @@ from datetime import datetime, timedelta
 
 from ...config import load_yaml
 from ...context import NodeContext
-from ...models.state import DecisionState, FinalDecision, NodePatch, TraderProposal
+from ...models.state import (
+    DecisionState,
+    FinalDecision,
+    NodePatch,
+    TraderProposal,
+    _final_from_verdict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,13 +58,22 @@ async def persist(state: DecisionState, ctx: NodeContext) -> NodePatch:
             state.degraded_reason() or "no trader proposal was produced"
         )
 
-    decision = FinalDecision.from_proposal(
-        proposal,
-        state.symbol,
-        expires_at=datetime.now() + timedelta(hours=ttl_hours),
-        stop_loss_pct=risk.get("default_stop_pct"),
-        degraded=degraded,
-    )
+    expires_at = datetime.now() + timedelta(hours=ttl_hours)
+    stop_pct = risk.get("default_stop_pct")
+
+    # The fund manager decides when there is one. At Stage 3 there was not, and
+    # the trader's proposal was promoted directly -- that shim stays for the
+    # `--slice` shape, but a real verdict always wins.
+    if state.risk_verdict is not None:
+        decision = _final_from_verdict(
+            state.risk_verdict, state.symbol,
+            expires_at=expires_at, stop_loss_pct=stop_pct, degraded=degraded,
+        )
+    else:
+        decision = FinalDecision.from_proposal(
+            proposal, state.symbol,
+            expires_at=expires_at, stop_loss_pct=stop_pct, degraded=degraded,
+        )
 
     if degraded and decision.action != "HOLD":
         # Belt and braces. from_proposal copies the action, and a degraded run

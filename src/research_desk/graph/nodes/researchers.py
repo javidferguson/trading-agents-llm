@@ -185,7 +185,12 @@ def _transcript_with(state: DecisionState, turns: list[DebateTurn]) -> DebateTra
     )
 
 
-def _score_novelty(state: DecisionState, turns: list[DebateTurn]) -> list[DebateTurn]:
+def _score_novelty(
+    state: DecisionState,
+    turns: list[DebateTurn],
+    *,
+    transcript: DebateTranscript | None = None,
+) -> list[DebateTurn]:
     """Overwrite ``new_information`` with the Jaccard check where it disagrees.
 
     Two signals, deliberately. The facilitator catches a speaker who changes
@@ -194,11 +199,12 @@ def _score_novelty(state: DecisionState, turns: list[DebateTurn]) -> list[Debate
     enough, because a false continue costs a round and a false stop costs
     nothing we can measure.
     """
+    history = transcript if transcript is not None else state.research_debate
     threshold = DEFAULT_THRESHOLD
     scored: list[DebateTurn] = []
     for turn in turns:
         earlier = [
-            t.claim for t in state.research_debate.turns
+            t.claim for t in history.turns
             if t.speaker == turn.speaker and t.round < turn.round
         ]
 
@@ -232,8 +238,11 @@ def _stop_reason(
     state: DecisionState,
     ctx: NodeContext,
     turns: list[DebateTurn],
-    verdict: ResearchVerdict,
+    verdict: ResearchVerdict | None,
     round_number: int,
+    *,
+    transcript: DebateTranscript | None = None,
+    rounds_key: str = "max_research_rounds",
 ) -> str | None:
     """The four conditions of §5, in priority order. ``None`` means continue."""
     budget = ctx.extras.get("budget")
@@ -244,7 +253,7 @@ def _stop_reason(
         return "budget"
 
     # 1: a hard cap in Python.
-    max_rounds = int(ctx.extras.get("max_research_rounds", 1))
+    max_rounds = int(ctx.extras.get(rounds_key, 1))
     if round_number >= max_rounds:
         return "max_rounds"
 
@@ -252,8 +261,10 @@ def _stop_reason(
     if turns and not any(t.new_information for t in turns):
         return "no_novelty"
 
-    # 2: the only one the model influences, and only after the caps.
-    if verdict.converged:
+    # 2: the only one the model influences, and only after the caps. The
+    # risk committee has no convergence signal of its own -- the fund manager
+    # decides rather than reporting agreement -- so it passes None.
+    if verdict is not None and verdict.converged:
         return "converged"
 
     return None
