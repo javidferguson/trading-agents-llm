@@ -135,15 +135,6 @@ toy-graph:  ## THE STAGE 0 GATE: run two nodes, see two spans in Langfuse
 bars:  ## Fetch daily bars from IB into the cache (needs the Gateway up)
 	$(UV) run python scripts/fetch_bars.py $(if $(SYMBOLS),--symbols $(SYMBOLS),)
 
-.PHONY: fixtures
-fixtures:  ## Seed SYNTHETIC bars so Stage 2 can be exercised without the Gateway
-	@echo "!! synthetic data, not market prices -- replace with \`make bars\`"
-	$(UV) run python scripts/seed_fixture_bars.py $(if $(SYMBOLS),--symbols $(SYMBOLS),)
-
-.PHONY: data
-data:  ## What is cached, from where, and how stale
-	$(UV) run desk data
-
 .PHONY: snapshot
 snapshot:  ## THE STAGE 2 GATE: every §7.1 metric for a symbol, no LLM
 	$(UV) run desk snapshot --symbol $${SYMBOL:-SPY}

@@ -162,7 +162,11 @@ services:
     #   your Mac          -> 127.0.0.1:4012
     # -------------------------------------------------------------------------
     ports:
-      - "127.0.0.1:4012:4004"   # paper API  (host 4012 -> socat paper)
+      # The host port comes from .env so there is ONE source of truth: the same
+      # IB_HOST_PORT drives this publish and config.resolve_ib_endpoint(). It
+      # used to be hardcoded here and set again in .env, which is two places to
+      # change and one to forget.
+      - "127.0.0.1:${IB_HOST_PORT:-4012}:4004"   # paper API -> socat paper
       # Live (host 4011 -> socat live). Left commented deliberately: with
       # TRADING_MODE=paper nothing is behind it, but it becomes a LIVE API
       # endpoint the moment TRADING_MODE flips.

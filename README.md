@@ -63,8 +63,7 @@ report.
 - `make toy-graph` — the Stage 0 exit gate: a two-node LangGraph run whose nodes
   both appear as spans in Langfuse.
 - `make bars` — fetch daily bars from IB into the cache (needs the Gateway).
-  `make fixtures` seeds **synthetic** bars so Stage 2 can be exercised without
-  it; every snapshot built from them says so loudly.
+  `make data` shows what is cached, from which source, and how stale.
 - `make snapshot` — the Stage 2 exit gate: all 38 OHLCV metrics for a symbol,
   each either populated or explicitly unavailable *with a reason*. No LLM.
 - `make smoke` — the Stage 1 exit gate: a real `AnalystReport` out of a local 8B
