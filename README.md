@@ -39,7 +39,39 @@ Two processes that communicate through a file, never a shared event loop:
 
 ```bash
 make setup
+make up          # Langfuse; Ollama stays native, see below
+make shell       # a bash shell inside the desk container -- start here
 ```
+
+**Containers are the default.** `make shell` drops you into the `dev` service
+with this repo bind-mounted at `/app`, so edits take effect with no rebuild.
+Inside, `desk`, `pytest` and the scripts are all on `PATH`:
+
+```
+desk doctor
+desk snapshot --symbol AAPL
+pytest -q
+```
+
+Every `make` target runs in that container too. Append `HOST=1` to run on the
+host instead, which is useful when Docker itself is what's broken:
+
+```bash
+make test            # in the container
+make test HOST=1     # on the host, via uv
+```
+
+The two contexts reach some services at different addresses — Ollama,
+Langfuse, the IB Gateway — and the compose file plus
+`config.resolve_ib_endpoint()` handle that, so the commands are identical
+either way. `make verify` prints which context it ran in.
+
+**Ollama is the one deliberate exception and stays native.** Architecture §10:
+containerised on macOS there is no Metal passthrough, so it is CPU-only in a VM
+— measured 5–15× slower, which turns a 4-minute pipeline into 40+. Containers
+reach the host daemon via `host.docker.internal`, and on current Docker Desktop
+that works even with Ollama bound to `127.0.0.1` (a correction to §10 — see
+there). On Linux you do need `OLLAMA_HOST=0.0.0.0:11434`.
 
 Then, after any pull, the one command that checks everything:
 

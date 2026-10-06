@@ -903,10 +903,41 @@ The app container reaches host Ollama via
 `OLLAMA_BASE_URL=http://host.docker.internal:11434` plus
 `extra_hosts: ["host.docker.internal:host-gateway"]` for Linux portability.
 
-**The gotcha that costs an hour:** Ollama binds `127.0.0.1:11434` by default,
-which a container cannot reach. Set `OLLAMA_HOST=0.0.0.0:11434` on the host
-daemon. Add a check target that curls `/api/tags` **from inside the container**
-so this is diagnosed in seconds rather than via stack traces.
+**The gotcha that costs an hour -- and a correction, measured at Stage 2.**
+This section said Ollama binds `127.0.0.1:11434` by default, "which a
+container cannot reach", and that `OLLAMA_HOST=0.0.0.0:11434` is therefore
+required. That is **no longer true on macOS**: verified on Docker Desktop
+4.86, a container reaches a loopback-only Ollama through
+`host.docker.internal` with no daemon reconfiguration, because Desktop proxies
+that name to the host's loopback. `lsof` confirms the daemon is still bound to
+`127.0.0.1` alone while `desk doctor` inside the container lists all four
+models.
+
+It remains true **on Linux**, where `host-gateway` resolves to the host's
+bridge address and a loopback-only service genuinely is unreachable. So the
+setting is a Linux/CI requirement, not a macOS prerequisite.
+
+Keep the check target regardless, and keep it curling `/api/tags` **from inside
+the container**: that is the only place the answer means anything, and it is
+how this correction was found.
+
+**Everything else is containerised, and the dev shell is the default entry
+point** (`make shell`): one `bash` inside the `dev` service, with the repo
+bind-mounted so edits need no rebuild. Ollama is the single deliberate
+exception, for the Metal reason above. `decide` and `execute` stay as clean
+production images; `dev` additionally carries the test group and the
+`ib_async` extra, so one shell runs the suite, a snapshot and a bar fetch.
+That means `dev` cannot enforce the §0 split by its *contents* the way
+`decide` does -- which is acceptable because the split is enforced where it
+matters: `tests/test_layering.py` reads the import graph and asserts in a
+subprocess that `ib_async` is absent from `decide`'s dependency tree.
+
+One non-obvious requirement of that layout: **the virtualenv must live outside
+`/app`.** Bind-mounting the repo over `/app` otherwise shadows the interpreter
+and every installed package, and the container dies with `desk: not found` a
+long way from the cause. It is at `/opt/venv`, with `/etc/profile.d` putting it
+on `PATH` for login shells too -- `bash -c` inherits the image `ENV`,
+`bash -lc` does not.
 
 Still ship a containerized Ollama behind a **compose profile** so the same file
 works on a Linux/NVIDIA box and in CI. Set `OLLAMA_KEEP_ALIVE=30m` (otherwise

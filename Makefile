@@ -16,6 +16,30 @@ SHELL := /bin/bash
 # which environment is used.
 UV := VIRTUAL_ENV= uv
 
+# ---------------------------------------------------------------------------
+# CONTAINERS ARE THE DEFAULT. `make shell` is the starting point.
+#
+# Every target below runs inside the `dev` service, which bind-mounts this repo
+# so edits take effect with no rebuild. Append HOST=1 to run on the host
+# instead -- useful when Docker itself is the thing that is broken:
+#
+#     make test              # in the container (default)
+#     make test HOST=1       # on the host, via uv
+#
+# The two contexts reach some services at different addresses (Ollama,
+# Langfuse, the IB Gateway); the compose file and config.resolve_ib_endpoint()
+# handle that, so the same command works either way.
+# ---------------------------------------------------------------------------
+# Deferred (=) not immediate (:=): COMPOSE is defined below this block, and
+# with := these would expand to an empty command.
+ifdef HOST
+RUN = $(UV) run
+IN  = host
+else
+RUN = $(COMPOSE) run --rm --no-deps dev
+IN  = container
+endif
+
 # --env-file is not optional here. Compose resolves ${VAR} interpolation against
 # a .env in the PROJECT directory, which defaults to the first -f file's parent
 # -- docker/, not the repo root. Without this the Langfuse init keys silently
@@ -52,22 +76,36 @@ lock:  ## Re-resolve uv.lock. LangGraph pins are exact ON PURPOSE (§1) -- upgra
 # Checks
 # --------------------------------------------------------------------------- #
 
+.PHONY: shell
+shell:  ## THE DEFAULT DEV ENTRY POINT: a bash shell inside the desk container
+	@echo "research-desk dev container. The repo is mounted at /app, so edits here"
+	@echo "take effect immediately. Try: desk doctor | desk snapshot --symbol AAPL | pytest -q"
+	@echo
+	$(COMPOSE) run --rm --service-ports dev bash
+
+.PHONY: up
+up:  ## Start the long-running services (Langfuse). Ollama stays native -- see §10.
+	$(MAKE) --no-print-directory langfuse-up
+	@echo
+	@echo "Ollama is NOT containerised on purpose (§10: 5-15x slower on macOS)."
+	@$(MAKE) --no-print-directory check-ollama || true
+
 .PHONY: doctor
 doctor:  ## Full environment report: config, dirs, ollama, langfuse, gateway
-	$(UV) run desk doctor
+	$(RUN) desk doctor
 
 .PHONY: config-check
 config-check:  ## Parse and validate config/, and print the config hash
-	$(UV) run desk config-check
+	$(RUN) desk config-check
 
 .PHONY: check-ollama
-check-ollama:  ## Curl Ollama /api/tags FROM INSIDE THE CONTAINER -- see architecture §10
+check-ollama:  ## Curl Ollama /api/tags from inside the container -- the only view that matters
 	@echo "Host view:"
 	@curl -sS --max-time 5 $${OLLAMA_BASE_URL:-http://127.0.0.1:11434}/api/tags >/dev/null \
 		&& echo "  ok   reachable from the host" \
 		|| echo "  FAIL not reachable from the host either -- is ollama running?"
 	@echo "Container view (this is the one that matters):"
-	@$(COMPOSE) run --rm --no-deps --entrypoint sh decide -c \
+	@$(COMPOSE) run --rm --no-deps --entrypoint sh dev -c \
 		'curl -sS --max-time 5 "$$OLLAMA_BASE_URL/api/tags" >/dev/null' \
 		&& echo "  ok   reachable from inside the container" \
 		|| { \
@@ -80,7 +118,7 @@ check-ollama:  ## Curl Ollama /api/tags FROM INSIDE THE CONTAINER -- see archite
 
 .PHONY: check-gateway
 check-gateway:  ## Is our Gateway up? And is the ORB engine's conflicting?
-	@$(UV) run python scripts/check_gateway_exclusive.py || true
+	@$(RUN) python scripts/check_gateway_exclusive.py || true
 	@nc -z -G 3 127.0.0.1 $${IB_HOST_PORT:-4012} 2>/dev/null \
 		&& echo "ok   desk-ib-gateway reachable on 127.0.0.1:$${IB_HOST_PORT:-4012}" \
 		|| echo "warn desk-ib-gateway not running. \`make gateway-start\`. Not needed until Stage 7."
@@ -91,7 +129,7 @@ check-gateway:  ## Is our Gateway up? And is the ORB engine's conflicting?
 
 .PHONY: gateway-start
 gateway-start:  ## Start this project's IB Gateway (refuses if the ORB one is up)
-	@$(UV) run python scripts/check_gateway_exclusive.py
+	@$(RUN) python scripts/check_gateway_exclusive.py
 	@grep -qE '^IB_USERNAME=.+' .env \
 		|| { echo "IB_USERNAME is empty in .env -- the Gateway will start and sit"; \
 		     echo "on the login screen forever. Fill it in first."; exit 1; }
@@ -118,7 +156,7 @@ gateway-vnc:  ## Open the Gateway UI (needs VNC_PASSWORD set in .env)
 
 .PHONY: models
 models:  ## Pull every Ollama model config/models.yaml asks for
-	@$(UV) run python -c "import yaml,sys; \
+	@$(RUN) python -c "import yaml,sys; \
 p=yaml.safe_load(open('config/models.yaml'))['profiles']; \
 print('\n'.join(sorted({v['model'] for v in p.values() if v.get('provider')=='ollama'})))" \
 	| while read -r m; do echo ">> ollama pull $$m"; ollama pull "$$m"; done
@@ -129,30 +167,34 @@ print('\n'.join(sorted({v['model'] for v in p.values() if v.get('provider')=='ol
 
 .PHONY: toy-graph
 toy-graph:  ## THE STAGE 0 GATE: run two nodes, see two spans in Langfuse
-	$(UV) run desk toy-graph --symbol $${SYMBOL:-SPY}
+	$(RUN) desk toy-graph --symbol $${SYMBOL:-SPY}
 
 .PHONY: bars
 bars:  ## Fetch daily bars from IB into the cache (needs the Gateway up)
-	$(UV) run python scripts/fetch_bars.py $(if $(SYMBOLS),--symbols $(SYMBOLS),)
+	# In the container this reaches desk-ib-gateway:4004 over
+	# trading-llm-network; on the host it resolves to 127.0.0.1:$(IB_HOST_PORT).
+	# resolve_ib_endpoint() probes both, so the command is identical either way.
+	$(RUN) python scripts/fetch_bars.py $(if $(SYMBOLS),--symbols $(SYMBOLS),)
 
 .PHONY: snapshot
 snapshot:  ## THE STAGE 2 GATE: every §7.1 metric for a symbol, no LLM
-	$(UV) run desk snapshot --symbol $${SYMBOL:-SPY}
+	$(RUN) desk snapshot --symbol $${SYMBOL:-SPY}
 
 .PHONY: smoke
 smoke:  ## THE STAGE 1 GATE: a real AnalystReport from a local 8B model
-	$(UV) run desk smoke
+	$(RUN) desk smoke
 
 .PHONY: test-smoke
 test-smoke:  ## Run the live model tests, failing if they are skipped
-	$(UV) run pytest tests/llm/test_smoke_ollama.py -p no:randomly -q -rs -m smoke
+	$(RUN) pytest tests/llm/test_smoke_ollama.py -p no:randomly -q -rs -m smoke
 
 # --------------------------------------------------------------------------- #
 # Containers
 # --------------------------------------------------------------------------- #
 
 .PHONY: build
-build:  ## Build the decide and execute images
+build:  ## Build the dev, decide and execute images
+	$(COMPOSE) build dev
 	$(COMPOSE) build decide
 	$(COMPOSE) --profile execute build execute
 
@@ -185,15 +227,15 @@ logs:  ## Tail logs from every running service
 
 .PHONY: gdelt
 gdelt:  ## Collect one day of GDELT tone/volume for the universe. Run it daily.
-	$(UV) run python scripts/gdelt_collect.py
+	$(RUN) python scripts/gdelt_collect.py
 
 .PHONY: gdelt-status
 gdelt-status:  ## How many days of sentiment history exist, and where the gaps are
-	$(UV) run python scripts/gdelt_collect.py --status
+	$(RUN) python scripts/gdelt_collect.py --status
 
 .PHONY: gdelt-probe
 gdelt-probe:  ## Measure how far back GDELT's API actually serves (architecture §7.5 asks)
-	$(UV) run python scripts/gdelt_collect.py --probe-window
+	$(RUN) python scripts/gdelt_collect.py --probe-window
 
 # --------------------------------------------------------------------------- #
 # Tests
@@ -201,11 +243,11 @@ gdelt-probe:  ## Measure how far back GDELT's API actually serves (architecture 
 
 .PHONY: test
 test:  ## Run the test suite
-	$(UV) run pytest -q
+	$(RUN) pytest -q
 
 .PHONY: test-layering
 test-layering:  ## Just the architectural boundary tests -- fast, and the ones that erode
-	$(UV) run pytest -q tests/test_layering.py
+	$(RUN) pytest -q tests/test_layering.py
 
 # --------------------------------------------------------------------------- #
 # The one command to run after a pull
@@ -213,6 +255,8 @@ test-layering:  ## Just the architectural boundary tests -- fast, and the ones t
 
 .PHONY: verify
 verify:  ## Run the whole Stage 0 gate in order, stopping at the first failure
+	@echo "running in: $(IN)"
+	@echo
 	@echo "=== 1/6  config ============================================"
 	@$(MAKE) --no-print-directory config-check
 	@echo
