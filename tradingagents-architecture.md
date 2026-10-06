@@ -613,7 +613,7 @@ considerably longer than 90 sessions.
 
 | Need | Primary | Fallback | Key | Notes |
 |---|---|---|---|---|
-| Daily OHLCV | **Stooq** — no key, decades of daily history | **IB `reqHistoricalData`** | none | **yfinance is demoted to third.** It is an unofficial scrape that has been structurally unreliable since Yahoo's 2025 redesign — rate limits, IP blocks, schema churn. IB is the authoritative fallback and the Gateway is already running |
+| Daily OHLCV | **IB `reqHistoricalData`**, via a cached artefact (see below) | — | none | **yfinance is demoted to third.** It is an unofficial scrape that has been structurally unreliable since Yahoo's 2025 redesign — rate limits, IP blocks, schema churn. IB is the authoritative fallback and the Gateway is already running |
 | Fundamentals | **SEC EDGAR** XBRL `companyfacts` | Finnhub `/stock/metric` | none for EDGAR | **The best free source in the stack.** Every fact carries its `filed` date, so it is genuinely point-in-time rather than approximately so. Requires a `User-Agent: Name email` header — a missing one is the usual cause of a 403 — and 10 req/s |
 | News | **Finnhub** `/company-news` | SEC 8-K feed; Yahoo RSS | free, 60/min | Finnhub is date-rangeable (1y history on free), which is exactly what replay needs. **RSS is not date-rangeable, so it is `supports_point_in_time=False` and must raise in replay** |
 | Events/estimates | **Finnhub** earnings calendar, surprises, recommendation trends | — | free, 60/min | |
@@ -644,6 +644,35 @@ not "no limit", and the limit is stated in a place that is easy to throw away:
 - GDELT's own 429 points high-traffic users at the **web ngrams dataset** as the
   supported alternative. Not needed at this universe size; the right answer if
   the universe ever grows past the point where 5-second pacing is tolerable.
+
+**Stooq is retired, and this row is reversed from the original.** Measured
+2026-10-06: Stooq's CSV endpoint now answers HTTP 200 with a JavaScript
+proof-of-work browser challenge, and its static bulk archive returns 401.
+Reading it programmatically would mean defeating a bot check. It was chosen as
+primary *because* it was a clean keyless CSV endpoint, so the reason is gone
+and IB — previously the authoritative fallback — is now primary.
+
+That creates a problem §0 forbids solving directly: `decide` may not import
+`ib_async`. The resolution is the shape §0 already uses one level up — **two
+processes communicating through a file**:
+
+```
+execution/bars.py   ib_async, talks to the Gateway, WRITES the bar cache
+providers/ib.py     reads the cache, imports nothing of the sort
+```
+
+This is **better than a direct fetch**, not a grudging workaround:
+
+- The price path in `decide` cannot reach the network in *any* mode, so §7.4's
+  "in replay the cache is the only permitted source" holds for bars always.
+  Look-ahead bias cannot enter through prices at all.
+- A research run does not need the Gateway up. Refresh bars when convenient,
+  then iterate on prompts for days — which matters, because §4 of the
+  migration plan lists "`decide` stops being fun to iterate on" as a legitimate
+  reason to abandon the project.
+
+The cost is one extra step (`make bars`) and a staleness check, which
+`build_market_snapshot` warns about past five days.
 
 Deliberately **not** used:
 

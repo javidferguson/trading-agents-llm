@@ -356,6 +356,68 @@ def cmd_toy_graph(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# snapshot -- the Stage 2 exit gate
+# --------------------------------------------------------------------------- #
+
+
+async def _run_snapshot(symbol: str, as_of: date, show_gaps: bool) -> int:
+    from .metrics.snapshot import build_market_snapshot, universe_context
+    from .providers.base import ProviderError
+    from .providers.registry import ProviderRegistry
+
+    settings = load_settings()
+    registry = ProviderRegistry.from_config(settings)
+    benchmark, sector = universe_context(load_yaml("universe.yaml"), symbol)
+
+    try:
+        snapshot = await build_market_snapshot(
+            registry, symbol, as_of,
+            benchmark_symbol=benchmark, sector_symbol=sector,
+        )
+    except ProviderError as exc:
+        print(f"FAILED: {exc}", file=sys.stderr)
+        return 1
+
+    populated, missing = snapshot.metric_count()
+
+    # Loud, because synthetic prices mistaken for real ones would make every
+    # number downstream fiction rather than merely wrong.
+    if snapshot.sources.get("bars") != "ib":
+        print(f"!! bars came from {snapshot.sources.get('bars')!r}, NOT from IB. "
+              "These are not market prices.\n")
+
+    print(f"{snapshot.symbol}  as_of={snapshot.as_of}  "
+          f"bars={snapshot.bars_available} (latest {snapshot.last_bar_day})")
+    print(f"sources: {snapshot.sources}")
+    print(f"metrics: {populated} populated, {missing} unavailable\n")
+
+    for name in ("trend", "risk", "mean_reversion", "relative_strength"):
+        block = getattr(snapshot, name)
+        print(f"  [{name}]")
+        for key, value in block.available().items():
+            shown = f"{value:,.4f}" if isinstance(value, float) else value
+            print(f"    {key:<28} {shown}")
+        if not block.available():
+            print("    (nothing computed)")
+        print()
+
+    if missing:
+        print(f"UNAVAILABLE ({missing}) -- every one states why, which is the gate:")
+        for key, reason in sorted(snapshot.all_gaps().items()):
+            print(f"    {key:<40} {reason}")
+    else:
+        print("Every §7.1 OHLCV metric populated.")
+    return 0
+
+
+def cmd_snapshot(args: argparse.Namespace) -> int:
+    """Print a MarketSnapshot. No LLM involved -- that is the point."""
+    setup_logging()
+    as_of = date.fromisoformat(args.as_of) if args.as_of else date.today()
+    return asyncio.run(_run_snapshot(args.symbol.upper(), as_of, args.gaps))
+
+
+# --------------------------------------------------------------------------- #
 # smoke -- the Stage 1 exit gate
 # --------------------------------------------------------------------------- #
 
@@ -437,6 +499,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("config-check", help="parse and validate config/").set_defaults(
         func=cmd_config_check
     )
+
+    snap = sub.add_parser("snapshot", help="Stage 2 exit gate: every §7.1 metric, no LLM")
+    snap.add_argument("--symbol", default="SPY")
+    snap.add_argument("--as-of", default=None, help="YYYY-MM-DD (default: today)")
+    snap.add_argument("--gaps", action="store_true", help="(gaps always shown)")
+    snap.set_defaults(func=cmd_snapshot)
 
     smoke = sub.add_parser("smoke", help="Stage 1 exit gate: a real AnalystReport from a local model")
     smoke.add_argument("--node", default="market_analyst")

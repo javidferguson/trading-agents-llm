@@ -15,8 +15,24 @@ defaults:
 
 providers:
 
+  # ---------------------------------------------------------------------------
+  # STOOQ IS NO LONGER USABLE. Measured 2026-10-06.
+  #
+  # The CSV endpoint now answers HTTP 200 with a JavaScript proof-of-work
+  # browser challenge (compute a SHA-256 prefix, POST to /__verify, reload),
+  # and the static bulk archive at static.stooq.com returns 401. Getting data
+  # out of it programmatically would mean defeating a bot check, which is not
+  # something this project does.
+  #
+  # §7.3 chose it as primary precisely because it was a clean keyless CSV
+  # endpoint. That is simply no longer true, so IB -- previously the
+  # "authoritative fallback" -- is now primary. See the `ib` block below.
+  #
+  # Left here rather than deleted so nobody re-adds it after reading §7.3.
+  # ---------------------------------------------------------------------------
   stooq:
-    role: "daily OHLCV, primary"
+    enabled: false
+    role: "RETIRED -- JS proof-of-work challenge since ~2026"
     base_url: "https://stooq.com/q/d/l/"
     key_env: null
     rate_limit_per_s: 2
@@ -27,12 +43,20 @@ providers:
     # Yahoo's 2025 redesign -- rate limits, IP blocks, schema churn.
 
   ib:
-    role: "daily OHLCV, authoritative fallback"
+    role: "daily OHLCV, PRIMARY (was the fallback; Stooq retired)"
     key_env: null
     rate_limit_per_s: 1
     supports_point_in_time: true
-    # NOTE: only the `execute` process may import ib_async. If `decide` ever
-    # needs this fallback, it must go through a subprocess or a cached artefact.
+    # Only the `execute` process may import ib_async, so `decide` reaches bars
+    # through a CACHED ARTEFACT, exactly as this note anticipated:
+    #
+    #   execution/bars.py   ib_async, talks to the Gateway, WRITES the cache
+    #   providers/ib.py     reads the cache, imports nothing of the sort
+    #
+    # That turns out to be better than a direct fetch rather than merely
+    # permitted: the price path in `decide` cannot reach the network in ANY
+    # mode, so look-ahead bias cannot enter through it, and a research run does
+    # not need the Gateway up. Refresh with `make bars`.
     # endDateTime must be timezone-aware: a naive 10:00 returned the 10:30-10:59
     # bars, an aware 10:00 ET returned 09:30-09:59. Measured, not theorised.
 
