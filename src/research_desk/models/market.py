@@ -243,6 +243,66 @@ class RelativeStrengthMetrics(MetricBlock):
         return self
 
 
+#: Every metric block on a snapshot, in display order. One list so adding a
+#: block cannot be half-wired -- `all_gaps` and `metric_count` both read it.
+BLOCK_NAMES = (
+    "trend", "risk", "mean_reversion", "relative_strength",
+    "value", "quality", "growth",
+)
+
+
+class ValueMetrics(MetricBlock):
+    """Value (§7.1), from EDGAR facts and the current price.
+
+    **Yields, not multiples.** A P/E of -48 is nonsense a small model will
+    reason about anyway; an earnings yield of -2% is a fact it handles. Yields
+    also stay finite through negative earnings, which multiples do not -- the
+    denominator never crosses zero.
+    """
+
+    market_cap: float | None = None
+    earnings_yield_pct: float | None = None
+    fcf_yield_pct: float | None = None
+    #: EBIT/EV rather than EV/EBIT, for the same finiteness reason.
+    ebit_to_ev_pct: float | None = None
+    book_to_price: float | None = None
+    sales_to_price: float | None = None
+
+
+class QualityMetrics(MetricBlock):
+    """Quality (§7.1). Two of these are the point of the whole block."""
+
+    #: Novy-Marx. About as well-evidenced as value and nearly free to compute.
+    gross_profitability: float | None = None
+    #: (net income - operating cash flow) / assets. The best-documented
+    #: *avoid* signal in the free-data universe, and it catches the thing news
+    #: sentiment never will. Negative is good: earnings backed by cash.
+    accruals: float | None = None
+    roe_pct: float | None = None
+    roic_pct: float | None = None
+    net_debt_to_ebitda: float | None = None
+    interest_coverage: float | None = None
+    current_ratio: float | None = None
+    #: 0-9, all nine components computable from EDGAR alone. A single small
+    #: integer is exactly the kind of input a small model uses well.
+    piotroski_f_score: float | None = None
+
+
+class GrowthMetrics(MetricBlock):
+    """Growth and dilution (§7.1)."""
+
+    revenue_yoy_pct: float | None = None
+    revenue_cagr_3y_pct: float | None = None
+    eps_yoy_pct: float | None = None
+    gross_margin_pct: float | None = None
+    operating_margin_pct: float | None = None
+    gross_margin_change_pct: float | None = None
+    operating_margin_change_pct: float | None = None
+    #: Buyback vs dilution. Free, point-in-time, and routinely ignored.
+    #: Negative means the share count shrank.
+    share_count_change_1y_pct: float | None = None
+
+
 class MarketSnapshot(BaseModel):
     """Everything deterministic, computed before any model runs.
 
@@ -279,10 +339,24 @@ class MarketSnapshot(BaseModel):
     relative_strength: RelativeStrengthMetrics = Field(
         default_factory=lambda: RelativeStrengthMetrics.unavailable("not computed")
     )
+    value: ValueMetrics = Field(
+        default_factory=lambda: ValueMetrics.unavailable("not computed")
+    )
+    quality: QualityMetrics = Field(
+        default_factory=lambda: QualityMetrics.unavailable("not computed")
+    )
+    growth: GrowthMetrics = Field(
+        default_factory=lambda: GrowthMetrics.unavailable("not computed")
+    )
 
-    # Arriving with the rest of Stage 2:
-    #   2b: value, quality, growth  (EDGAR)
-    #   2c: events, positioning, sentiment, macro, regime
+    #: The latest EDGAR filing this snapshot's fundamentals came from, and when
+    #: it was filed. Without it you cannot tell a stale snapshot from a company
+    #: that simply has not reported.
+    fundamentals_asof: date | None = None
+    fundamentals_form: str | None = None
+
+    # Arriving with Stage 2c:
+    #   events, positioning, sentiment, macro, regime
 
     def all_gaps(self) -> dict[str, str]:
         """Every unavailable metric and why, flattened.
@@ -291,7 +365,7 @@ class MarketSnapshot(BaseModel):
         where every §7.1 metric is either in `available()` or in here.
         """
         out: dict[str, str] = {}
-        for block_name in ("trend", "risk", "mean_reversion", "relative_strength"):
+        for block_name in BLOCK_NAMES:
             block = getattr(self, block_name)
             for field_name, reason in block.gaps.items():
                 out[f"{block_name}.{field_name}"] = reason
@@ -299,8 +373,69 @@ class MarketSnapshot(BaseModel):
 
     def metric_count(self) -> tuple[int, int]:
         """``(populated, missing)`` across every block."""
-        populated = sum(
-            len(getattr(self, name).available())
-            for name in ("trend", "risk", "mean_reversion", "relative_strength")
-        )
+        populated = sum(len(getattr(self, name).available()) for name in BLOCK_NAMES)
         return populated, len(self.all_gaps())
+
+
+class CompanyFacts:
+    """One company's XBRL facts, already filtered to what was public at ``as_of``.
+
+    A data shape, which is why it lives here rather than in
+    ``providers/edgar.py``: ``metrics/fundamentals.py`` needs the type to read
+    it, and reaching into a provider module for that would break the §2 rule
+    that every *fetch* goes through the registry. The provider builds these;
+    nothing else imports the provider.
+    """
+
+    def __init__(self, symbol: str, cik: str, entity_name: str,
+                 facts: dict[str, Any], as_of: date):
+        self.symbol = symbol
+        self.cik = cik
+        self.entity_name = entity_name
+        self.facts = facts
+        self.as_of = as_of
+
+    def concept(self, name: str, taxonomy: str = "us-gaap") -> list[dict[str, Any]]:
+        """Every visible fact for one XBRL concept, oldest first."""
+        node = (self.facts.get(taxonomy) or {}).get(name) or {}
+        rows: list[dict[str, Any]] = []
+        for unit_rows in (node.get("units") or {}).values():
+            rows.extend(unit_rows)
+        return sorted(rows, key=lambda r: (r.get("end") or "", r.get("filed") or ""))
+
+    def has(self, name: str, taxonomy: str = "us-gaap") -> bool:
+        return bool(self.concept(name, taxonomy))
+
+    #: Forms that actually carry financial statements. A company also tags
+    #: facts in prospectuses (424B2), 8-Ks and disclosure filings (SD), and
+    #: those are usually the newest thing in the document -- so a naive "most
+    #: recent filed" reports provenance like "424B2" or "2.01 SD" for JPM and
+    #: Berkshire, implying the numbers came from a prospectus. Observed; this
+    #: list is the fix.
+    STATEMENT_FORMS = ("10-K", "10-Q", "20-F", "40-F", "6-K", "11-K")
+
+    @property
+    def latest_filing(self) -> tuple[date | None, str | None]:
+        """``(filed, form)`` of the most recent financial-statement filing.
+
+        Surfaced on the snapshot because without it you cannot tell a stale
+        snapshot from a company that simply has not reported yet -- so it has
+        to name the filing the NUMBERS came from, not merely the newest thing
+        the filer tagged.
+        """
+        best_date: date | None = None
+        best_form: str | None = None
+        for concepts in self.facts.values():
+            for node in concepts.values():
+                for unit_rows in (node.get("units") or {}).values():
+                    for row in unit_rows:
+                        filed, form = row.get("filed"), row.get("form") or ""
+                        if not filed:
+                            continue
+                        # Accept amendments too: "10-K/A" starts with "10-K".
+                        if not form.startswith(self.STATEMENT_FORMS):
+                            continue
+                        parsed = date.fromisoformat(filed)
+                        if best_date is None or parsed > best_date:
+                            best_date, best_form = parsed, form
+        return best_date, best_form

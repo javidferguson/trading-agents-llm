@@ -31,8 +31,9 @@ from typing import Any
 from ..config import Settings, load_yaml
 from ..models.market import BarSeries
 from ..models.modes import RunMode
-from .base import NetworkForbiddenError, PointInTimeError, ProviderSpec
+from .base import NetworkForbiddenError, PointInTimeError, ProviderError, ProviderSpec
 from .cache import Cache
+from .edgar import CompanyFacts, EdgarProvider
 from .ib import IBBarsProvider
 from .limiter import RateLimiter
 
@@ -61,11 +62,13 @@ class ProviderRegistry:
         cache: Cache,
         limiter: RateLimiter,
         bars: Any,
+        edgar: Any = None,
     ):
         self.mode = mode
         self.cache = cache
         self.limiter = limiter
         self._bars = bars
+        self._edgar = edgar
 
     @classmethod
     def from_config(
@@ -91,6 +94,7 @@ class ProviderRegistry:
             cache=cache,
             limiter=RateLimiter(intervals),
             bars=IBBarsProvider(cache),
+            edgar=EdgarProvider(cache, settings.sec_user_agent),
         )
 
     # ----------------------------------------------------------------- guards
@@ -137,9 +141,22 @@ class ProviderRegistry:
         await self._rate_limited(spec)
         return await self._bars.daily_bars(symbol, as_of)
 
-    # Arriving with the rest of Stage 2, each one typed, each taking as_of:
-    #   2b: company_facts(symbol, as_of)        -- EDGAR XBRL
-    #   2c: company_news(symbol, as_of, days)   -- Finnhub
+    async def company_facts(self, symbol: str, as_of: date) -> CompanyFacts | None:
+        """XBRL company facts for ``symbol`` as they were public on ``as_of``.
+
+        ``None`` means the entity files no XBRL financials -- an answer, not a
+        failure. An ETF has no income statement, and SPY in particular has a
+        CIK but 404s on company facts.
+        """
+        if self._edgar is None:
+            raise ProviderError("no EDGAR provider configured")
+        spec = self._edgar.spec
+        self._guard(spec)
+        await self._rate_limited(spec)
+        return await self._edgar.company_facts(symbol, as_of)
+
+    # Arriving with Stage 2c, each one typed, each taking as_of:
+    #   company_news(symbol, as_of, days)   -- Finnhub
     #       earnings_calendar(symbol, as_of)    -- Finnhub
     #       short_interest(symbol, as_of)       -- FINRA
     #       insider_transactions(symbol, as_of) -- EDGAR Form 4
@@ -150,7 +167,7 @@ class ProviderRegistry:
     def describe(self) -> list[dict[str, Any]]:
         """What is wired up, for `desk providers`."""
         rows = []
-        for provider in (self._bars,):
+        for provider in (p for p in (self._bars, self._edgar) if p is not None):
             spec: ProviderSpec = provider.spec
             rows.append({
                 "name": spec.name,

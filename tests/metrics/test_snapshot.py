@@ -14,6 +14,7 @@ from datetime import date, timedelta
 import pytest
 
 from research_desk.metrics.snapshot import build_market_snapshot, universe_context
+from research_desk.models.market import BLOCK_NAMES
 from research_desk.models.modes import RunMode
 from research_desk.providers.base import ProviderError
 from research_desk.providers.cache import Cache
@@ -54,6 +55,8 @@ def registry(tmp_path) -> ProviderRegistry:
     cache = Cache(tmp_path / "cache")
     for symbol in ("AAPL", "SPY", "XLK"):
         seed(cache, symbol, 400)
+    # No EDGAR provider: these tests cover the OHLCV path, and the
+    # fundamentals blocks are expected to report themselves unavailable.
     return ProviderRegistry(mode=RunMode.LIVE, cache=cache,
                             limiter=RateLimiter({}), bars=IBBarsProvider(cache))
 
@@ -62,10 +65,11 @@ async def test_a_full_history_populates_every_metric(registry) -> None:
     snapshot = await build_market_snapshot(
         registry, "AAPL", END, benchmark_symbol="SPY", sector_symbol="XLK"
     )
-    populated, missing = snapshot.metric_count()
-
-    assert missing == 0, f"unexpected gaps: {snapshot.all_gaps()}"
-    assert populated == 38
+    # Only the OHLCV blocks; no EDGAR provider is wired in this fixture.
+    for name in ("trend", "risk", "mean_reversion", "relative_strength"):
+        block = getattr(snapshot, name)
+        assert not block.gaps, f"unexpected gaps in {name}: {block.gaps}"
+    assert len(snapshot.trend.available()) == 12
     assert snapshot.sources["bars"] == "ib"
     assert snapshot.bars_available == 400
 
@@ -82,7 +86,11 @@ async def test_every_gap_has_a_reason_and_every_reason_a_gap(registry) -> None:
         assert reason and reason.strip(), f"{key} is missing with an empty reason"
 
     populated, missing = snapshot.metric_count()
-    assert populated + missing == 38, "a metric vanished from both sides"
+    # Derived, not hardcoded: a new block must not silently shrink the total.
+    expected = sum(
+        len(getattr(snapshot, name).model_fields) - 1 for name in BLOCK_NAMES
+    )
+    assert populated + missing == expected, "a metric vanished from both sides"
 
 
 async def test_a_missing_sector_degrades_rather_than_failing(registry) -> None:

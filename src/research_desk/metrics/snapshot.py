@@ -24,7 +24,7 @@ from ..models.market import (
     TrendMetrics,
 )
 from ..providers.base import ProviderError
-from . import indicators
+from . import fundamentals, indicators
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +66,19 @@ async def build_market_snapshot(
     benchmark = await _optional_series(registry, benchmark_symbol, as_of)
     sector = await _optional_series(registry, sector_symbol, as_of)
 
+    # Fundamentals are optional in the same way the benchmark is: an ETF has
+    # none and that is a fact about the instrument, not a failure to fetch.
+    facts = None
+    facts_reason = "no XBRL financials (ETFs and trusts file none)"
+    try:
+        facts = await registry.company_facts(symbol, as_of)
+    except ProviderError as exc:
+        facts_reason = f"EDGAR unavailable: {str(exc).splitlines()[0]}"
+        logger.info("%s: %s", symbol, facts_reason)
+
+    last_close = series.bars[-1].close if len(series) else None
+    filed, form = facts.latest_filing if facts else (None, None)
+
     snapshot = MarketSnapshot(
         symbol=series.symbol,
         as_of=as_of,
@@ -80,12 +93,19 @@ async def build_market_snapshot(
             benchmark_symbol=benchmark_symbol,
             sector_symbol=sector_symbol,
         ),
+        value=fundamentals.value_metrics(facts, last_close, facts_reason),
+        quality=fundamentals.quality_metrics(facts, facts_reason),
+        growth=fundamentals.growth_metrics(facts, facts_reason),
+        fundamentals_asof=filed,
+        fundamentals_form=form,
     )
 
     if benchmark is not None:
         snapshot.sources["benchmark"] = f"{benchmark.symbol}@{benchmark.source}"
     if sector is not None:
         snapshot.sources["sector"] = f"{sector.symbol}@{sector.source}"
+    if facts is not None:
+        snapshot.sources["fundamentals"] = f"edgar:CIK{facts.cik}"
 
     # A stale last bar is a quiet way to make a decision on old prices. Warn
     # rather than refuse: a weekend or a holiday is a legitimate three-day gap.

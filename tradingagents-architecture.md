@@ -674,6 +674,33 @@ This is **better than a direct fetch**, not a grudging workaround:
 The cost is one extra step (`make bars`) and a staleness check, which
 `build_market_snapshot` warns about past five days.
 
+**EDGAR, as built at Stage 2b.** It does deserve "best free source in the
+stack" — every fact carries `filed`, so filtering to `filed <= as_of`
+reproduces exactly what was knowable on a past date. Four things the doc did
+not say, all measured:
+
+- **An ETF 404s *with an XML body*.** SPY has a CIK (0000884394) — §7.3 assumed
+  it would not — but company facts returns `404` carrying
+  `<?xml ...><Error><Code>NoSuchKey</Code>`. A naive path therefore breaks
+  twice: on the status, then parsing XML as JSON. Treated as an *answer*
+  ("files no XBRL financials"), not an error.
+- **EDGAR spells share classes with a dash**: `BRK-B`. That is a third
+  spelling after our canonical `BRK.B` and IB's `BRK B`.
+- **Balance-sheet facts are instants, not annual durations.** Reaching for
+  total assets or share count with a duration query finds nothing — which made
+  the Piotroski score report "missing assets" for Apple. Instants need their
+  own accessor, with a ~70-day tolerance for fiscal-year drift and 52/53-week
+  calendars.
+- **Provenance must name a financial statement.** Filers tag facts in
+  prospectuses and disclosure filings too, and those are often the newest
+  thing in the document, so "most recent filed" reported `424B2` for JPM and
+  `2.01 SD` for Berkshire.
+
+Coverage is honestly uneven, and the gaps are reporting conventions rather than
+bugs: AAPL 60/60, BRK.B 48/60, JPM 50/60 (no gross profit, no classified
+balance sheet — banks do not present one), TSM 38/60 (a 20-F filer with no
+quarterlies). Each missing metric states which convention caused it.
+
 Deliberately **not** used:
 
 - **Alpha Vantage** — 25 requests/day now, unusable for anything but a one-off

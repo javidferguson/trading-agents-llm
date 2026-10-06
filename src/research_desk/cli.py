@@ -426,6 +426,7 @@ def cmd_data(args: argparse.Namespace) -> int:
 
 async def _run_snapshot(symbol: str, as_of: date, show_gaps: bool) -> int:
     from .metrics.snapshot import build_market_snapshot, universe_context
+    from .models.market import BLOCK_NAMES
     from .providers.base import ProviderError
     from .providers.registry import ProviderRegistry
 
@@ -453,9 +454,15 @@ async def _run_snapshot(symbol: str, as_of: date, show_gaps: bool) -> int:
     print(f"{snapshot.symbol}  as_of={snapshot.as_of}  "
           f"bars={snapshot.bars_available} (latest {snapshot.last_bar_day})")
     print(f"sources: {snapshot.sources}")
+    if snapshot.fundamentals_asof:
+        print(f"fundamentals: {snapshot.fundamentals_form} filed "
+              f"{snapshot.fundamentals_asof}")
     print(f"metrics: {populated} populated, {missing} unavailable\n")
 
-    for name in ("trend", "risk", "mean_reversion", "relative_strength"):
+    # Read from BLOCK_NAMES so a new metric block cannot be half-wired: the
+    # CLI, all_gaps() and metric_count() all derive from the same list. This
+    # printed only the OHLCV blocks after Stage 2b added three more.
+    for name in BLOCK_NAMES:
         block = getattr(snapshot, name)
         print(f"  [{name}]")
         for key, value in block.available().items():
@@ -470,7 +477,7 @@ async def _run_snapshot(symbol: str, as_of: date, show_gaps: bool) -> int:
         for key, reason in sorted(snapshot.all_gaps().items()):
             print(f"    {key:<40} {reason}")
     else:
-        print("Every §7.1 OHLCV metric populated.")
+        print(f"Every §7.1 metric populated ({populated}).")
     return 0
 
 
