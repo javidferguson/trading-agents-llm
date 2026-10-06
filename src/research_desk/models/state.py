@@ -143,14 +143,19 @@ class AnalystReport(Degradable):
     @field_validator("key_points")
     @classmethod
     def _key_points_are_real(cls, value: list[str]) -> list[str]:
-        """Reject blank entries.
+        """Reject blank or placeholder entries.
 
-        Not hypothetical. Ollama's constrained decode *does* enforce
-        `minItems`, and when a model wants to emit fewer items than the schema
-        demands it satisfies the count with padding -- observed returning
-        `['...', '...', '\n\n']`. The grammar is happy; the report is not.
-        Schema-valid is not the same as usable, and this is the clearest case
-        of the difference.
+        Defence in depth. The padding that originally motivated this is now
+        prevented upstream: `structured.schema_for` strips `minItems` before
+        the schema reaches Ollama, precisely because enforcing a count in the
+        grammar made a model satisfy it with junk -- observed returning
+        `['real point', 'another', '\n\n']` and, on another run,
+        `['...', '...', 'key_points_count']`.
+
+        With the count stripped the model returns however many it has and this
+        validator rarely fires. It stays because a blank string is still
+        possible, and because an empty "key point" reaching a debate prompt is
+        the kind of thing nobody notices until the transcript looks strange.
         """
         blank = [i for i, point in enumerate(value) if not point.strip()]
         if blank:

@@ -184,6 +184,48 @@ async def test_length_errors_ask_for_structure_not_arithmetic() -> None:
     assert "go clearly inside it" in instruction, "ask for margin, not the limit"
 
 
+def test_ollama_owns_shape_and_pydantic_owns_values() -> None:
+    """The division of labour, asserted so it cannot drift back.
+
+    Shape keywords a grammar is good at are kept; every value-level constraint
+    is stripped and left to Pydantic. Measured justification: `minItems` made
+    qwen3:8b pad a short list with 'key_points_count' to satisfy the count,
+    and `maximum` was never enforced at all. A constraint the grammar
+    half-enforces is worse than one it does not enforce, because the failure
+    stops being visible.
+    """
+    sent = json.dumps(schema_for(AnalystReport))
+
+    # Shape: kept.
+    assert '"enum"' in sent, "enums work well and are worth constraining"
+    assert "$defs" in sent, "nested models resolve correctly"
+    assert '"required"' in sent
+    assert '"type"' in sent
+
+    # Values: Pydantic's job.
+    for keyword in ("minItems", "maxItems", "minimum", "maximum",
+                    "minLength", "maxLength", "pattern", "exclusiveMinimum"):
+        assert keyword not in sent, f"{keyword} must not reach the model"
+
+
+def test_value_constraints_are_stripped_inside_nested_defs() -> None:
+    """A constraint hiding in $defs is still a constraint.
+
+    Evidence.excerpt has max_length=300; stripping only the top level would
+    leave it in and reintroduce exactly the half-enforcement being removed.
+    """
+    schema = schema_for(AnalystReport)
+    evidence = schema["$defs"]["Evidence"]
+    assert "maxLength" not in json.dumps(evidence)
+    # ...and Pydantic still enforces it.
+    with pytest.raises(Exception):
+        AnalystReport.model_validate({
+            **VALID,
+            "evidence": [{"source": "x", "as_of": "2026-10-06T00:00:00",
+                          "excerpt": "y" * 400}],
+        })
+
+
 async def test_whitespace_padded_key_points_are_rejected() -> None:
     """Observed from Ollama: it enforces minItems by padding with '\n\n'.
 

@@ -397,15 +397,39 @@ Measured against `qwen3:8b` through Ollama's `format=<json_schema>`:
 | `minimum` / `maximum` | **No.** Asked for a percentage it returned `confidence: 85` against `maximum: 1.0` |
 | Word/sentence counts | Not expressible at all |
 
-Two consequences worth stating plainly, because both were discovered by running
-the thing rather than by reading docs:
+### The rule this produces: Ollama owns shape, Pydantic owns values
 
-1. **Schema-valid is not the same as usable.** The padding case is the clearest
-   example: nothing errors, and a key point is a newline. Anything with a
-   `minItems` needs a validator rejecting blanks.
-2. **The repair turn is a routine path, not an exotic one.** Range violations
-   and length violations both reach it on ordinary runs. Building it at Stage 1
-   rather than Stage 4 was the right call.
+The schema sent to the model keeps object structure, field names, types, enums,
+`$defs`/`$ref` and `required`. **Every value-level constraint is stripped** —
+`minItems`, `maxItems`, `minimum`, `maximum`, `minLength`, `maxLength`,
+`pattern` — and enforced by Pydantic instead.
+
+This is not tidiness. Leaving `minItems` in made the output *actively worse*.
+Asked for two key points against `minItems: 3`, `qwen3:8b` returned:
+
+```
+['Price above all SMAs...', 'RSI-14 at 71.2...', 'key_points_count']
+```
+
+and on another run `[..., '\n\n']`. The grammar was satisfied; a key point was
+a placeholder string. With the constraint stripped, the same prompt returns the
+two it actually has — Pydantic rejects that honestly, and the repair turn asks
+for a real third.
+
+> **A constraint the grammar half-enforces is worse than one it does not
+> enforce at all, because the failure stops being visible.** One validation
+> layer that always runs beats two that disagree, and Pydantic is the one that
+> can express what we actually mean (word counts, cross-field rules, "not
+> whitespace").
+
+Two further consequences, both found by running it rather than reading docs:
+
+1. **Schema-valid is not the same as usable.** Even with shape-only schemas,
+   a model can return an empty string where a sentence belongs. Validators
+   stay.
+2. **The repair turn is a routine path, not an exotic one.** Range and length
+   violations both reach it on ordinary runs. Building it at Stage 1 rather
+   than Stage 4 was the right call.
 
 ### Two things the repair prompt must say, both learned the hard way
 

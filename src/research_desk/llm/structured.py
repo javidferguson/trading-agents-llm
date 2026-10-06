@@ -45,6 +45,16 @@ T = TypeVar("T", bound=Degradable)
 #: output degraded, nor -- far worse -- declare a degraded output fine.
 INTERNAL_FIELDS = ("parse_failed", "degraded_reason")
 
+#: JSON Schema keywords that constrain a *value* rather than describe a shape.
+#: All of them are stripped before the schema reaches Ollama, and all of them
+#: are enforced by Pydantic instead. See `schema_for` for why.
+VALUE_CONSTRAINTS = frozenset({
+    "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+    "minLength", "maxLength", "pattern",
+    "minItems", "maxItems", "uniqueItems",
+    "minProperties", "maxProperties",
+})
+
 #: How much of a validation error to paste into the repair prompt. Pydantic is
 #: verbose, and a 2kB error pushes the original request out of a small model's
 #: attention just when it needs it most.
@@ -69,28 +79,66 @@ class StructuredResult:
         return len(self.records)
 
 
+def _strip_value_constraints(node: Any) -> Any:
+    """Recursively drop value-level constraints, keeping shape and types."""
+    if isinstance(node, dict):
+        return {
+            key: _strip_value_constraints(value)
+            for key, value in node.items()
+            if key not in VALUE_CONSTRAINTS
+        }
+    if isinstance(node, list):
+        return [_strip_value_constraints(item) for item in node]
+    return node
+
+
 def schema_for(model: type[Degradable]) -> dict[str, Any]:
     """The JSON schema to constrain the decode with.
 
-    Two edits to what Pydantic generates, both about what the *model* should
-    see rather than what is technically correct:
+    **The division of labour is deliberate: Ollama owns the SHAPE, Pydantic
+    owns the VALUES.** The schema sent to the model keeps object structure,
+    field names, types, enums, `$defs`/`$ref` and `required` -- the things a
+    grammar is genuinely good at. Every value-level constraint is stripped and
+    enforced by Pydantic afterwards.
+
+    That split is not a stylistic preference, it is what the measurements
+    forced:
+
+    * **`minItems` actively produced garbage.** Ollama enforces it, but by
+      PADDING -- asked for two key points against `minItems: 3`, qwen3:8b
+      returned ``['real point', 'another', '\n\n']``. The grammar was
+      satisfied and the report was junk. Leaving the constraint in made the
+      output *worse*, because a padded list looks valid to everything
+      downstream. Strip it, and the model simply returns the two it has;
+      Pydantic rejects that honestly and the repair turn asks for a third.
+    * **`minimum`/`maximum` were never enforced anyway** -- it returned
+      `confidence: 85` against `maximum: 1.0` -- so sending them bought
+      nothing and implied a guarantee that did not exist.
+
+    The general rule, and the reason to keep it: a constraint the grammar
+    half-enforces is worse than one it does not enforce at all, because the
+    failure stops being visible. One validation layer that always runs beats
+    two that disagree, and Pydantic is the one that can express what we
+    actually mean.
+
+    Two further edits, both about what the *model* should see:
 
     * ``parse_failed`` / ``degraded_reason`` are removed. They are ours.
     * ``title`` and ``description`` are removed. Pydantic fills ``description``
-      from the class docstring, and our docstrings are written for whoever
-      maintains this -- shipping "Stage 1's smoke-test target" into a prompt is
-      noise at best and misdirection at worst. Field-level descriptions written
-      *for* a model would be worth keeping; developer prose is not.
-
-    ``$defs`` and ``$ref`` are left alone: Ollama resolves them correctly,
-    including nested models, which was verified before this was written.
+      from the class docstring, and ours are written for whoever maintains
+      this -- shipping "Stage 1's smoke-test target" into a prompt is noise at
+      best. Field descriptions written *for* a model would be worth keeping;
+      developer prose is not.
     """
     schema = model.model_json_schema()
+
     properties = schema.get("properties", {})
     for name in INTERNAL_FIELDS:
         properties.pop(name, None)
     if "required" in schema:
         schema["required"] = [r for r in schema["required"] if r not in INTERNAL_FIELDS]
+
+    schema = _strip_value_constraints(schema)
     schema.pop("title", None)
     schema.pop("description", None)
     return schema
