@@ -31,6 +31,7 @@ THE TRAPS, ALL FROM §14 AND ALL MEASURED
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import date, datetime, time, timedelta
 from typing import Any
@@ -91,6 +92,24 @@ def _end_of_day(when: date) -> datetime:
     return datetime.combine(when, time(23, 59, 59), tzinfo=EXCHANGE_TZ)
 
 
+def ib_ticker(symbol: str, provider_symbols: dict[str, str] | None = None) -> str:
+    """The spelling IB uses for a symbol.
+
+    Share classes are the whole reason this exists. IB wants ``BRK B`` with a
+    SPACE where everyone else writes ``BRK.B``, ``BRK-B`` or ``brk-b.us``, and
+    passing the wrong one does not error -- ``qualifyContracts`` just returns
+    nothing, which surfaces much later as an empty price series.
+    ``config/universe.yaml`` records the per-provider spelling; this reads it.
+
+    The fallback converts ``.`` to a space, which is IB's convention, so a new
+    share-class ticker works even before someone adds a mapping for it.
+    """
+    mapped = (provider_symbols or {}).get("ib")
+    if mapped:
+        return mapped
+    return symbol.upper().replace(".", " ")
+
+
 async def fetch_series(
     ib: IB,
     symbol: str,
@@ -99,13 +118,27 @@ async def fetch_series(
     duration: str = DEFAULT_DURATION,
     exchange: str = "SMART",
     currency: str = "USD",
+    provider_symbols: dict[str, str] | None = None,
 ) -> BarSeries:
     """Daily TRADES bars for one symbol, newest bar on or before ``end``."""
-    contract = Stock(symbol.upper(), exchange, currency)
-    (qualified,) = await ib.qualifyContractsAsync(contract)
+    ticker = ib_ticker(symbol, provider_symbols)
+    contract = Stock(ticker, exchange, currency)
+
+    # qualifyContractsAsync returns a list that may contain None -- an unknown
+    # or misspelled symbol does not raise, it comes back unresolved. Unpacking
+    # it blindly turns that into an AttributeError sixty lines away.
+    qualified = await ib.qualifyContractsAsync(contract)
+    resolved = qualified[0] if qualified else None
+    if resolved is None or not getattr(resolved, "conId", 0):
+        raise RuntimeError(
+            f"IB could not resolve {symbol!r} (sent as {ticker!r}) on "
+            f"{exchange}/{currency}. Share classes are the usual cause: IB "
+            f"writes BRK.B as 'BRK B' with a space. Add a provider_symbols.ib "
+            f"entry for it in config/universe.yaml."
+        )
 
     rows = await ib.reqHistoricalDataAsync(
-        qualified,
+        resolved,
         # Aware, always. A naive value here is the measured one-session bug.
         endDateTime=_end_of_day(end) if end else "",
         durationStr=duration,
@@ -116,12 +149,17 @@ async def fetch_series(
     )
     if not rows:
         raise RuntimeError(
-            f"IB returned no bars for {symbol}. Check the contract qualified to "
-            f"the venue you expect ({qualified.primaryExchange or exchange}), and "
-            "that the Gateway has market data permissions for it."
+            f"IB returned no bars for {symbol} (as {ticker!r}). It resolved to "
+            f"conId {resolved.conId} on "
+            f"{resolved.primaryExchange or exchange}, so the contract is fine "
+            "-- this is most likely missing historical-data permission, or a "
+            "duration longer than IB will serve for this contract."
         )
 
     bars = [bar_from_ib(row) for row in rows]
+    # Keep the canonical ticker, not IB's spelling: `providers/ib.py` looks the
+    # cache up by the universe's symbol, and 'BRK B' there would be a
+    # permanent, silent miss.
     return BarSeries(symbol=symbol.upper(), source=CACHE_PROVIDER, bars=bars)
 
 
@@ -134,8 +172,17 @@ async def fetch_and_cache(
     client_id: int,
     duration: str = DEFAULT_DURATION,
     end: date | None = None,
+    provider_symbols: dict[str, dict[str, str]] | None = None,
+    pace_s: float = 2.0,
 ) -> dict[str, int]:
-    """Fetch each symbol and write it to the cache. Returns symbol -> bar count."""
+    """Fetch each symbol and write it to the cache. Returns symbol -> bar count.
+
+    ``pace_s`` respects IB's historical-data pacing: roughly 60 requests per
+    10 minutes, and identical requests inside 15 seconds are refused. One
+    request per symbol over a ~21-symbol universe is nowhere near the limit,
+    but a 2 s gap costs 40 seconds total and removes the whole class of
+    "pacing violation" errors, which arrive as an unhelpful generic message.
+    """
     ib = IB()
     written: dict[str, int] = {}
 
@@ -146,8 +193,13 @@ async def fetch_and_cache(
         accounts = assert_paper_account(ib)
         logger.info("connected to %s:%s as %s", host, port, ", ".join(accounts))
 
-        for symbol in symbols:
-            series = await fetch_series(ib, symbol, end=end, duration=duration)
+        for index, symbol in enumerate(symbols):
+            if index:
+                await asyncio.sleep(pace_s)
+            series = await fetch_series(
+                ib, symbol, end=end, duration=duration,
+                provider_symbols=(provider_symbols or {}).get(symbol.upper()),
+            )
             cache.put(
                 CACHE_PROVIDER,
                 CACHE_METHOD,

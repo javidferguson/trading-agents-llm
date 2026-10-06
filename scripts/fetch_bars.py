@@ -31,6 +31,20 @@ from research_desk.logging_setup import setup_logging  # noqa: E402
 from research_desk.providers.cache import Cache  # noqa: E402
 
 
+def provider_symbol_map() -> dict[str, dict[str, str]]:
+    """symbol -> {provider: spelling}, from universe.yaml.
+
+    Only BRK.B needs one today, but getting it wrong is a silently empty
+    series rather than an error, so it is read rather than assumed.
+    """
+    body = load_yaml("universe.yaml")
+    return {
+        entry["symbol"].upper(): entry["provider_symbols"]
+        for entry in body["symbols"]
+        if entry.get("provider_symbols")
+    }
+
+
 def universe_symbols() -> list[str]:
     """Everything that needs bars: the universe, its benchmark, its sector ETFs.
 
@@ -76,6 +90,7 @@ def main(argv: list[str] | None = None) -> int:
             client_id=12,
             duration=args.duration,
             end=end,
+            provider_symbols=provider_symbol_map(),
         ))
     except Exception as exc:
         print(f"FAILED: {exc}", file=sys.stderr)

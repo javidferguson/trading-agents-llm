@@ -356,6 +356,72 @@ def cmd_toy_graph(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# data -- what is cached, from where, and how stale
+# --------------------------------------------------------------------------- #
+
+
+def cmd_data(args: argparse.Namespace) -> int:
+    """Inventory the provider cache.
+
+    Answers the question you actually have before trusting a snapshot: is this
+    real IB data or the synthetic fixtures, and how old is it?
+    """
+    import json as _json
+
+    settings = load_settings()
+    universe = load_yaml("universe.yaml")
+    wanted = sorted(
+        {e["symbol"] for e in universe["symbols"]}
+        | {universe["benchmark"]}
+        | {e["sector_etf"] for e in universe["symbols"] if e.get("sector_etf")}
+    )
+
+    bars_dir = settings.cache_dir / "ib"
+    found: dict[str, dict] = {}
+    for path in sorted(bars_dir.glob("daily_bars-*.json")) if bars_dir.exists() else []:
+        try:
+            payload = (_json.loads(path.read_text()) or {}).get("payload") or {}
+        except Exception:
+            continue
+        if payload.get("symbol"):
+            found[payload["symbol"]] = payload
+
+    today = date.today()
+    print(f"{'symbol':<8}{'source':<10}{'bars':>6}  {'first':<12}{'last':<12}{'age':>5}")
+    print("-" * 60)
+
+    fixtures = 0
+    missing = []
+    for symbol in wanted:
+        payload = found.get(symbol)
+        if not payload:
+            missing.append(symbol)
+            print(f"{symbol:<8}{'-':<10}{0:>6}  {'-':<12}{'-':<12}{'-':>5}")
+            continue
+        rows = payload.get("bars") or []
+        source = payload.get("source", "?")
+        if source != "ib":
+            fixtures += 1
+        first = rows[0]["day"] if rows else "-"
+        last = rows[-1]["day"] if rows else "-"
+        age = (today - date.fromisoformat(last)).days if rows else 0
+        print(f"{symbol:<8}{source:<10}{len(rows):>6}  {first:<12}{last:<12}{age:>4}d")
+
+    print()
+    if fixtures:
+        print(f"!! {fixtures} symbol(s) hold SYNTHETIC fixture data, not market prices.")
+        print("   Every metric computed from them is fiction. Replace with:")
+        print("       make gateway-start && make bars")
+    if missing:
+        print(f"{len(missing)} symbol(s) have no bars: {', '.join(missing)}")
+        print("   `make bars` fetches the whole universe.")
+    if not fixtures and not missing:
+        print("All universe symbols have real IB bars.")
+    # Stale is a warning, not a failure: a long weekend is a legitimate 3 days.
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # snapshot -- the Stage 2 exit gate
 # --------------------------------------------------------------------------- #
 
@@ -498,6 +564,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub.add_parser("config-check", help="parse and validate config/").set_defaults(
         func=cmd_config_check
+    )
+
+    sub.add_parser("data", help="what is in the provider cache, and is it real").set_defaults(
+        func=cmd_data
     )
 
     snap = sub.add_parser("snapshot", help="Stage 2 exit gate: every §7.1 metric, no LLM")
