@@ -34,6 +34,8 @@ from ..models.modes import RunMode
 from .base import NetworkForbiddenError, PointInTimeError, ProviderError, ProviderSpec
 from .cache import Cache
 from .edgar import CompanyFacts, EdgarProvider
+from .finra import FinraProvider
+from .gdelt import GdeltProvider
 from .ib import IBBarsProvider
 from .limiter import RateLimiter
 
@@ -63,12 +65,16 @@ class ProviderRegistry:
         limiter: RateLimiter,
         bars: Any,
         edgar: Any = None,
+        finra: Any = None,
+        gdelt: Any = None,
     ):
         self.mode = mode
         self.cache = cache
         self.limiter = limiter
         self._bars = bars
         self._edgar = edgar
+        self._finra = finra
+        self._gdelt = gdelt
 
     @classmethod
     def from_config(
@@ -95,6 +101,8 @@ class ProviderRegistry:
             limiter=RateLimiter(intervals),
             bars=IBBarsProvider(cache),
             edgar=EdgarProvider(cache, settings.sec_user_agent),
+            finra=FinraProvider(cache),
+            gdelt=GdeltProvider(settings.cache_dir),
         )
 
     # ----------------------------------------------------------------- guards
@@ -155,7 +163,51 @@ class ProviderRegistry:
         await self._rate_limited(spec)
         return await self._edgar.company_facts(symbol, as_of)
 
-    # Arriving with Stage 2c, each one typed, each taking as_of:
+    async def short_interest(self, symbol: str, as_of: date) -> list[dict[str, Any]]:
+        """Semi-monthly short interest that was PUBLIC on or before ``as_of``.
+
+        Not merely settled before it: dissemination lags settlement by ~8
+        business days, so filtering on the settlement date alone would expose
+        up to twelve days of future information (see providers/finra.py).
+        """
+        return await self._via(self._finra, "short_interest", symbol, as_of)
+
+    async def short_volume(
+        self, symbol: str, as_of: date, days: int = 20
+    ) -> list[dict[str, Any]]:
+        """Daily short-sale volume, newest first. Published one session late."""
+        if self._finra is None:
+            raise ProviderError("no FINRA provider configured")
+        self._guard(self._finra.spec)
+        await self._rate_limited(self._finra.spec)
+        return await self._finra.short_volume(symbol, as_of, days)
+
+    async def insider_transactions(
+        self, symbol: str, as_of: date, days: int = 90
+    ) -> list[dict[str, Any]]:
+        """Form 4 transactions filed in the ``days`` before ``as_of``.
+
+        Each carries a ``discretionary`` flag. Only open-market purchases and
+        sales are decisions about price; exercises and tax withholding are not.
+        """
+        if self._edgar is None:
+            raise ProviderError("no EDGAR provider configured")
+        self._guard(self._edgar.spec)
+        await self._rate_limited(self._edgar.spec)
+        return await self._edgar.insider_transactions(symbol, as_of, days)
+
+    async def news_tone(self, symbol: str, as_of: date) -> list[dict[str, Any]]:
+        """Daily GDELT tone and article counts from the collector's cache."""
+        return await self._via(self._gdelt, "news_tone", symbol, as_of)
+
+    async def _via(self, provider: Any, method: str, symbol: str, as_of: date) -> Any:
+        if provider is None:
+            raise ProviderError(f"no provider configured for {method}")
+        self._guard(provider.spec)
+        await self._rate_limited(provider.spec)
+        return await getattr(provider, method)(symbol, as_of)
+
+    # Still to arrive, both gated on a free API key:
     #   company_news(symbol, as_of, days)   -- Finnhub
     #       earnings_calendar(symbol, as_of)    -- Finnhub
     #       short_interest(symbol, as_of)       -- FINRA
@@ -167,7 +219,10 @@ class ProviderRegistry:
     def describe(self) -> list[dict[str, Any]]:
         """What is wired up, for `desk providers`."""
         rows = []
-        for provider in (p for p in (self._bars, self._edgar) if p is not None):
+        for provider in (
+            p for p in (self._bars, self._edgar, self._finra, self._gdelt)
+            if p is not None
+        ):
             spec: ProviderSpec = provider.spec
             rows.append({
                 "name": spec.name,

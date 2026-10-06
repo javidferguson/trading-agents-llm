@@ -29,8 +29,9 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
+from xml.etree import ElementTree
 
 import httpx
 
@@ -54,6 +55,29 @@ TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 
 METHOD_FACTS = "company_facts"
 METHOD_TICKERS = "ticker_map"
+METHOD_SUBMISSIONS = "submissions"
+METHOD_FORM4 = "form4"
+
+#: Form 4 transaction codes, and which ones carry signal.
+#:
+#: ONLY P AND S ARE DISCRETIONARY. This is the single most important thing
+#: about Form 4 and it is easy to get wrong: a real Apple filing in this
+#: cache reports an "M" of 374,541 shares acquired (an option exercise) and
+#: an "F" of 199,038 disposed (shares withheld to pay the tax on it). Counted
+#: naively that reads as an executive buying 374k shares, which is the
+#: opposite of informative -- nobody chose to buy anything. Awards (A) and
+#: gifts (G) are likewise not decisions about price.
+DISCRETIONARY_CODES = frozenset({"P", "S"})
+CODE_MEANINGS = {
+    "P": "open-market purchase",
+    "S": "open-market sale",
+    "M": "exercise or conversion of a derivative",
+    "F": "shares withheld to cover tax",
+    "A": "grant or award",
+    "G": "gift",
+    "C": "conversion",
+    "D": "disposition to the issuer",
+}
 
 
 class MissingUserAgentError(ProviderError):
@@ -198,3 +222,153 @@ class EdgarProvider:
             facts=visible,
             as_of=as_of,
         )
+
+    async def insider_transactions(
+        self, symbol: str, as_of: date, days: int = 90, max_filings: int = 40
+    ) -> list[dict[str, Any]]:
+        """Form 4 transactions filed in the ``days`` before ``as_of``.
+
+        Point-in-time by ``filingDate``, which for Form 4 is genuinely close to
+        public availability -- insiders must file within two business days.
+
+        Each record carries its transaction ``code`` and a ``discretionary``
+        flag. **Read that flag.** Only open-market purchases and sales (P, S)
+        are decisions about price; an option exercise (M) and the shares
+        withheld to tax it (F) are mechanical, and counting them as buying and
+        selling is actively misleading -- see DISCRETIONARY_CODES.
+
+        ``max_filings`` bounds the work: a megacap files hundreds of Form 4s a
+        year, each one a separate document fetch.
+        """
+        cik = await self.cik_for(symbol)
+        if cik is None:
+            return []
+
+        recent = await self._submissions(cik)
+        window_start = as_of - timedelta(days=days)
+
+        wanted: list[tuple[str, str, date]] = []
+        for accession, form, filed in zip(
+            recent.get("accessionNumber") or [],
+            recent.get("form") or [],
+            recent.get("filingDate") or [],
+        ):
+            if form != "4" or not filed:
+                continue
+            filed_on = date.fromisoformat(filed)
+            if not (window_start <= filed_on <= as_of):
+                continue
+            wanted.append((accession, form, filed_on))
+            if len(wanted) >= max_filings:
+                break
+
+        transactions: list[dict[str, Any]] = []
+        for accession, _form, filed_on in wanted:
+            document = await self._form4(cik, accession)
+            if document is None:
+                continue
+            for tx in _parse_form4(document):
+                transactions.append({**tx, "filed": filed_on, "accession": accession})
+        return transactions
+
+    async def _submissions(self, cik: str) -> dict[str, Any]:
+        """The filing index. Cached whole; filtered by date at read time."""
+        entry = self._cache.get(SPEC.name, METHOD_SUBMISSIONS, as_of=None, cik=cik)
+        if entry is None:
+            payload = await self._get_json(f"{BASE_URL}/submissions/CIK{cik}.json")
+            if payload is None:
+                return {}
+            self._cache.put(SPEC.name, METHOD_SUBMISSIONS, payload=payload,
+                            as_of=None, cik=cik)
+            entry = {"payload": payload}
+        return ((entry.get("payload") or {}).get("filings") or {}).get("recent") or {}
+
+    async def _form4(self, cik: str, accession: str) -> str | None:
+        """One Form 4 XML document, cached by accession number.
+
+        Fetched from the raw ``form4.xml``, not the ``xslF345X06/`` path the
+        submissions index names -- that one is the XSL-rendered HTML, which
+        returns 200 with ``text/html`` and parses as XML not at all.
+        """
+        entry = self._cache.get(SPEC.name, METHOD_FORM4, as_of=None, accession=accession)
+        if entry is not None:
+            payload = entry.get("payload") or {}
+            return None if payload.get("missing") else payload.get("xml")
+
+        bare = accession.replace("-", "")
+        url = (
+            f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{bare}/form4.xml"
+        )
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            try:
+                response = await client.get(url, headers=self._headers())
+            except httpx.HTTPError as exc:
+                raise ProviderError(f"EDGAR unreachable: {exc}") from exc
+
+        if response.status_code >= 400:
+            self._cache.put(SPEC.name, METHOD_FORM4, payload={"missing": True},
+                            as_of=None, accession=accession)
+            return None
+
+        self._cache.put(SPEC.name, METHOD_FORM4, payload={"xml": response.text},
+                        as_of=None, accession=accession)
+        return response.text
+
+
+def _parse_form4(xml: str) -> list[dict[str, Any]]:
+    """Pull non-derivative transactions out of one Form 4.
+
+    Derivative transactions are skipped: they are options and RSUs, which move
+    on vesting schedules rather than on a view about price.
+    """
+    try:
+        root = ElementTree.fromstring(xml)
+    except ElementTree.ParseError:
+        logger.debug("unparseable Form 4", exc_info=True)
+        return []
+
+    relationship = root.find(".//reportingOwner/reportingOwnerRelationship")
+    roles = (
+        {child.tag: (child.text or "").strip() for child in relationship}
+        if relationship is not None
+        else {}
+    )
+
+    def text(node: Any, path: str) -> str | None:
+        found = node.find(path)
+        return found.text.strip() if found is not None and found.text else None
+
+    out: list[dict[str, Any]] = []
+    for tx in root.findall(".//nonDerivativeTransaction"):
+        code = text(tx, "transactionCoding/transactionCode")
+        shares = text(tx, "transactionAmounts/transactionShares/value")
+        price = text(tx, "transactionAmounts/transactionPricePerShare/value")
+        direction = text(tx, "transactionAmounts/transactionAcquiredDisposedCode/value")
+        raw_date = text(tx, "transactionDate/value")
+
+        try:
+            share_count = float(shares) if shares else None
+            unit_price = float(price) if price else None
+        except ValueError:
+            continue
+
+        out.append({
+            "date": date.fromisoformat(raw_date) if raw_date else None,
+            "code": code,
+            "code_meaning": CODE_MEANINGS.get(code or "", "other"),
+            "discretionary": code in DISCRETIONARY_CODES,
+            "acquired": direction == "A",
+            "shares": share_count,
+            "price": unit_price,
+            # None rather than 0 when no price is reported: an exercise or a
+            # gift has no transaction price, and a zero would quietly drag a
+            # net-dollar total toward nothing.
+            "usd": (share_count * unit_price)
+            if share_count is not None and unit_price is not None
+            else None,
+            "is_officer": roles.get("isOfficer") == "true",
+            "is_director": roles.get("isDirector") == "true",
+            "is_ten_percent_owner": roles.get("isTenPercentOwner") == "true",
+            "officer_title": roles.get("officerTitle") or None,
+        })
+    return out

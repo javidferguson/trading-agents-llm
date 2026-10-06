@@ -248,6 +248,7 @@ class RelativeStrengthMetrics(MetricBlock):
 BLOCK_NAMES = (
     "trend", "risk", "mean_reversion", "relative_strength",
     "value", "quality", "growth",
+    "positioning", "sentiment",
 )
 
 
@@ -303,6 +304,68 @@ class GrowthMetrics(MetricBlock):
     share_count_change_1y_pct: float | None = None
 
 
+class PositioningMetrics(MetricBlock):
+    """Revealed positioning (§7.1) -- what people did with money.
+
+    *"This is what node 4 reads instead of Reddit."* Regulated disclosure, so
+    barely manipulable, and every figure is dated.
+
+    The insider fields count **only discretionary** transactions: open-market
+    purchases and sales. An option exercise and the shares withheld to tax it
+    are mechanical, and counting them as buying and selling says an executive
+    bought hundreds of thousands of shares when nobody chose to buy anything.
+    """
+
+    short_interest_shares: float | None = None
+    short_interest_change_pct: float | None = None
+    days_to_cover: float | None = None
+    #: Days between the settlement date and ``as_of``. Short interest is
+    #: semi-monthly and published ~8 business days late, so it is ALWAYS stale;
+    #: how stale is information a model should have.
+    short_interest_age_days: float | None = None
+
+    short_volume_ratio: float | None = None
+    short_volume_ratio_20d: float | None = None
+
+    insider_buy_count: float | None = None
+    insider_sell_count: float | None = None
+    insider_net_usd: float | None = None
+    #: Non-discretionary filings in the window (exercises, awards, tax
+    #: withholding). Surfaced so a reader can see the discretionary count is
+    #: small because little was chosen, not because little was filed.
+    insider_nondiscretionary_count: float | None = None
+
+
+class SentimentMetrics(MetricBlock):
+    """News tone and attention (§7.1), normalised.
+
+    Three rules from §7.1 that matter more than the numbers:
+
+    1. **Percentiles, never raw tone, and never an adjective.** A tone of
+       ``-1.7`` means nothing to an 8B model; "12th percentile of this
+       symbol's own last year" means something.
+    2. **The sign is not the obvious one.** Extreme bullish sentiment and
+       abnormal attention are, at short horizons, better documented as
+       *contrarian*. Tell an 8B model "sentiment is very positive" and it will
+       say BUY every time -- so the prompt gets the percentile and the
+       direction of change, and the bull and bear researchers argue about what
+       it means.
+    3. **Expect a weak signal.** Tone is largely priced in for large caps. It
+       earns its place as a tiebreaker and a risk flag -- an unusual spike in
+       coverage *volume* is a better reason to pay attention than the tone of
+       that coverage.
+    """
+
+    news_tone_1d: float | None = None
+    news_tone_7d: float | None = None
+    news_tone_30d: float | None = None
+    #: Where the 7-day tone sits in this symbol's own trailing year. The thing
+    #: that actually goes in a prompt.
+    news_tone_percentile_1y: float | None = None
+    article_count_7d: float | None = None
+    coverage_volume_zscore_90d: float | None = None
+
+
 class MarketSnapshot(BaseModel):
     """Everything deterministic, computed before any model runs.
 
@@ -348,6 +411,12 @@ class MarketSnapshot(BaseModel):
     growth: GrowthMetrics = Field(
         default_factory=lambda: GrowthMetrics.unavailable("not computed")
     )
+    positioning: PositioningMetrics = Field(
+        default_factory=lambda: PositioningMetrics.unavailable("not computed")
+    )
+    sentiment: SentimentMetrics = Field(
+        default_factory=lambda: SentimentMetrics.unavailable("not computed")
+    )
 
     #: The latest EDGAR filing this snapshot's fundamentals came from, and when
     #: it was filed. Without it you cannot tell a stale snapshot from a company
@@ -355,8 +424,9 @@ class MarketSnapshot(BaseModel):
     fundamentals_asof: date | None = None
     fundamentals_form: str | None = None
 
-    # Arriving with Stage 2c:
-    #   events, positioning, sentiment, macro, regime
+    # Still to arrive (both gated on free API keys):
+    #   events  -- Finnhub earnings calendar, surprises, recommendation trends
+    #   macro   -- FRED series, and the regime tag they key (§7.2)
 
     def all_gaps(self) -> dict[str, str]:
         """Every unavailable metric and why, flattened.

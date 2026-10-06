@@ -26,7 +26,7 @@ Two processes that communicate through a file, never a shared event loop:
 |---|---|---|
 | **0** | Skeleton, pinned deps, compose, Langfuse, toy graph | **done** |
 | **1** | LLM router + structured output | **done** |
-| 2 | Providers, cache, metrics | **2a+2b done** (bars, EDGAR, 60 metrics); 2c pending |
+| 2 | Providers, cache, metrics | **2a-2c done** (76 metrics); Finnhub + FRED need keys |
 | 3 | Vertical slice → `proposal.json` | not started |
 | 4 | Analysts + research debate | not started |
 | 5 | Risk debate + fund manager | not started |
@@ -96,9 +96,12 @@ report.
   both appear as spans in Langfuse.
 - `make bars` — fetch daily bars from IB into the cache (needs the Gateway).
   `make data` shows what is cached, from which source, and how stale.
-- `make snapshot` — the Stage 2 exit gate: all 60 metrics for a symbol, each
+- `make snapshot` — the Stage 2 exit gate: all 76 metrics for a symbol, each
   either populated or explicitly unavailable *with a reason*. No LLM.
   Needs `SEC_EDGAR_USER_AGENT` set, or EDGAR 403s without saying why.
+- `make gdelt` — collect news tone. **Its window closes**: GDELT serves a
+  rolling ~3 months, so uncollected days are unrecoverable. Run
+  `--days 90` once to backfill.
 - `make smoke` — the Stage 1 exit gate: a real `AnalystReport` out of a local 8B
   model, showing attempts, latency, tokens and the model digest.
 

@@ -24,7 +24,7 @@ from ..models.market import (
     TrendMetrics,
 )
 from ..providers.base import ProviderError
-from . import fundamentals, indicators
+from . import fundamentals, indicators, positioning, sentiment
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +76,26 @@ async def build_market_snapshot(
         facts_reason = f"EDGAR unavailable: {str(exc).splitlines()[0]}"
         logger.info("%s: %s", symbol, facts_reason)
 
+    # Positioning and sentiment are independently optional: FINRA needs no
+    # key but can be down, and GDELT depends on a collector that may never
+    # have run. Each failure becomes its own explained gap rather than
+    # sinking the snapshot.
+    async def _optional(coro, label: str):
+        try:
+            return await coro, None
+        except ProviderError as exc:
+            reason = f"{label} unavailable: {str(exc).splitlines()[0]}"
+            logger.info("%s: %s", symbol, reason)
+            return None, reason
+
+    interest, interest_reason = await _optional(
+        registry.short_interest(symbol, as_of), "FINRA short interest")
+    volume, _ = await _optional(
+        registry.short_volume(symbol, as_of), "FINRA short volume")
+    insiders, _ = await _optional(
+        registry.insider_transactions(symbol, as_of), "EDGAR Form 4")
+    tone, _ = await _optional(registry.news_tone(symbol, as_of), "GDELT")
+
     last_close = series.bars[-1].close if len(series) else None
     filed, form = facts.latest_filing if facts else (None, None)
 
@@ -96,6 +116,12 @@ async def build_market_snapshot(
         value=fundamentals.value_metrics(facts, last_close, facts_reason),
         quality=fundamentals.quality_metrics(facts, facts_reason),
         growth=fundamentals.growth_metrics(facts, facts_reason),
+        positioning=positioning.positioning_metrics(
+            interest, volume, insiders, as_of,
+            unavailable_reason=interest_reason if volume is None and insiders is None
+            else None,
+        ),
+        sentiment=sentiment.sentiment_metrics(tone, as_of),
         fundamentals_asof=filed,
         fundamentals_form=form,
     )

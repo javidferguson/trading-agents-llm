@@ -617,9 +617,9 @@ considerably longer than 90 sessions.
 | Fundamentals | **SEC EDGAR** XBRL `companyfacts` | Finnhub `/stock/metric` | none for EDGAR | **The best free source in the stack.** Every fact carries its `filed` date, so it is genuinely point-in-time rather than approximately so. Requires a `User-Agent: Name email` header — a missing one is the usual cause of a 403 — and 10 req/s |
 | News | **Finnhub** `/company-news` | SEC 8-K feed; Yahoo RSS | free, 60/min | Finnhub is date-rangeable (1y history on free), which is exactly what replay needs. **RSS is not date-rangeable, so it is `supports_point_in_time=False` and must raise in replay** |
 | Events/estimates | **Finnhub** earnings calendar, surprises, recommendation trends | — | free, 60/min | |
-| Positioning | **FINRA** short interest + daily short-sale volume; **SEC EDGAR** Form 4 | — | none | Short interest carries a settlement date; Form 4 carries a filing date. Both point-in-time |
+| Positioning | **FINRA** short interest + daily short-sale volume; **SEC EDGAR** Form 4 | — | none | Both dated — but see the lag below: a settlement date is **not** a publication date |
 | **News tone / volume** | **GDELT** DOC 2.0 (`TimelineTone`, `TimelineVol`) | Finnhub article counts | **none** | Open API, no key, no auth — but **not unlimited**, see below. Aggregates thousands of outlets across 100+ countries — see §7.6 on why breadth is the whole point. **Rolling 3-month window only**, which drives a build-order requirement (§7.5) |
-| Market sentiment | **CBOE** daily options statistics — equity put/call ratio | — | none | Free daily files with an archive back to 2006. The cleanest free sentiment series in the stack |
+| Market sentiment | ~~CBOE equity put/call~~ — **RETIRED**, see below | — | — | Every documented endpoint now returns 403 |
 | Search attention | pytrends (Google Trends) | — | none | **Optional.** Unofficial, rate-limited, and its values are *relative to the requested window*, so the same date returns different numbers depending on the query range — a genuine replay hazard. If used at all: snapshot at `as_of`, cache, and never re-query a cached date |
 | Macro | **FRED** | — | free key | Generous limits, one fetch per run |
 
@@ -700,6 +700,34 @@ Coverage is honestly uneven, and the gaps are reporting conventions rather than
 bugs: AAPL 60/60, BRK.B 48/60, JPM 50/60 (no gross profit, no classified
 balance sheet — banks do not present one), TSM 38/60 (a 20-F filer with no
 quarterlies). Each missing metric states which convention caused it.
+
+**Positioning, as built at Stage 2c. Two measured corrections.**
+
+*The settlement date is not the publication date, and the difference is
+look-ahead bias.* Measured 2026-10-06: the newest short-interest settlement
+FINRA would serve was **2026-09-15**; the 09-30 settlement was still
+unpublished six days later, because dissemination runs ~8 business days behind
+settlement. Filtering on `settlementDate <= as_of` therefore makes up to twelve
+days of future information visible — §15.1 exactly, and the kind that looks
+like a working backtest. The provider applies a conservative 14-day
+dissemination lag, and the snapshot reports `short_interest_age_days` so a
+model knows it is reading a three-week-old number.
+
+*Only Form 4 codes P and S are decisions about price.* A real Apple filing in
+the cache reports an `M` of 374,541 shares **acquired** (an option exercise)
+and an `F` of 199,038 **disposed** (shares withheld to pay the tax on it).
+Counted naively that reads as an executive buying 374k shares, which is the
+opposite of informative — nobody chose to buy anything. Over 90 days AAPL
+showed 18 `S`, 5 `F`, 5 `M` and 1 `G`: the discretionary signal is the 18, and
+the other 11 are surfaced separately so a small discretionary count is visibly
+"little was chosen" rather than "little was filed".
+
+**CBOE is retired.** §7.3 described "free daily files with an archive back to
+2006"; every documented endpoint —
+`cdn.cboe.com/api/global/us_indices/daily_statistics/*` and the CSV archive —
+now returns **403**. The third provider after Stooq and Stooq's bulk archive to
+have closed. It costs the put/call raw field but **not** the regime tag, which
+§7.2 deliberately built from VIX, the curve and SPY's 200-day only.
 
 Deliberately **not** used:
 
