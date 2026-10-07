@@ -38,6 +38,18 @@ LANGGRAPH_OWNER = SRC / "graph" / "build.py"
 #: The single package allowed to import ib_async.
 IB_OWNER = SRC / "execution"
 
+#: What may be imported from `providers` by the rest of the codebase.
+#:
+#: `registry` is the fetch entry point -- that is the §2 rule. `base` is the
+#: *contract*: ProviderSpec and the exception types. Importing an exception to
+#: catch it is not reaching into a provider, and the alternative (re-exporting
+#: every error from registry) would obscure where they are defined for no gain.
+#:
+#: What this still forbids is exactly what §2 cares about: `providers.ib`,
+#: `providers.edgar`, `providers.stooq` and friends. If one of those appears in
+#: a diff outside this package, the tool-promotion path has been broken.
+PROVIDER_PUBLIC = {"registry", "base"}
+
 
 def _modules() -> list[Path]:
     return sorted(SRC.rglob("*.py"))
@@ -132,9 +144,11 @@ def test_providers_reached_only_through_the_registry(path: Path) -> None:
         parts = node.module.split(".")
         if "providers" in parts:
             tail = parts[parts.index("providers") + 1 :]
-            assert not tail or tail[0] == "registry", (
+            assert not tail or tail[0] in PROVIDER_PUBLIC, (
                 f"{path.relative_to(SRC)} imports providers.{'.'.join(tail)} "
-                "directly. Every fetch goes through providers/registry.py."
+                "directly. Every FETCH goes through providers/registry.py -- "
+                f"only {sorted(PROVIDER_PUBLIC)} may be imported from outside "
+                "the package."
             )
 
 
@@ -146,4 +160,46 @@ def test_the_owners_actually_exist() -> None:
         "graph/build.py no longer imports langgraph, so the rule above proves "
         "nothing. Either LangGraph was dropped -- in which case say so in the "
         "architecture doc -- or this test needs a new owner."
+    )
+
+
+def test_importing_decide_does_not_pull_ib_async() -> None:
+    """The §0 split, asserted on the dependency TREE rather than the source.
+
+    Migration plan §0: *"the cheapest way to enforce it is a test that asserts
+    the import is absent from the decide dependency tree."* The AST tests above
+    catch a direct import; this catches a transitive one -- a convenience
+    helper in `cli.py` that reaches `execution.bars`, say, which would look
+    innocent in a diff and quietly install ib_async's event loop policy into
+    the process running a dozen concurrent LLM calls.
+
+    Run in a subprocess because `ib_async` is certainly already imported in
+    this one: the carried safety tests import it on purpose.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    probe = textwrap.dedent("""
+        import sys
+        # Everything `decide` legitimately touches.
+        import research_desk.cli
+        import research_desk.graph.build
+        import research_desk.llm.router
+        import research_desk.llm.structured
+        import research_desk.metrics.snapshot
+        import research_desk.providers.registry
+        leaked = [m for m in sys.modules if m.split('.')[0] == 'ib_async']
+        print(','.join(leaked))
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, f"probe failed:\n{result.stderr}"
+    leaked = [m for m in result.stdout.strip().split(",") if m]
+    assert not leaked, (
+        f"importing decide's modules pulled in {leaked}. Something in the "
+        "decide path now reaches execution/ at import time -- find it with "
+        "`python -X importtime -c 'import research_desk.cli'`."
     )

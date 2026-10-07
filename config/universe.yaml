@@ -138,6 +138,7 @@ symbols:
       stooq: "brk-b.us"
       ib: "BRK B"            # IB uses a space; SMART/USD
       yahoo: "BRK-B"
+      edgar: "BRK-B"       # a THIRD spelling: EDGAR uses a dash
     # Financials screening does not transfer to a conglomerate holding company:
     # gross profitability and accruals (§7.1) are close to meaningless here,
     # and book/price is the metric that actually means something. Worth a

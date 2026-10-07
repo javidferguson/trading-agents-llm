@@ -376,6 +376,37 @@ refactor will "helpfully" fix. It needs the code comment the architecture doc
 asks for, and ideally a test that asserts intent text is absent from analyst
 prompts.
 
+> **Done.** Both halves of the gate are tests: `tests/intent/test_stage6_gate.py`
+> asserts an `OrderPlan` out of the real book with `socket.socket.connect`
+> replaced by a raising stub — stronger than looking for `ib_async`, because it
+> proves the layer is not quietly reading a quote from anywhere — and blocks a
+> fund manager that approves 100% of equity at conviction 1.0, including through
+> a hand-built plan that bypasses sizing entirely, so the veto cannot be passing
+> merely because sizing made it unnecessary.
+>
+> The trap was right, and Stage 6 made it sharper rather than softer:
+> `prefetch` now puts the book and the drift table into `DecisionState`, so the
+> data an analyst must not see sits in the object it reads. The guard checks the
+> imports *and* the prompts each analyst actually sent, and it checks the
+> positive control too — that the trader and fund manager do receive it — since
+> a blindness test that passed by deleting the feature would be worthless. Both
+> halves were verified by injecting a leak and watching them fail.
+>
+> Four things the architecture doc now records as built, under §8 and §9. The
+> one that mattered beyond this stage was **`conviction_w` damping the target
+> twice** — the fund manager reduces for risk and the formula reduced again, so
+> a 4.5% adjusted target at 0.65 conviction ordered three shares. **Fixed before
+> Stage 7 rather than carried**, because it moves every position size and so
+> every Stage 8 number. The term is gone; sizing is now
+> `min(requested, cap_intent, cap_position, cap_risk)` and the same decision
+> orders eleven shares.
+>
+> The reason for removing it rather than reweighting it is worth keeping: §11's
+> calibration plot measures stated confidence against realised outcomes, so
+> `conviction` must not also be a control input — a measured number that sets
+> position size is a number with a reason to be inflated. It now has zero
+> numeric consumers. See FOLLOWUPS.md.
+
 ### Stage 7 — Execution · M
 
 The `execute` process: copied safety, `whatIfOrder`, marketable limit orders,

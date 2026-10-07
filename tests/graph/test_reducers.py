@@ -116,3 +116,71 @@ async def test_linear_graph_threads_state_in_order(ctx: NodeContext) -> None:
     )
     result = DecisionState.model_validate(await graph.ainvoke(_state(ctx)))
     assert result.notes == ["first", "second"]
+
+
+async def test_a_dict_written_by_parallel_nodes_merges(ctx: NodeContext) -> None:
+    """The Stage 4 failure, and the gap in this file that let it through.
+
+    The list fields were annotated at Stage 0 because §4 named them. The
+    `analyst_reports` DICT was not, and the four-way fan-out failed on its
+    first live run:
+
+        InvalidUpdateError: At key 'analyst_reports': Can receive only one
+        value per step. Use an Annotated key to handle multiple values.
+
+    Two things worth keeping from that. LangGraph 1.2 *raises* where §4
+    expected a silent overwrite, so the trap is louder than documented. And a
+    reducer test that only covers the shapes a doc happened to list is a test
+    that covers the bugs you already knew about.
+    """
+    from research_desk.models.state import AnalystReport
+
+    def reporter(kind: str):
+        async def probe(state: DecisionState, _ctx: NodeContext) -> dict:
+            return {"analyst_reports": {kind: AnalystReport.degraded("x", kind=kind)}}
+        return probe
+
+    kinds = ["market", "news", "positioning", "fundamentals"]
+    branches = [(f"{k}_analyst", reporter(k)) for k in kinds]
+
+    graph = build_fanout_graph(
+        ("prefetch", _passthrough), branches, ("collect", _passthrough), ctx
+    )
+    result = DecisionState.model_validate(await graph.ainvoke(_state(ctx)))
+
+    assert sorted(result.analyst_reports) == sorted(kinds), (
+        "a dict written by parallel nodes needs operator.or_, not last-write-wins"
+    )
+
+
+def test_every_concurrently_written_field_has_a_reducer() -> None:
+    """Catch the NEXT one statically, rather than on a live run.
+
+    Stage 5 adds a risk trio writing in parallel. This asserts that any
+    collection field on DecisionState carries an Annotated reducer, so the
+    omission is a failing test rather than an InvalidUpdateError eight minutes
+    into a run.
+    """
+    import typing
+
+    from research_desk.models.state import DecisionState as DS
+
+    exempt = {"gaps"}  # not on DecisionState, but belt and braces
+    missing = []
+    for name, field in DS.model_fields.items():
+        if name in exempt:
+            continue
+        annotation = field.annotation
+        origin = typing.get_origin(annotation)
+        if origin not in (list, dict):
+            continue
+        # A reducer shows up as metadata on the Annotated wrapper.
+        if not field.metadata:
+            missing.append(name)
+
+    assert not missing, (
+        f"{missing} are collections on DecisionState with no reducer. If any "
+        "node writes one in parallel, LangGraph will refuse the update "
+        "mid-run (§4). Annotate with operator.add for lists, operator.or_ "
+        "for dicts."
+    )

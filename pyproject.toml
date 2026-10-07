@@ -56,3 +56,10 @@ packages = ["src/research_desk"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "smoke: hits a real local model. Skipped when Ollama is unreachable.",
+]
+# The live model tests add ~30s and need Ollama up, so they are out of the
+# default run -- a suite you hesitate to run is a suite you stop running.
+# `make test-smoke` and `make verify` invoke them explicitly.
+addopts = "-m 'not smoke'"

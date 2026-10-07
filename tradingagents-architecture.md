@@ -309,6 +309,24 @@ class DecisionState(BaseModel):
     errors: list[NodeError] = []
 ```
 
+**Reducers, as found at Stage 4.** The list fields were annotated at Stage 0
+because §4 names them. `analyst_reports` is a **dict**, was not annotated, and
+the four-way fan-out failed on its first live run:
+
+```
+InvalidUpdateError: At key 'analyst_reports': Can receive only one value
+per step. Use an Annotated key to handle multiple values.
+```
+
+Two things worth keeping. LangGraph 1.2 **raises** where this section expected
+a silent overwrite, so the trap is louder than documented — but only for
+fields it can see are concurrent, so the annotation (`operator.or_` for dicts)
+is still the fix. And a reducer test covering only the shapes a doc happened to
+list is a test covering the bugs you already knew about;
+`test_every_concurrently_written_field_has_a_reducer` now asserts statically
+that every collection on `DecisionState` carries one, which is what will catch
+the risk trio at Stage 5.
+
 Three details that pay for themselves:
 
 - **`LLMCallRecord` stores the raw response**, enabling `mode="replay_llm"`:
@@ -382,6 +400,104 @@ presets:
 repair turn with the validation error appended → on second failure, return
 `schema.degraded()` with `parse_failed=True`. A degraded analyst report beats a
 crashed 8-minute run.
+
+### What constrained decode actually enforces (measured at Stage 1)
+
+The §2 bet is that constraining the decode beats asking politely. It does — but
+not uniformly, and the gaps are exactly where Pydantic validators have to live.
+Measured against `qwen3:8b` through Ollama's `format=<json_schema>`:
+
+| Constraint | Enforced? |
+|---|---|
+| `enum`, JSON types | **Yes.** `stance` never came back off-list |
+| `$defs` / `$ref`, nested models | **Yes**, including a nested `Evidence` with a `datetime` |
+| `minItems` / `maxItems` | **Yes — but by padding.** Asked for two items against `minItems: 3` it returned `['…', '…', '\n\n']`. The grammar is satisfied and the report is junk |
+| `minimum` / `maximum` | **No.** Asked for a percentage it returned `confidence: 85` against `maximum: 1.0` |
+| Word/sentence counts | Not expressible at all |
+
+### The rule this produces: Ollama owns shape, Pydantic owns values
+
+The schema sent to the model keeps object structure, field names, types, enums,
+`$defs`/`$ref` and `required`. **Every value-level constraint is stripped** —
+`minItems`, `maxItems`, `minimum`, `maximum`, `minLength`, `maxLength`,
+`pattern` — and enforced by Pydantic instead.
+
+This is not tidiness. Leaving `minItems` in made the output *actively worse*.
+Asked for two key points against `minItems: 3`, `qwen3:8b` returned:
+
+```
+['Price above all SMAs...', 'RSI-14 at 71.2...', 'key_points_count']
+```
+
+and on another run `[..., '\n\n']`. The grammar was satisfied; a key point was
+a placeholder string. With the constraint stripped, the same prompt returns the
+two it actually has — Pydantic rejects that honestly, and the repair turn asks
+for a real third.
+
+> **A constraint the grammar half-enforces is worse than one it does not
+> enforce at all, because the failure stops being visible.** One validation
+> layer that always runs beats two that disagree, and Pydantic is the one that
+> can express what we actually mean (word counts, cross-field rules, "not
+> whitespace").
+
+Two further consequences, both found by running it rather than reading docs:
+
+1. **Schema-valid is not the same as usable.** Even with shape-only schemas,
+   a model can return an empty string where a sentence belongs. Validators
+   stay.
+2. **The repair turn is a routine path, not an exotic one.** Range and length
+   violations both reach it on ordinary runs. Building it at Stage 1 rather
+   than Stage 4 was the right call.
+
+### Two things the repair prompt must say, both learned the hard way
+
+- **Ask for margin, not compliance.** Told *"summary is 412 words; the limit is
+  200"*, qwen3:8b returned **304** — it shortened and still failed, burning the
+  only retry. Counting words is arithmetic, and §2's "never let an LLM do
+  arithmetic" applies to the constraints we hand a model, not only to the
+  numbers we ask it for. State limits structurally ("at most 6 short
+  sentences") and tell it to go clearly inside the limit.
+- **The correction must claim priority over the original request.** Asked for
+  confidence *"as a PERCENTAGE"*, the model returned `85`; told it must be
+  `<= 1`, it returned `82`, then `80`. It was still obeying the earlier, more
+  specific instruction, because a validation error states a constraint without
+  saying what to do about it. The repair prompt now says explicitly that it
+  overrides anything conflicting earlier. This is not only an artificial case:
+  any system prompt that disagrees with a schema produces it.
+
+### The fund manager runs locally for now (Stage 5)
+
+§6 routes `fund_manager` to `deep_hosted` and calls it "the one node worth
+paying for". It is routed to a **local quantized model** instead:
+`qwen3:32b`, Q4_K_M — 20.2 GB for 32.8B parameters is ~4.9 bits per parameter,
+where unquantized FP16 would be 65.6 GB and would not fit alongside anything
+else.
+
+Three reasons this is the right starting point rather than a compromise:
+
+- **A full run now costs $0 and needs no API key.** §12's table can be
+  re-derived against real rates when it matters rather than before anything
+  works.
+- **§11 already has the experiment.** The `trader→deep_hosted` ablation and
+  the `all_hosted` preset exist precisely to answer "is the paid node worth
+  paying for". Running local first and measuring later is what that machinery
+  is *for*; deciding by assumption now would waste it.
+- **It is a distinct model.** A fund manager sharing weights with the trader
+  is not a second opinion, and §3 node 13 exists to be a separate judgement.
+  A test asserts it never shares a model with trader, analyst or facilitator.
+
+`deep_hosted` stays defined and unrouted, and `AnthropicClient` still raises a
+clear unimplemented error — reachable only through `all_hosted`, so a routing
+mistake cannot quietly start spending.
+
+### `think:` is a cost dial, and a large one
+
+qwen3 is a hybrid reasoning model and **thinks by default**. On an identical
+prompt: thinking on produced 579 eval tokens in 8.7 s, thinking off produced 64
+in 2.7 s — the same answer, ~9× the tokens. Structured output stays valid either
+way (reasoning returns in its own field rather than contaminating the JSON), so
+this is purely cost/quality. Default off; raise it only where reasoning is the
+product and an ablation shows it earns the time.
 
 ---
 
@@ -540,13 +656,13 @@ considerably longer than 90 sessions.
 
 | Need | Primary | Fallback | Key | Notes |
 |---|---|---|---|---|
-| Daily OHLCV | **Stooq** — no key, decades of daily history | **IB `reqHistoricalData`** | none | **yfinance is demoted to third.** It is an unofficial scrape that has been structurally unreliable since Yahoo's 2025 redesign — rate limits, IP blocks, schema churn. IB is the authoritative fallback and the Gateway is already running |
+| Daily OHLCV | **IB `reqHistoricalData`**, via a cached artefact (see below) | — | none | **yfinance is demoted to third.** It is an unofficial scrape that has been structurally unreliable since Yahoo's 2025 redesign — rate limits, IP blocks, schema churn. IB is the authoritative fallback and the Gateway is already running |
 | Fundamentals | **SEC EDGAR** XBRL `companyfacts` | Finnhub `/stock/metric` | none for EDGAR | **The best free source in the stack.** Every fact carries its `filed` date, so it is genuinely point-in-time rather than approximately so. Requires a `User-Agent: Name email` header — a missing one is the usual cause of a 403 — and 10 req/s |
 | News | **Finnhub** `/company-news` | SEC 8-K feed; Yahoo RSS | free, 60/min | Finnhub is date-rangeable (1y history on free), which is exactly what replay needs. **RSS is not date-rangeable, so it is `supports_point_in_time=False` and must raise in replay** |
 | Events/estimates | **Finnhub** earnings calendar, surprises, recommendation trends | — | free, 60/min | |
-| Positioning | **FINRA** short interest + daily short-sale volume; **SEC EDGAR** Form 4 | — | none | Short interest carries a settlement date; Form 4 carries a filing date. Both point-in-time |
+| Positioning | **FINRA** short interest + daily short-sale volume; **SEC EDGAR** Form 4 | — | none | Both dated — but see the lag below: a settlement date is **not** a publication date |
 | **News tone / volume** | **GDELT** DOC 2.0 (`TimelineTone`, `TimelineVol`) | Finnhub article counts | **none** | Open API, no key, no auth — but **not unlimited**, see below. Aggregates thousands of outlets across 100+ countries — see §7.6 on why breadth is the whole point. **Rolling 3-month window only**, which drives a build-order requirement (§7.5) |
-| Market sentiment | **CBOE** daily options statistics — equity put/call ratio | — | none | Free daily files with an archive back to 2006. The cleanest free sentiment series in the stack |
+| Market sentiment | ~~CBOE equity put/call~~ — **RETIRED**, see below | — | — | Every documented endpoint now returns 403 |
 | Search attention | pytrends (Google Trends) | — | none | **Optional.** Unofficial, rate-limited, and its values are *relative to the requested window*, so the same date returns different numbers depending on the query range — a genuine replay hazard. If used at all: snapshot at `as_of`, cache, and never re-query a cached date |
 | Macro | **FRED** | — | free key | Generous limits, one fetch per run |
 
@@ -571,6 +687,108 @@ not "no limit", and the limit is stated in a place that is easy to throw away:
 - GDELT's own 429 points high-traffic users at the **web ngrams dataset** as the
   supported alternative. Not needed at this universe size; the right answer if
   the universe ever grows past the point where 5-second pacing is tolerable.
+
+**Stooq is retired, and this row is reversed from the original.** Measured
+2026-10-06: Stooq's CSV endpoint now answers HTTP 200 with a JavaScript
+proof-of-work browser challenge, and its static bulk archive returns 401.
+Reading it programmatically would mean defeating a bot check. It was chosen as
+primary *because* it was a clean keyless CSV endpoint, so the reason is gone
+and IB — previously the authoritative fallback — is now primary.
+
+That creates a problem §0 forbids solving directly: `decide` may not import
+`ib_async`. The resolution is the shape §0 already uses one level up — **two
+processes communicating through a file**:
+
+```
+execution/bars.py   ib_async, talks to the Gateway, WRITES the bar cache
+providers/ib.py     reads the cache, imports nothing of the sort
+```
+
+This is **better than a direct fetch**, not a grudging workaround:
+
+- The price path in `decide` cannot reach the network in *any* mode, so §7.4's
+  "in replay the cache is the only permitted source" holds for bars always.
+  Look-ahead bias cannot enter through prices at all.
+- A research run does not need the Gateway up. Refresh bars when convenient,
+  then iterate on prompts for days — which matters, because §4 of the
+  migration plan lists "`decide` stops being fun to iterate on" as a legitimate
+  reason to abandon the project.
+
+The cost is one extra step (`make bars`) and a staleness check, which
+`build_market_snapshot` warns about past five days.
+
+**EDGAR, as built at Stage 2b.** It does deserve "best free source in the
+stack" — every fact carries `filed`, so filtering to `filed <= as_of`
+reproduces exactly what was knowable on a past date. Four things the doc did
+not say, all measured:
+
+- **An ETF 404s *with an XML body*.** SPY has a CIK (0000884394) — §7.3 assumed
+  it would not — but company facts returns `404` carrying
+  `<?xml ...><Error><Code>NoSuchKey</Code>`. A naive path therefore breaks
+  twice: on the status, then parsing XML as JSON. Treated as an *answer*
+  ("files no XBRL financials"), not an error.
+- **EDGAR spells share classes with a dash**: `BRK-B`. That is a third
+  spelling after our canonical `BRK.B` and IB's `BRK B`.
+- **Balance-sheet facts are instants, not annual durations.** Reaching for
+  total assets or share count with a duration query finds nothing — which made
+  the Piotroski score report "missing assets" for Apple. Instants need their
+  own accessor, with a ~70-day tolerance for fiscal-year drift and 52/53-week
+  calendars.
+- **Provenance must name a financial statement.** Filers tag facts in
+  prospectuses and disclosure filings too, and those are often the newest
+  thing in the document, so "most recent filed" reported `424B2` for JPM and
+  `2.01 SD` for Berkshire.
+
+Coverage is honestly uneven, and the gaps are reporting conventions rather than
+bugs: AAPL 60/60, BRK.B 48/60, JPM 50/60 (no gross profit, no classified
+balance sheet — banks do not present one), TSM 38/60 (a 20-F filer with no
+quarterlies). Each missing metric states which convention caused it.
+
+**Positioning, as built at Stage 2c. Two measured corrections.**
+
+*The settlement date is not the publication date, and the difference is
+look-ahead bias.* Measured 2026-10-06: the newest short-interest settlement
+FINRA would serve was **2026-09-15**; the 09-30 settlement was still
+unpublished six days later, because dissemination runs ~8 business days behind
+settlement. Filtering on `settlementDate <= as_of` therefore makes up to twelve
+days of future information visible — §15.1 exactly, and the kind that looks
+like a working backtest. The provider applies a conservative 14-day
+dissemination lag, and the snapshot reports `short_interest_age_days` so a
+model knows it is reading a three-week-old number.
+
+*Only Form 4 codes P and S are decisions about price.* A real Apple filing in
+the cache reports an `M` of 374,541 shares **acquired** (an option exercise)
+and an `F` of 199,038 **disposed** (shares withheld to pay the tax on it).
+Counted naively that reads as an executive buying 374k shares, which is the
+opposite of informative — nobody chose to buy anything. Over 90 days AAPL
+showed 18 `S`, 5 `F`, 5 `M` and 1 `G`: the discretionary signal is the 18, and
+the other 11 are surfaced separately so a small discretionary count is visibly
+"little was chosen" rather than "little was filed".
+
+**CBOE is retired.** §7.3 described "free daily files with an archive back to
+2006"; every documented endpoint —
+`cdn.cboe.com/api/global/us_indices/daily_statistics/*` and the CSV archive —
+now returns **403**. The third provider after Stooq and Stooq's bulk archive to
+have closed. It costs the put/call raw field but **not** the regime tag, which
+§7.2 deliberately built from VIX, the curve and SPY's 200-day only.
+
+**Foreign private issuers, found by a live Stage 4 run.** Two bugs, one
+subtle and dangerous:
+
+- **A 20-F filer uses IFRS, not US GAAP.** TSM's company facts carry 334
+  `ifrs-full` concepts and **zero** `us-gaap` ones, so a us-gaap-only lookup
+  reported "no fundamentals data" for a company that files perfectly good
+  financials. The concept-alias lists now carry both spellings and
+  `CompanyFacts.concept` searches us-gaap then ifrs-full. TSM went from 52 to
+  67 populated metrics.
+- **The same concept can be reported in two currencies.** TSM reports Revenue,
+  Assets, Equity and ProfitLoss under **both `TWD` and `USD`**. Flattening
+  every unit into one series interleaved two currencies and sorted by date, so
+  whichever happened to be last won — and `book_to_price` would divide a
+  Taiwan-dollar equity by a US-dollar market cap, producing a number roughly
+  32x wrong *that looks entirely plausible*. One unit per concept now, USD
+  preferred because the price side of every ratio is USD. Verified: TSM's
+  gross margin comes back at 56.1%, which is correct.
 
 Deliberately **not** used:
 
@@ -716,6 +934,44 @@ entire value of a bear researcher evaporates if every upstream report was primed
 with your thesis. Intent enters at the Trader node and no earlier. This deserves
 a code comment so nobody "helpfully" fixes it later.
 
+**As built at Stage 6. Four notes, two of them corrections.**
+
+*The book is a file, and `equity` is not in it.* `config/portfolio.yaml` holds
+cash and positions with a stored mark each; equity is derived as
+`cash + net_value`, the way IB reports NetLiquidation. A stored equity figure
+and a position list can disagree, and the failure is invisible — sizing against
+an equity 20% too high overstates every target weight by 20% and nothing
+raises. Marks are stored rather than fetched because `decide` builds a
+`MarketSnapshot` for *one* symbol and has no price for the other seven
+holdings. `as_of` is the date of the **oldest** mark, so re-marking against a
+stale bars cache cannot reset the staleness clock, and a book past its
+tolerance is a *blocking* violation: the drift table would say there is room
+when there is not.
+
+*The drift table must be a cap, not just a prompt.* §8 says the trader's job is
+"choosing which gap to close, not inventing allocations", and a table alone
+does not enforce that — the model is still free to ask for 100%. `sizing.py`
+therefore takes the symbol's drift target as a **fourth cap**
+(`cap_intent`) alongside §9's three. A symbol in no theme gets a zero target
+and so cannot be bought at all, which is the correct reading of a book that has
+no mandate for it.
+
+*Channel 1 must not filter a symbol the book already holds.* At
+`max_positions`, an already-held symbol still occupies a slot it already has,
+so trimming, closing or adding to it changes no slot count. Filtering it out
+made a full book untradeable rather than merely unable to open something new —
+and the first thing you want to do with a full book is rebalance it.
+
+*The fund manager was getting neither channel.* §8 says intent reaches "the
+Trader and Fund Manager system prompts **only**", and the Stage 5 fund manager
+received no intent at all — so the node deciding whether to adjust a target
+weight could not see the book that weight applies to, nor the limit it is
+measured against. It gets `render_intent` and `render_drift` now. Analysts
+still get neither, and `tests/test_intent_blindness.py` checks both halves:
+that no analyst module imports `render_drift` or anything under `intent/`, and
+that the prompts the analysts actually sent contain none of the book's real
+numbers.
+
 ---
 
 ## 9. Decision → broker
@@ -736,6 +992,19 @@ target_w        = min(conviction_w, cap_position, cap_risk)
 delta_notional  = equity * target_w/100 - pf.position_value(symbol)
 ```
 
+> **The implementation deliberately differs from the first line above, and the
+> block is kept only as the record of what was originally specified.** As built:
+>
+> ```
+> target_w = min(requested, cap_intent, cap_position, cap_risk)
+> ```
+>
+> `conviction_w` was removed because `conviction` is a *measured* quantity
+> (§11's calibration plot) and must not also be a control input; `cap_intent`
+> is the drift target, which §9's three-term `min()` leaves implicit. Both are
+> explained under "As built at Stage 6" below. Do not reimplement the line
+> above from this block.
+
 Then reject dust (`< min_trade_usd`), clamp to `max_order_shares` and 90% of
 buying power.
 
@@ -744,6 +1013,91 @@ max_sector_pct, min_cash_pct, max_gross_exposure, max_positions, universe
 membership, earnings blackout, max_decisions_per_day, ADV participation.
 **Any violation blocks the order regardless of what the fund manager decided.**
 Two-key system: LLM proposes, Python vetoes. This is where trust comes from.
+
+**As built at Stage 6. Five findings. The first changes every number at Stage 8
+and was fixed before Stage 7 rather than carried.**
+
+*`conviction_w` was removed, and this is a deliberate deviation from the
+formula above.* §9 writes the first term as
+`conviction_w = target_weight_pct * conviction`, and Stage 6 shipped it
+literally. The first live run showed what that does: the drift table offered
+TSM 5.83%, the trader proposed 5.83% at 0.75, the fund manager **adjusted down
+to 4.5%** for overbought risk at 0.65, and sizing then multiplied to 2.93% and
+ordered **three shares**. The reduction for risk was applied twice — once as a
+judgement, once by the formula — and with debater confidence typically 0.6–0.8
+the systematic effect is a book that converges to about two thirds of its stated
+theme targets and never closes a gap.
+
+**But the deciding argument is not the double-damping. It is that `conviction`
+already has a different job.** §2's prompt tells the model conviction *"is not
+enthusiasm: it is the probability you would put on being right"* and that it
+*"will be measured against realised outcomes"*; §11 makes the calibration plot —
+realized hit rate bucketed by stated confidence — *"cheap and usually the most
+damning diagnostic"*. A number under measurement must not also be a control
+input: once conviction sets position size there is pressure to inflate it, and
+the plot then measures a quantity that was gamed. Since §11's go/no-go rests on
+that plot, this is the one place the design can least afford Goodhart.
+
+So the four caps are now `min(requested, cap_intent, cap_position, cap_risk)` —
+still four, none duplicating another, with `requested` the approved
+`target_weight_pct` itself. The same TSM decision sizes to **+11 shares**.
+`conviction` now has **zero numeric consumers** anywhere, and
+`tests/intent/test_sizing.py` asserts behaviourally that varying it from 0.01 to
+1.0 does not move a share count. Two supporting reasons for preferring this over
+the alternatives: the model already expresses size through `target_weight_pct`,
+so two knobs for one quantity fight each other; and the trader prompt already
+described sizing as *"from your weight, the stop distance and the hard limits"*,
+so this makes the code match what the model was told.
+
+*The theme-level `conviction:` in §8 stays prose-only.* It was never read
+numerically despite a code comment claiming otherwise. As a size multiplier it
+would be redundant with `target_weight_pct` — if the desk wants 28% in a theme,
+the target should read 28% rather than 35% scaled by 0.8, which leaves two
+numbers that can disagree about the same intention. It reaches the trader and
+fund manager through `render_intent` as context for choosing which gap to close.
+
+*The caps must not apply to a reducing order.* Scaling a trim by conviction
+makes the trade **bigger**: a trim to 5% at conviction 0.6 becomes a trim to
+3%, selling more than the fund manager approved. A cap whose job is to limit
+risk must never be able to increase the size of a risk-reducing trade, so a
+SELL takes its requested target as given and is constrained only by zero and
+the share limits.
+
+*The earnings blackout has no data source, so it warns.* FOLLOWUPS.md predicted
+this before the stage started. With no earnings calendar, the next report date
+is projected from EDGAR 10-Q/10-K filing cadence — good to one or two weeks,
+which would veto roughly a month of every quarter on a guess and look like a
+real earnings veto in the log. A **confirmed** date blocks; an **estimated**
+one warns and surfaces in the confirmation prompt; **no usable history** (an
+ETF, or a foreign private issuer whose quarterly results arrive on 6-K) warns
+that the check could not be evaluated. It is the only non-blocking rule in the
+file, and the flip is one field.
+
+*`max_decisions_per_day` must count symbols, not runs.* The first live Stage 6
+run was vetoed with "8 actionable decisions already written" — three of which
+were re-runs of the symbol it was deciding. Counting runs makes iterating on
+one name burn the day's budget, which collides with the plan's third stopping
+rule about `decide` staying pleasant to iterate on. It counts **distinct
+symbols, excluding the symbol under decision**: a re-run supersedes its own
+earlier proposal, and what the limit protects is how many *positions* the desk
+touches.
+
+*A veto is a judgement, not a degradation.* The same run reported a correct
+block as "DEGRADED — this HOLD is a failure, not a judgement", which is exactly
+backwards. §4 puts `degraded` on `FinalDecision` so `execute` can tell a failed
+HOLD from a decided one, and the veto is the one place in this pipeline where
+the system is working as designed — "this is where trust comes from". A blocked
+order now leaves `degraded=False`, exits 0, and records every violation on the
+`OrderPlan`, in the notes and in `proposal.json`.
+
+*`max_gross_exposure_pct` is inert while the book is long-only.*
+`min_cash_pct: 10` and `max_gross_exposure_pct: 95` sum to 105, which looks
+like a contradiction and is not: in a long-only unlevered book
+`cash_pct + gross_pct == 100` identically, so the cash floor already caps gross
+at 90 and the 95 can never bind. Redundancy, not impossibility — and the 95
+starts mattering as soon as `allow_shorts` is true, since gross counts both
+legs. `RiskLimits.effective_gross_cap_pct()` resolves which limit binds so the
+violation message does not blame the wrong one.
 
 **Execution** — three rules carried from the options engine:
 
@@ -774,10 +1128,41 @@ The app container reaches host Ollama via
 `OLLAMA_BASE_URL=http://host.docker.internal:11434` plus
 `extra_hosts: ["host.docker.internal:host-gateway"]` for Linux portability.
 
-**The gotcha that costs an hour:** Ollama binds `127.0.0.1:11434` by default,
-which a container cannot reach. Set `OLLAMA_HOST=0.0.0.0:11434` on the host
-daemon. Add a check target that curls `/api/tags` **from inside the container**
-so this is diagnosed in seconds rather than via stack traces.
+**The gotcha that costs an hour -- and a correction, measured at Stage 2.**
+This section said Ollama binds `127.0.0.1:11434` by default, "which a
+container cannot reach", and that `OLLAMA_HOST=0.0.0.0:11434` is therefore
+required. That is **no longer true on macOS**: verified on Docker Desktop
+4.86, a container reaches a loopback-only Ollama through
+`host.docker.internal` with no daemon reconfiguration, because Desktop proxies
+that name to the host's loopback. `lsof` confirms the daemon is still bound to
+`127.0.0.1` alone while `desk doctor` inside the container lists all four
+models.
+
+It remains true **on Linux**, where `host-gateway` resolves to the host's
+bridge address and a loopback-only service genuinely is unreachable. So the
+setting is a Linux/CI requirement, not a macOS prerequisite.
+
+Keep the check target regardless, and keep it curling `/api/tags` **from inside
+the container**: that is the only place the answer means anything, and it is
+how this correction was found.
+
+**Everything else is containerised, and the dev shell is the default entry
+point** (`make shell`): one `bash` inside the `dev` service, with the repo
+bind-mounted so edits need no rebuild. Ollama is the single deliberate
+exception, for the Metal reason above. `decide` and `execute` stay as clean
+production images; `dev` additionally carries the test group and the
+`ib_async` extra, so one shell runs the suite, a snapshot and a bar fetch.
+That means `dev` cannot enforce the §0 split by its *contents* the way
+`decide` does -- which is acceptable because the split is enforced where it
+matters: `tests/test_layering.py` reads the import graph and asserts in a
+subprocess that `ib_async` is absent from `decide`'s dependency tree.
+
+One non-obvious requirement of that layout: **the virtualenv must live outside
+`/app`.** Bind-mounting the repo over `/app` otherwise shadows the interpreter
+and every installed package, and the container dies with `desk: not found` a
+long way from the cause. It is at `/opt/venv`, with `/etc/profile.d` putting it
+on `PATH` for login shells too -- `bash -c` inherits the image `ENV`,
+`bash -lc` does not.
 
 Still ship a containerized Ollama behind a **compose profile** so the same file
 works on a Linux/NVIDIA box and in CI. Set `OLLAMA_KEEP_ALIVE=30m` (otherwise
@@ -846,6 +1231,13 @@ curve may be fiction.
 | Containerized Ollama on macOS | 20–60+ min — not viable |
 | Hybrid (fund_manager hosted only) | ~3–8 min + **~$0.03** (~$40/yr at 5 symbols daily) |
 | All 14 calls hosted | seconds + **~$0.40** (~$500/yr daily; a 90-day × 5-symbol replay ≈ $180) |
+
+**As built at Stage 5: a full run is $0.** Every node including the fund
+manager runs on a local quantized model, so the table above describes a
+configuration that exists (`all_hosted`) but is not the default. Measured on
+an M5 Max: 12 model calls, ~83-112 s of inference in ~56-67 s of wall clock —
+the gap is the four-analyst fan-out genuinely running in parallel. Well inside
+`RunBudget(max_llm_calls=20, max_wall_s=900, max_usd=0.50)`.
 
 *Order-of-magnitude. Re-derive against current per-Mtok rates. Prompt caching on
 the repeated system prompts cuts input cost materially — wire it on day one.*

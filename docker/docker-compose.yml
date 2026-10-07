@@ -57,6 +57,65 @@ services:
     command: ["desk", "doctor"]
 
   # ---------------------------------------------------------------------------
+  # dev -- THE DEFAULT DEVELOPMENT ENTRY POINT.  `make shell`
+  #
+  # Source is bind-mounted, so edits take effect with no rebuild. That is the
+  # whole point: the first time this was tried against a COPY-only image, the
+  # container ran a version of the code from before the script under test
+  # existed, and the error ("can't open file") said nothing about staleness.
+  #
+  # It carries dev dependencies AND the ib_async extra, so one shell runs the
+  # test suite, `desk snapshot` and `make bars`. That does mean this image
+  # cannot enforce the §0 split by its contents the way `decide` does -- which
+  # is fine, because the split is enforced where it actually matters:
+  # tests/test_layering.py reads the import graph, and asserts in a subprocess
+  # that ib_async is absent from decide's dependency tree.
+  #
+  # NOT a production artefact. `decide` and `execute` are.
+  # ---------------------------------------------------------------------------
+  dev:
+    <<: *common
+    container_name: desk-dev
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        EXTRAS: "execute"
+        DEV_GROUP: ""        # install the dev group: pytest et al
+    stdin_open: true
+    tty: true
+    environment:
+      # Ollama runs NATIVELY on the host for Metal (§10: containerised on
+      # macOS is 5-15x slower, CPU-only inside a VM with no Metal passthrough).
+      #
+      # MEASURED, and it corrects §10: on current Docker Desktop for Mac this
+      # works with Ollama bound to 127.0.0.1 -- host.docker.internal is
+      # proxied to the host loopback, so the daemon needs NO reconfiguration.
+      # §10 says a container cannot reach a 127.0.0.1 bind; that was true of
+      # older Docker Desktop and is not true here.
+      #
+      # It IS still true on Linux, where host-gateway resolves to the host's
+      # bridge address and a loopback-only service is unreachable. There:
+      #
+      #     OLLAMA_HOST=0.0.0.0:11434   # on the host daemon
+      #
+      # `make check-ollama` answers this from inside the container, which is
+      # the only place the answer means anything.
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL_CONTAINER:-http://host.docker.internal:11434}
+      # Service name, not localhost: langfuse-web is a sibling container.
+      LANGFUSE_HOST: ${LANGFUSE_HOST_CONTAINER:-http://langfuse-web:3000}
+      IB_HOST: ${IB_HOST:-desk-ib-gateway}
+      IB_PORT: ${IB_PORT:-4004}
+      IB_CLIENT_ID: ${IB_CLIENT_ID:-12}
+      TZ: ${TZ:-America/New_York}
+    volumes:
+      # The repo over /app. Safe because the venv lives in /opt/venv -- see the
+      # Dockerfile comment.
+      - ../:/app
+    networks: [default, trading-llm-network]
+    command: ["bash"]
+
+  # ---------------------------------------------------------------------------
   # execute -- human gate and ib_async. No LLM, no network beyond IB.
   # ---------------------------------------------------------------------------
   execute:
@@ -162,7 +221,11 @@ services:
     #   your Mac          -> 127.0.0.1:4012
     # -------------------------------------------------------------------------
     ports:
-      - "127.0.0.1:4012:4004"   # paper API  (host 4012 -> socat paper)
+      # The host port comes from .env so there is ONE source of truth: the same
+      # IB_HOST_PORT drives this publish and config.resolve_ib_endpoint(). It
+      # used to be hardcoded here and set again in .env, which is two places to
+      # change and one to forget.
+      - "127.0.0.1:${IB_HOST_PORT:-4012}:4004"   # paper API -> socat paper
       # Live (host 4011 -> socat live). Left commented deliberately: with
       # TRADING_MODE=paper nothing is behind it, but it becomes a LIVE API
       # endpoint the moment TRADING_MODE flips.

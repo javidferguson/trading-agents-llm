@@ -25,12 +25,12 @@ Two processes that communicate through a file, never a shared event loop:
 | Stage | Deliverable | State |
 |---|---|---|
 | **0** | Skeleton, pinned deps, compose, Langfuse, toy graph | **done** |
-| 1 | LLM router + structured output | not started |
-| 2 | Providers, cache, metrics | not started |
-| 3 | Vertical slice → `proposal.json` | not started |
-| 4 | Analysts + research debate | not started |
-| 5 | Risk debate + fund manager | not started |
-| 6 | Intent, sizing, compliance | not started |
+| **1** | LLM router + structured output | **done** |
+| 2 | Providers, cache, metrics | **2a-2c done** (76 metrics); Finnhub + FRED need keys |
+| **3** | Vertical slice → `proposal.json` | **done** |
+| **4** | Analysts + research debate | **done** |
+| **5** | Risk debate + fund manager | **done** (local judge; hosted deferred) |
+| **6** | Intent, sizing, compliance | **done** (earnings blackout warns on an estimate — see gaps) |
 | 7 | Execution + confirmation gate | not started |
 | 8 | Evaluation, B0–B4, the go/no-go | not started |
 | 9 | Memory + reflection | not started |
@@ -39,7 +39,39 @@ Two processes that communicate through a file, never a shared event loop:
 
 ```bash
 make setup
+make up          # Langfuse; Ollama stays native, see below
+make shell       # a bash shell inside the desk container -- start here
 ```
+
+**Containers are the default.** `make shell` drops you into the `dev` service
+with this repo bind-mounted at `/app`, so edits take effect with no rebuild.
+Inside, `desk`, `pytest` and the scripts are all on `PATH`:
+
+```
+desk doctor
+desk snapshot --symbol AAPL
+pytest -q
+```
+
+Every `make` target runs in that container too. Append `HOST=1` to run on the
+host instead, which is useful when Docker itself is what's broken:
+
+```bash
+make test            # in the container
+make test HOST=1     # on the host, via uv
+```
+
+The two contexts reach some services at different addresses — Ollama,
+Langfuse, the IB Gateway — and the compose file plus
+`config.resolve_ib_endpoint()` handle that, so the commands are identical
+either way. `make verify` prints which context it ran in.
+
+**Ollama is the one deliberate exception and stays native.** Architecture §10:
+containerised on macOS there is no Metal passthrough, so it is CPU-only in a VM
+— measured 5–15× slower, which turns a 4-minute pipeline into 40+. Containers
+reach the host daemon via `host.docker.internal`, and on current Docker Desktop
+that works even with Ollama bound to `127.0.0.1` (a correction to §10 — see
+there). On Linux you do need `OLLAMA_HOST=0.0.0.0:11434`.
 
 Then, after any pull, the one command that checks everything:
 
@@ -47,8 +79,11 @@ Then, after any pull, the one command that checks everything:
 make verify
 ```
 
-It runs the Stage 0 gate in order — config, tests, environment, toy graph — and
-stops at the first real failure. `make doctor` alone gives just the environment
+It runs every exit gate in order — config, tests, environment, toy graph,
+Stage 1, Stage 2, Stage 6, Stage 3 — and stops at the first real failure.
+Stage 6 runs *before* Stage 3 deliberately: it needs no model and no network, so
+it takes a second and tells you the book is stale before you spend three minutes
+of inference sizing against it. `make doctor` alone gives just the environment
 report.
 
 `make help` lists everything. The three checks worth knowing:
@@ -62,6 +97,46 @@ report.
   letting Stage 1 die on a 404 that looks like a router bug.
 - `make toy-graph` — the Stage 0 exit gate: a two-node LangGraph run whose nodes
   both appear as spans in Langfuse.
+- `make bars` — fetch daily bars from IB into the cache (needs the Gateway).
+  `make data` shows what is cached, from which source, and how stale.
+- `make snapshot` — the Stage 2 exit gate: all 76 metrics for a symbol, each
+  either populated or explicitly unavailable *with a reason*. No LLM.
+  Needs `SEC_EDGAR_USER_AGENT` set, or EDGAR 403s without saying why.
+- `make gdelt` — collect news tone. **Its window closes**: GDELT serves a
+  rolling ~3 months, so uncollected days are unrecoverable. Run
+  `--days 90` once to backfill.
+- `make decide` — the Stage 3 exit gate: a real decision end to end,
+  written to `data/proposals/`. `SYMBOL=NVDA make decide` for another name.
+  Since Stage 6 the output also carries the `OrderPlan` — the share count, the
+  four caps and which one bound, and any compliance violation.
+- `make portfolio` — the Stage 6 exit gate: the book and the drift table, with
+  **no model and no broker**. Exits non-zero if the marks are stale, because
+  sizing against last week's weights is how a position gets doubled.
+- `make candidates` — channel 1 of §8: universe minus exclusions minus earnings
+  blackout minus at-max-positions, computed before any model runs. `--earnings`
+  also prints every symbol's next-report estimate.
+- `make portfolio-seed` / `make portfolio-refresh` — the only two things that
+  write `config/portfolio.yaml`. Both read the bars cache and **cannot fetch**,
+  so they run with the Gateway down. Do not hand-edit the file.
+- `make test-stage6` — the other half of the Stage 6 gate: an `OrderPlan`
+  produced with zero IB contact (asserted by making every socket connection
+  fail), and a deliberately non-compliant decision blocked regardless of what
+  the fund manager decided.
+- `make smoke` — the Stage 1 exit gate: a real `AnalystReport` out of a local 8B
+  model, showing attempts, latency, tokens and the model digest.
+
+The live model tests are deselected from `make test` (they add ~30s and need
+Ollama up); `make test-smoke` runs them explicitly, and `make verify` includes
+them.
+
+`make test-smoke` sets `REQUIRE_SMOKE=1`, which turns "Ollama unavailable" from
+a skip into a failure. Without it the gate exited 0 on four skips — green
+without having loaded any weights. That is also how a container-only bug stayed
+hidden: the test resolved Ollama with the bare `Settings()` default of
+`127.0.0.1`, which is correct on the host and points at the container itself
+inside `dev`. Tests that reach a real service use `load_settings()`; the
+offline ones keep `Settings()` deliberately, so a local `.env` cannot change a
+result.
 
 ## Never run both IB Gateways at once
 
@@ -85,6 +160,31 @@ Host ports are deliberately different so a connection is never ambiguous:
 |---|---|---|
 | ORB+GEX `ajj-ib-gateway` | 4002 | 5900 |
 | Research desk `desk-ib-gateway` | **4012** | **5912** |
+
+**The exclusivity guard is the one thing here that always runs on the host, and
+it is the exception to "containers are the default."** Both of its checks read
+host state: `docker ps` needs the Docker CLI and a mounted socket, which the
+`dev` service deliberately does not have, and `127.0.0.1:4002` inside a
+container is the *container's* loopback rather than the host's. The Makefile
+uses `$(HOST_RUN)` for it, and `tests/test_gateway_exclusive.py` fails the build
+if that ever reverts to `$(RUN)`.
+
+It was routed through the container once, which broke `make gateway-start` with
+a compose error and a message that said only "could not ask Docker". The subtler
+half is why the redundancy did not save it: the container check *abstained*, but
+the port check *answered* — about the wrong loopback. Two checks are only
+independent if both can see the thing they are checking.
+
+`desk doctor` runs in the container by default, so it cannot evaluate this guard
+either. It now says so explicitly instead of reporting the Gateway as merely
+unreachable, which had made a missing safety check look like an absent one.
+
+## Known gaps
+
+[`FOLLOWUPS.md`](FOLLOWUPS.md) lists what is deliberately missing and what
+unblocks it — chiefly two free API keys (Finnhub, FRED), the regime tag that
+depends on FRED, and the GDELT collection, which is the one gap whose cost
+is irreversible.
 
 ## Corrections to the design docs, found while building Stage 0
 
@@ -137,11 +237,36 @@ that directory.
 ## Rules that the tests enforce
 
 These are not style preferences; each protects a decision that is otherwise easy
-to erode one commit at a time. `tests/test_layering.py` fails the build on all
-four.
+to erode one commit at a time.
+
+`tests/test_layering.py` fails the build on the first four:
 
 1. `graph/build.py` is the **only** module that imports `langgraph`.
 2. `execution/` is the **only** package that imports `ib_async`.
 3. Nothing outside `providers/` imports a provider module directly — everything
    goes through `providers/registry.py`.
 4. No `langchain_core` chat models, no `ToolNode`, no `interrupt()`.
+
+`tests/test_intent_blindness.py` fails it on the fifth, which is §8's and the
+one a well-meaning refactor is most likely to "fix":
+
+5. **Analysts are intent-blind.** No analyst sees the themes, the constraints,
+   the risk limits or the drift table. Intent enters at the trader and no
+   earlier, because the entire value of a bear researcher evaporates if every
+   upstream report was primed with your thesis.
+
+   Stage 6 made this load-bearing rather than theoretical: `prefetch` now puts
+   the book and the drift table into `DecisionState`, so the data an analyst
+   must not see sits in the object it reads. The guard checks both halves — no
+   analyst module may *import* `render_drift` or anything from `intent/`, and
+   the prompts each analyst actually sent are searched for the book's real
+   numbers. It also checks the positive control, that the trader and fund
+   manager *do* receive it, because a blindness test that passed by deleting
+   the feature would be worthless.
+
+`tests/intent/test_stage6_gate.py` fails it on the sixth:
+
+6. **Sizing and compliance reach no broker and no network.** Asserted by
+   replacing `socket.socket.connect` with a raising stub for the duration of
+   the path, which is stronger than looking for `ib_async`: it proves the layer
+   is not quietly reading a quote from anywhere.
