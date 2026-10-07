@@ -934,6 +934,44 @@ entire value of a bear researcher evaporates if every upstream report was primed
 with your thesis. Intent enters at the Trader node and no earlier. This deserves
 a code comment so nobody "helpfully" fixes it later.
 
+**As built at Stage 6. Four notes, two of them corrections.**
+
+*The book is a file, and `equity` is not in it.* `config/portfolio.yaml` holds
+cash and positions with a stored mark each; equity is derived as
+`cash + net_value`, the way IB reports NetLiquidation. A stored equity figure
+and a position list can disagree, and the failure is invisible — sizing against
+an equity 20% too high overstates every target weight by 20% and nothing
+raises. Marks are stored rather than fetched because `decide` builds a
+`MarketSnapshot` for *one* symbol and has no price for the other seven
+holdings. `as_of` is the date of the **oldest** mark, so re-marking against a
+stale bars cache cannot reset the staleness clock, and a book past its
+tolerance is a *blocking* violation: the drift table would say there is room
+when there is not.
+
+*The drift table must be a cap, not just a prompt.* §8 says the trader's job is
+"choosing which gap to close, not inventing allocations", and a table alone
+does not enforce that — the model is still free to ask for 100%. `sizing.py`
+therefore takes the symbol's drift target as a **fourth cap**
+(`cap_intent`) alongside §9's three. A symbol in no theme gets a zero target
+and so cannot be bought at all, which is the correct reading of a book that has
+no mandate for it.
+
+*Channel 1 must not filter a symbol the book already holds.* At
+`max_positions`, an already-held symbol still occupies a slot it already has,
+so trimming, closing or adding to it changes no slot count. Filtering it out
+made a full book untradeable rather than merely unable to open something new —
+and the first thing you want to do with a full book is rebalance it.
+
+*The fund manager was getting neither channel.* §8 says intent reaches "the
+Trader and Fund Manager system prompts **only**", and the Stage 5 fund manager
+received no intent at all — so the node deciding whether to adjust a target
+weight could not see the book that weight applies to, nor the limit it is
+measured against. It gets `render_intent` and `render_drift` now. Analysts
+still get neither, and `tests/test_intent_blindness.py` checks both halves:
+that no analyst module imports `render_drift` or anything under `intent/`, and
+that the prompts the analysts actually sent contain none of the book's real
+numbers.
+
 ---
 
 ## 9. Decision → broker
@@ -954,6 +992,19 @@ target_w        = min(conviction_w, cap_position, cap_risk)
 delta_notional  = equity * target_w/100 - pf.position_value(symbol)
 ```
 
+> **The implementation deliberately differs from the first line above, and the
+> block is kept only as the record of what was originally specified.** As built:
+>
+> ```
+> target_w = min(requested, cap_intent, cap_position, cap_risk)
+> ```
+>
+> `conviction_w` was removed because `conviction` is a *measured* quantity
+> (§11's calibration plot) and must not also be a control input; `cap_intent`
+> is the drift target, which §9's three-term `min()` leaves implicit. Both are
+> explained under "As built at Stage 6" below. Do not reimplement the line
+> above from this block.
+
 Then reject dust (`< min_trade_usd`), clamp to `max_order_shares` and 90% of
 buying power.
 
@@ -962,6 +1013,91 @@ max_sector_pct, min_cash_pct, max_gross_exposure, max_positions, universe
 membership, earnings blackout, max_decisions_per_day, ADV participation.
 **Any violation blocks the order regardless of what the fund manager decided.**
 Two-key system: LLM proposes, Python vetoes. This is where trust comes from.
+
+**As built at Stage 6. Five findings. The first changes every number at Stage 8
+and was fixed before Stage 7 rather than carried.**
+
+*`conviction_w` was removed, and this is a deliberate deviation from the
+formula above.* §9 writes the first term as
+`conviction_w = target_weight_pct * conviction`, and Stage 6 shipped it
+literally. The first live run showed what that does: the drift table offered
+TSM 5.83%, the trader proposed 5.83% at 0.75, the fund manager **adjusted down
+to 4.5%** for overbought risk at 0.65, and sizing then multiplied to 2.93% and
+ordered **three shares**. The reduction for risk was applied twice — once as a
+judgement, once by the formula — and with debater confidence typically 0.6–0.8
+the systematic effect is a book that converges to about two thirds of its stated
+theme targets and never closes a gap.
+
+**But the deciding argument is not the double-damping. It is that `conviction`
+already has a different job.** §2's prompt tells the model conviction *"is not
+enthusiasm: it is the probability you would put on being right"* and that it
+*"will be measured against realised outcomes"*; §11 makes the calibration plot —
+realized hit rate bucketed by stated confidence — *"cheap and usually the most
+damning diagnostic"*. A number under measurement must not also be a control
+input: once conviction sets position size there is pressure to inflate it, and
+the plot then measures a quantity that was gamed. Since §11's go/no-go rests on
+that plot, this is the one place the design can least afford Goodhart.
+
+So the four caps are now `min(requested, cap_intent, cap_position, cap_risk)` —
+still four, none duplicating another, with `requested` the approved
+`target_weight_pct` itself. The same TSM decision sizes to **+11 shares**.
+`conviction` now has **zero numeric consumers** anywhere, and
+`tests/intent/test_sizing.py` asserts behaviourally that varying it from 0.01 to
+1.0 does not move a share count. Two supporting reasons for preferring this over
+the alternatives: the model already expresses size through `target_weight_pct`,
+so two knobs for one quantity fight each other; and the trader prompt already
+described sizing as *"from your weight, the stop distance and the hard limits"*,
+so this makes the code match what the model was told.
+
+*The theme-level `conviction:` in §8 stays prose-only.* It was never read
+numerically despite a code comment claiming otherwise. As a size multiplier it
+would be redundant with `target_weight_pct` — if the desk wants 28% in a theme,
+the target should read 28% rather than 35% scaled by 0.8, which leaves two
+numbers that can disagree about the same intention. It reaches the trader and
+fund manager through `render_intent` as context for choosing which gap to close.
+
+*The caps must not apply to a reducing order.* Scaling a trim by conviction
+makes the trade **bigger**: a trim to 5% at conviction 0.6 becomes a trim to
+3%, selling more than the fund manager approved. A cap whose job is to limit
+risk must never be able to increase the size of a risk-reducing trade, so a
+SELL takes its requested target as given and is constrained only by zero and
+the share limits.
+
+*The earnings blackout has no data source, so it warns.* FOLLOWUPS.md predicted
+this before the stage started. With no earnings calendar, the next report date
+is projected from EDGAR 10-Q/10-K filing cadence — good to one or two weeks,
+which would veto roughly a month of every quarter on a guess and look like a
+real earnings veto in the log. A **confirmed** date blocks; an **estimated**
+one warns and surfaces in the confirmation prompt; **no usable history** (an
+ETF, or a foreign private issuer whose quarterly results arrive on 6-K) warns
+that the check could not be evaluated. It is the only non-blocking rule in the
+file, and the flip is one field.
+
+*`max_decisions_per_day` must count symbols, not runs.* The first live Stage 6
+run was vetoed with "8 actionable decisions already written" — three of which
+were re-runs of the symbol it was deciding. Counting runs makes iterating on
+one name burn the day's budget, which collides with the plan's third stopping
+rule about `decide` staying pleasant to iterate on. It counts **distinct
+symbols, excluding the symbol under decision**: a re-run supersedes its own
+earlier proposal, and what the limit protects is how many *positions* the desk
+touches.
+
+*A veto is a judgement, not a degradation.* The same run reported a correct
+block as "DEGRADED — this HOLD is a failure, not a judgement", which is exactly
+backwards. §4 puts `degraded` on `FinalDecision` so `execute` can tell a failed
+HOLD from a decided one, and the veto is the one place in this pipeline where
+the system is working as designed — "this is where trust comes from". A blocked
+order now leaves `degraded=False`, exits 0, and records every violation on the
+`OrderPlan`, in the notes and in `proposal.json`.
+
+*`max_gross_exposure_pct` is inert while the book is long-only.*
+`min_cash_pct: 10` and `max_gross_exposure_pct: 95` sum to 105, which looks
+like a contradiction and is not: in a long-only unlevered book
+`cash_pct + gross_pct == 100` identically, so the cash floor already caps gross
+at 90 and the 95 can never bind. Redundancy, not impossibility — and the 95
+starts mattering as soon as `allow_shorts` is true, since gross counts both
+legs. `RiskLimits.effective_gross_cap_pct()` resolves which limit binds so the
+violation message does not blame the wrong one.
 
 **Execution** — three rules carried from the options engine:
 

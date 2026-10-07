@@ -40,6 +40,12 @@ HOW TO WEIGH WHAT YOU WERE GIVEN
 - You may lower conviction and target weight freely. You may not raise the
   weight above the per-symbol ceiling in the intent — Python enforces it after
   you and a breach simply blocks the order.
+- **Those are two separate decisions, not one.** `conviction` does not affect
+  position size: sizing reads `target_weight_pct` alone. So lowering conviction
+  records that you are less sure and changes nothing about the order. If the
+  risk committee convinced you the position should be SMALLER, you must lower
+  `target_weight_pct` and say so in `adjustment`. Lowering only conviction
+  approves the original size with a caveat attached.
 
 Being unwilling to veto makes the whole committee decorative. Being unwilling
 to approve makes the desk useless. Decide.

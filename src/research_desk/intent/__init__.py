@@ -24,4 +24,18 @@ not one** (architecture §8):
 > test asserting intent text is absent from analyst prompts.
 
 Two-key system: the LLM proposes, Python vetoes. That is where trust comes from.
+
+The package, as built:
+
+* ``engine.py``   -- ``compute_gaps()`` (channel 2) and ``candidates()``
+                     (channel 1), plus ``load_intent`` / ``load_portfolio``.
+* ``sizing.py``   -- weight to shares, the minimum of four caps (§9).
+* ``compliance.py`` -- the post-trade veto battery (channel 4).
+* ``earnings.py`` -- the blackout's one estimated input, and the reason it is
+                     the only rule that warns rather than blocks.
+
+Nothing here reaches a model, a broker or (apart from the cached EDGAR filing
+history behind the earnings estimate) a network.
+``tests/intent/test_stage6_gate.py`` asserts that by replacing
+``socket.socket.connect`` with a raising stub for the duration of the path.
 """

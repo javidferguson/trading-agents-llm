@@ -196,6 +196,31 @@ snapshot:  ## THE STAGE 2 GATE: every §7.1 metric for a symbol, no LLM
 decide:  ## THE STAGE 3 GATE: a real decision end to end -> proposal.json
 	$(RUN) desk decide --symbol $${SYMBOL:-MSFT}
 
+# --------------------------------------------------------------------------- #
+# Stage 6 -- intent, sizing, compliance. None of these touches IB or a model.
+# --------------------------------------------------------------------------- #
+
+.PHONY: portfolio
+portfolio:  ## THE STAGE 6 GATE (part 1): the book and the drift table, no LLM, no broker
+	$(RUN) desk portfolio
+
+.PHONY: candidates
+candidates:  ## Channel 1: today's tradeable set, computed before any model runs
+	$(RUN) desk candidates --earnings
+
+.PHONY: portfolio-seed
+portfolio-seed:  ## Rebuild config/portfolio.yaml from the bars cache. Reads the cache; never fetches.
+	$(RUN) python scripts/seed_portfolio.py --seed
+
+.PHONY: portfolio-refresh
+portfolio-refresh:  ## Re-mark the book against the newest cached bars (as_of tracks the OLDEST mark)
+	$(RUN) python scripts/seed_portfolio.py --refresh
+
+.PHONY: test-stage6
+test-stage6:  ## THE STAGE 6 GATE (part 2): an OrderPlan with zero IB contact, and the veto
+	$(RUN) pytest -q tests/intent tests/graph/test_compliance_node.py \
+	    tests/test_intent_blindness.py
+
 .PHONY: smoke
 smoke:  ## THE STAGE 1 GATE: a real AnalystReport from a local 8B model
 	$(RUN) desk smoke
@@ -270,30 +295,37 @@ test-layering:  ## Just the architectural boundary tests -- fast, and the ones t
 # --------------------------------------------------------------------------- #
 
 .PHONY: verify
-verify:  ## Run the whole Stage 0 gate in order, stopping at the first failure
+verify:  ## Run every exit gate in order, stopping at the first failure
 	@echo "running in: $(IN)"
 	@echo
-	@echo "=== 1/7  config ============================================"
+	@echo "=== 1/8  config ============================================"
 	@$(MAKE) --no-print-directory config-check
 	@echo
-	@echo "=== 2/7  tests ============================================="
+	@echo "=== 2/8  tests ============================================="
 	@# Via the target, not $(UV) directly: this step used to run on the host
 	@# even in container mode, one line after announcing "running in:
 	@# container". A gate that reports a context it did not use is the same
 	@# defect as one that passes without running.
 	@$(MAKE) --no-print-directory test
 	@echo
-	@echo "=== 3/7  environment ======================================="
+	@echo "=== 3/8  environment ======================================="
 	@$(MAKE) --no-print-directory doctor
 	@echo
-	@echo "=== 4/7  Stage 0 exit gate ================================="
+	@echo "=== 4/8  Stage 0 exit gate ================================="
 	@$(MAKE) --no-print-directory toy-graph
 	@echo
-	@echo "=== 5/7  Stage 1 exit gate ================================="
+	@echo "=== 5/8  Stage 1 exit gate ================================="
 	@$(MAKE) --no-print-directory smoke
 	@echo
-	@echo "=== 6/7  Stage 2 exit gate ================================="
+	@echo "=== 6/8  Stage 2 exit gate ================================="
 	@$(MAKE) --no-print-directory snapshot
 	@echo
-	@echo "=== 7/7  Stage 3 exit gate ================================="
+	@echo "=== 7/8  Stage 6 exit gate ================================="
+	@# Before the Stage 3 gate, not after: this one needs no model and no
+	@# network, so it takes a second and tells you whether the book is stale
+	@# BEFORE you spend three minutes of inference sizing against it.
+	@$(MAKE) --no-print-directory portfolio
+	@$(MAKE) --no-print-directory test-stage6
+	@echo
+	@echo "=== 8/8  Stage 3 exit gate ================================="
 	@$(MAKE) --no-print-directory decide

@@ -110,6 +110,14 @@ def _visible(facts: dict[str, Any], as_of: date) -> dict[str, Any]:
     return out
 
 
+#: Forms that carry a periodic financial report, and nothing else.
+#:
+#: 10-Q and 10-K are the domestic quarterly and annual. 20-F and 40-F are the
+#: annual reports of a foreign private issuer and a Canadian MJDS filer. **6-K
+#: is deliberately absent** -- see ``periodic_filings``.
+PERIODIC_FORMS: tuple[str, ...] = ("10-Q", "10-K", "20-F", "40-F")
+
+
 class EdgarProvider:
     """Company facts, cached whole and sliced by filing date at read time."""
 
@@ -270,6 +278,60 @@ class EdgarProvider:
             for tx in _parse_form4(document):
                 transactions.append({**tx, "filed": filed_on, "accession": accession})
         return transactions
+
+    async def periodic_filings(
+        self, symbol: str, as_of: date, forms: tuple[str, ...] = PERIODIC_FORMS
+    ) -> list[dict[str, Any]]:
+        """Periodic report filings visible on ``as_of``, newest first.
+
+        The input to the earnings-blackout estimate. EDGAR has no forward
+        calendar -- it records what has been filed, not what is coming -- so
+        the cadence of past 10-Qs is the only free signal for when the next
+        report lands. ``intent/earnings.py`` turns these dates into an
+        estimate and is explicit that it is one.
+
+        Point-in-time by ``filingDate``, like every other method here: a
+        filing that was not public on ``as_of`` cannot inform a decision made
+        on ``as_of`` (§7.4).
+
+        **Foreign private issuers return almost nothing useful, by design.**
+        TSM files a 20-F once a year and reports quarterly results on 6-K,
+        which it also uses for press releases, dividend notices and board
+        changes -- 664 of them in this cache against 13 20-Fs. Including 6-K
+        would put the median interval at a few days and produce a confident
+        estimate that is nonsense, so it is excluded and the caller is left
+        with an annual cadence it can correctly refuse to trust.
+        """
+        cik = await self.cik_for(symbol)
+        if cik is None:
+            return []
+
+        recent = await self._submissions(cik)
+        wanted = set(forms)
+        out: list[dict[str, Any]] = []
+        for form, filed, reported, accession in zip(
+            recent.get("form") or [],
+            recent.get("filingDate") or [],
+            recent.get("reportDate") or [],
+            recent.get("accessionNumber") or [],
+        ):
+            if form not in wanted or not filed:
+                continue
+            filed_on = date.fromisoformat(filed)
+            if filed_on > as_of:
+                continue
+            out.append({
+                "form": form,
+                "filed": filed_on,
+                # The period the report covers, which is 4-6 weeks before it is
+                # filed. Carried because it distinguishes a late filing from a
+                # shifted fiscal calendar.
+                "period_end": date.fromisoformat(reported) if reported else None,
+                "accession": accession,
+            })
+
+        out.sort(key=lambda row: row["filed"], reverse=True)
+        return out
 
     async def _submissions(self, cik: str) -> dict[str, Any]:
         """The filing index. Cached whole; filtered by date at read time."""

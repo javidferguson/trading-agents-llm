@@ -31,6 +31,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .modes import RunMode
+from .orders import OrderPlan, Violation
 
 
 class Degradable(BaseModel):
@@ -593,8 +594,29 @@ class DecisionState(BaseModel):
 
     final_decision: FinalDecision | None = None
 
+    # --- Stage 6: intent, portfolio, sizing, the veto ------------------------
+
+    #: The book sizing ran against (``models.portfolio.PortfolioSnapshot``).
+    #: Typed ``Any`` for the same reason ``snapshot`` is -- it keeps
+    #: ``models/state.py`` free of an import cycle.
+    #:
+    #: Recorded in full rather than as a reference to ``config/portfolio.yaml``,
+    #: because that file is overwritten every time the book is re-marked and a
+    #: replay must see the weights the decision was actually made against.
+    portfolio: Any | None = None
+
+    #: The drift table the trader was given (``intent.engine.DriftTable``).
+    #: Channel 2's output, kept so that at Stage 8 a decision can be read
+    #: against the gaps that were open when it was made -- "did it close the
+    #: gap it said it was closing" is not answerable without it.
+    drift: Any | None = None
+
+    #: Channel 4's output: the sized, checked order. Present for every run,
+    #: including HOLDs and blocked orders -- the reason no order was placed is
+    #: the most useful field in the file.
+    order_plan: OrderPlan | None = None
+
     # --- arriving in later stages --------------------------------------------
-    # Stage 6: intent, portfolio, violations
     # Stage 9: memory_hits, regime
 
     def degraded_reason(self) -> str | None:
@@ -623,5 +645,7 @@ __all__ = [
     "LLMCallRecord",
     "NodeError",
     "NodePatch",
+    "OrderPlan",
     "RunMode",
+    "Violation",
 ]

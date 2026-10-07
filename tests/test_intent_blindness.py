@@ -34,6 +34,13 @@ SRC = Path(__file__).resolve().parents[1] / "src" / "research_desk"
 #: this guard covers the whole family by covering one file.
 ANALYST_MODULES = ("market_analyst", "analysts")
 
+#: Nodes that ARE allowed to see intent, per §8: *"Objective description,
+#: theme theses and free-text constraints go into the Trader and Fund
+#: Manager system prompts only."* Listed so the positive control below can
+#: assert the channel actually works -- a blindness test that passes
+#: because nothing anywhere receives intent would be worthless.
+INTENT_SIGHTED_NODES = ("trader", "risk")
+
 #: Every analyst kind, checked live against what it actually sent.
 ANALYST_KINDS = ("market", "news", "positioning", "fundamentals")
 
@@ -282,3 +289,217 @@ def test_no_analyst_node_imports_render_intent(node: str) -> None:
 def test_no_analyst_node_mentions_portfolio_intent_at_all(node: str) -> None:
     source = (SRC / "graph" / "nodes" / f"{node}.py").read_text()
     assert "portfolio-intent.yaml" not in source
+
+
+# --------------------------------------------------------------------------- #
+# Stage 6: the drift table is intent too, and analysts must not see it either
+# --------------------------------------------------------------------------- #
+
+
+def drift_table():
+    """The real drift table, from the real intent and the real seeded book."""
+    from research_desk.intent.engine import compute_gaps, load_intent, load_portfolio
+
+    return compute_gaps(load_intent(), load_portfolio(), as_of=date(2026, 10, 6))
+
+
+@pytest.mark.parametrize("kind", ANALYST_KINDS)
+async def test_no_analyst_sees_the_drift_table(kind: str) -> None:
+    """**The Stage 6 regression this file exists for.**
+
+    ``prefetch`` now puts the book and the drift table into ``DecisionState``,
+    which is exactly the shape of accident §8 warns about: the data an analyst
+    must not see is now sitting in the state object it reads. The analyst's path
+    to facts is ``render_for_analyst``, which cannot reach it -- and this test
+    is what would notice if that ever changed.
+
+    An analyst that knows the book is overweight XOM is no longer reading XOM's
+    fundamentals on their merits, and the bear researcher downstream is arguing
+    against a report that was already primed.
+    """
+    from research_desk.graph.nodes.analysts import make_analyst
+    from research_desk.metrics.render import ANALYST_BLOCKS
+
+    recorder = Recorder()
+    node_name = {"market": "market_analyst", "news": "news_analyst",
+                 "positioning": "positioning_analyst",
+                 "fundamentals": "fundamentals_analyst"}[kind]
+    router = LLMRouter(
+        profiles={"quick": ModelProfile(name="quick", provider="fake", model="m")},
+        node_routes={node_name: "quick"},
+        clients={"fake": recorder},
+    )
+    ctx = NodeContext(settings=Settings(), as_of=date(2026, 10, 6),
+                      extras={"router": router})
+
+    snap = MarketSnapshot(symbol="MSFT", as_of=date(2026, 10, 6))
+    block_name = ANALYST_BLOCKS[kind][0]
+    block_cls = type(getattr(snap, block_name))
+    field = next(f for f in block_cls.model_fields if f != "gaps")
+    populated = block_cls(**{field: 1.0}, gaps={
+        f: "test" for f in block_cls.model_fields if f not in ("gaps", field)
+    })
+    snap = snap.model_copy(update={block_name: populated})
+
+    from research_desk.intent.engine import load_portfolio
+
+    drift = drift_table()
+    state = DecisionState(
+        run_id="t", symbol="MSFT", as_of=date(2026, 10, 6), snapshot=snap,
+        # Both present in state, exactly as prefetch leaves them.
+        drift=drift, portfolio=load_portfolio(),
+    )
+
+    await make_analyst(kind)(state, ctx)
+    assert recorder.messages, f"{kind} analyst made no call; the test proved nothing"
+    sent = "\n".join(m["content"] for m in recorder.messages).lower()
+
+    for banned in ("portfolio drift", "gap usd", "free slot", "max_positions",
+                   "gross exposure", "underweight", "overweight", "in band",
+                   "equity"):
+        assert banned not in sent, (
+            f"{banned!r} reached the {kind} analyst -- the drift table has "
+            "leaked into an intent-blind node (§8)"
+        )
+
+    # And no holding's actual weight, which is the specific number that would
+    # let an analyst reason about the book rather than the symbol.
+    book = load_portfolio()
+    for held in book.positions:
+        weight = f"{book.weight_pct(held.symbol):.2f}%"
+        assert weight not in sent, (
+            f"the book's {held.symbol} weight {weight} reached the {kind} analyst"
+        )
+
+
+@pytest.mark.parametrize("node", ANALYST_MODULES)
+def test_no_analyst_node_imports_render_drift(node: str) -> None:
+    """Catches the refactor before it runs, as with ``render_intent``."""
+    path = SRC / "graph" / "nodes" / f"{node}.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    for imported in ast.walk(tree):
+        if isinstance(imported, ast.ImportFrom):
+            names = {alias.name for alias in imported.names}
+            assert "render_drift" not in names, (
+                f"{node} imports render_drift. The drift table is channel 2 of "
+                "portfolio intent (§8) and reaches the trader and fund manager "
+                "only."
+            )
+
+
+@pytest.mark.parametrize("node", ANALYST_MODULES)
+def test_no_analyst_node_reaches_the_intent_package(node: str) -> None:
+    """``intent/`` is channels 1, 2 and 4. None of them is an analyst's business."""
+    path = SRC / "graph" / "nodes" / f"{node}.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    for imported in ast.walk(tree):
+        if isinstance(imported, ast.ImportFrom) and imported.module:
+            assert "intent" not in imported.module.split("."), (
+                f"{node} imports from {imported.module}. Intent enters at the "
+                "trader and no earlier (§8)."
+            )
+
+
+def test_render_drift_does_emit_the_book() -> None:
+    """The positive control. A blindness test that passed because nothing
+    anywhere rendered a drift table would be worthless."""
+    from research_desk.metrics.render import render_drift
+
+    text = render_drift(drift_table())
+    assert "PORTFOLIO DRIFT" in text
+    assert "gap USD" in text
+    assert "free slot" in text
+
+
+def test_render_drift_says_closing_a_gap_is_optional() -> None:
+    """§8's claim is that the table converts "how much should we buy" into
+    "close this gap or don't" -- the "or don't" has to be in the text."""
+    from research_desk.metrics.render import render_drift
+
+    text = render_drift(drift_table())
+    assert "needs no action" in text
+    assert "not an instruction" in text
+
+
+def test_render_drift_uses_no_adjectives_about_the_book() -> None:
+    """The §2 restraint the rest of ``render.py`` follows: percentiles and
+    direction, never a judgement. ``overweight`` is a computed state; "badly
+    overweight" or "dangerously concentrated" would be the renderer arguing."""
+    from research_desk.metrics.render import render_drift
+
+    text = render_drift(drift_table()).lower()
+    for adjective in ("dangerous", "badly", "excessive", "too much", "risky",
+                      "healthy", "comfortable", "should buy", "recommend"):
+        assert adjective not in text
+
+
+async def test_the_trader_does_receive_the_drift_table() -> None:
+    """The other half of §8: channel 2 has to actually reach the trader.
+
+    Both halves in one file on purpose. A test suite that only asserted the
+    absence would be satisfied by deleting the feature.
+    """
+    from research_desk.graph.nodes.trader import trader
+
+    class TraderRecorder(Recorder):
+        async def complete(self, profile, messages, schema=None):
+            self.messages = [dict(m) for m in messages]
+            return LLMResponse(
+                text='{"action":"HOLD","conviction":0.1,"target_weight_pct":0.0,'
+                     '"horizon_days":30,"rationale":"Nothing compelling here today.",'
+                     '"invalidation":"A break above the prior high would change this.",'
+                     '"strongest_counterargument":"Momentum could continue regardless."}',
+                model="fake", profile=profile.name, provider=profile.provider,
+            )
+
+    recorder = TraderRecorder()
+    router = LLMRouter(
+        profiles={"quick": ModelProfile(name="quick", provider="fake", model="m")},
+        node_routes={"trader": "quick"},
+        clients={"fake": recorder},
+    )
+    ctx = NodeContext(settings=Settings(), as_of=date(2026, 10, 6),
+                      extras={"router": router})
+
+    await trader(
+        DecisionState(run_id="t", symbol="TSM", as_of=date(2026, 10, 6),
+                      snapshot=snapshot(), drift=drift_table()),
+        ctx,
+    )
+    sent = "\n".join(m["content"] for m in recorder.messages)
+    assert "PORTFOLIO DRIFT" in sent
+    assert "PORTFOLIO INTENT" in sent
+
+
+async def test_the_trader_is_told_plainly_when_the_book_is_missing() -> None:
+    """FOLLOWUPS.md recorded the trader *inferring* a position when it had no
+    information. Silence is what produced that, so absence is stated."""
+    from research_desk.graph.nodes.trader import trader
+
+    class TraderRecorder(Recorder):
+        async def complete(self, profile, messages, schema=None):
+            self.messages = [dict(m) for m in messages]
+            return LLMResponse(
+                text='{"action":"HOLD","conviction":0.1,"target_weight_pct":0.0,'
+                     '"horizon_days":30,"rationale":"Nothing compelling here today.",'
+                     '"invalidation":"A break above the prior high would change this.",'
+                     '"strongest_counterargument":"Momentum could continue regardless."}',
+                model="fake", profile=profile.name, provider=profile.provider,
+            )
+
+    recorder = TraderRecorder()
+    router = LLMRouter(
+        profiles={"quick": ModelProfile(name="quick", provider="fake", model="m")},
+        node_routes={"trader": "quick"},
+        clients={"fake": recorder},
+    )
+    ctx = NodeContext(settings=Settings(), as_of=date(2026, 10, 6),
+                      extras={"router": router})
+
+    await trader(
+        DecisionState(run_id="t", symbol="TSM", as_of=date(2026, 10, 6),
+                      snapshot=snapshot(), drift=None),
+        ctx,
+    )
+    sent = "\n".join(m["content"] for m in recorder.messages)
+    assert "Do NOT infer a current position" in sent

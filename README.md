@@ -30,7 +30,7 @@ Two processes that communicate through a file, never a shared event loop:
 | **3** | Vertical slice → `proposal.json` | **done** |
 | **4** | Analysts + research debate | **done** |
 | **5** | Risk debate + fund manager | **done** (local judge; hosted deferred) |
-| 6 | Intent, sizing, compliance | not started |
+| **6** | Intent, sizing, compliance | **done** (earnings blackout warns on an estimate — see gaps) |
 | 7 | Execution + confirmation gate | not started |
 | 8 | Evaluation, B0–B4, the go/no-go | not started |
 | 9 | Memory + reflection | not started |
@@ -79,8 +79,11 @@ Then, after any pull, the one command that checks everything:
 make verify
 ```
 
-It runs the Stage 0 gate in order — config, tests, environment, toy graph — and
-stops at the first real failure. `make doctor` alone gives just the environment
+It runs every exit gate in order — config, tests, environment, toy graph,
+Stage 1, Stage 2, Stage 6, Stage 3 — and stops at the first real failure.
+Stage 6 runs *before* Stage 3 deliberately: it needs no model and no network, so
+it takes a second and tells you the book is stale before you spend three minutes
+of inference sizing against it. `make doctor` alone gives just the environment
 report.
 
 `make help` lists everything. The three checks worth knowing:
@@ -104,6 +107,21 @@ report.
   `--days 90` once to backfill.
 - `make decide` — the Stage 3 exit gate: a real decision end to end,
   written to `data/proposals/`. `SYMBOL=NVDA make decide` for another name.
+  Since Stage 6 the output also carries the `OrderPlan` — the share count, the
+  four caps and which one bound, and any compliance violation.
+- `make portfolio` — the Stage 6 exit gate: the book and the drift table, with
+  **no model and no broker**. Exits non-zero if the marks are stale, because
+  sizing against last week's weights is how a position gets doubled.
+- `make candidates` — channel 1 of §8: universe minus exclusions minus earnings
+  blackout minus at-max-positions, computed before any model runs. `--earnings`
+  also prints every symbol's next-report estimate.
+- `make portfolio-seed` / `make portfolio-refresh` — the only two things that
+  write `config/portfolio.yaml`. Both read the bars cache and **cannot fetch**,
+  so they run with the Gateway down. Do not hand-edit the file.
+- `make test-stage6` — the other half of the Stage 6 gate: an `OrderPlan`
+  produced with zero IB contact (asserted by making every socket connection
+  fail), and a deliberately non-compliant decision blocked regardless of what
+  the fund manager decided.
 - `make smoke` — the Stage 1 exit gate: a real `AnalystReport` out of a local 8B
   model, showing attempts, latency, tokens and the model digest.
 
@@ -201,11 +219,36 @@ that directory.
 ## Rules that the tests enforce
 
 These are not style preferences; each protects a decision that is otherwise easy
-to erode one commit at a time. `tests/test_layering.py` fails the build on all
-four.
+to erode one commit at a time.
+
+`tests/test_layering.py` fails the build on the first four:
 
 1. `graph/build.py` is the **only** module that imports `langgraph`.
 2. `execution/` is the **only** package that imports `ib_async`.
 3. Nothing outside `providers/` imports a provider module directly — everything
    goes through `providers/registry.py`.
 4. No `langchain_core` chat models, no `ToolNode`, no `interrupt()`.
+
+`tests/test_intent_blindness.py` fails it on the fifth, which is §8's and the
+one a well-meaning refactor is most likely to "fix":
+
+5. **Analysts are intent-blind.** No analyst sees the themes, the constraints,
+   the risk limits or the drift table. Intent enters at the trader and no
+   earlier, because the entire value of a bear researcher evaporates if every
+   upstream report was primed with your thesis.
+
+   Stage 6 made this load-bearing rather than theoretical: `prefetch` now puts
+   the book and the drift table into `DecisionState`, so the data an analyst
+   must not see sits in the object it reads. The guard checks both halves — no
+   analyst module may *import* `render_drift` or anything from `intent/`, and
+   the prompts each analyst actually sent are searched for the book's real
+   numbers. It also checks the positive control, that the trader and fund
+   manager *do* receive it, because a blindness test that passed by deleting
+   the feature would be worthless.
+
+`tests/intent/test_stage6_gate.py` fails it on the sixth:
+
+6. **Sizing and compliance reach no broker and no network.** Asserted by
+   replacing `socket.socket.connect` with a raising stub for the duration of
+   the path, which is stronger than looking for `ib_async`: it proves the layer
+   is not quietly reading a quote from anywhere.

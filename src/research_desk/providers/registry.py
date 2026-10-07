@@ -196,6 +196,21 @@ class ProviderRegistry:
         await self._rate_limited(self._edgar.spec)
         return await self._edgar.insider_transactions(symbol, as_of, days)
 
+    async def periodic_filings(
+        self, symbol: str, as_of: date
+    ) -> list[dict[str, Any]]:
+        """10-Q / 10-K / 20-F filings visible on ``as_of``, newest first.
+
+        Feeds the earnings-blackout estimate (§9). EDGAR publishes no forward
+        calendar, so this is filing *history* and `intent/earnings.py` says so
+        in every estimate it builds from it.
+        """
+        if self._edgar is None:
+            raise ProviderError("no EDGAR provider configured")
+        self._guard(self._edgar.spec)
+        await self._rate_limited(self._edgar.spec)
+        return await self._edgar.periodic_filings(symbol, as_of)
+
     async def news_tone(self, symbol: str, as_of: date) -> list[dict[str, Any]]:
         """Daily GDELT tone and article counts from the collector's cache."""
         return await self._via(self._gdelt, "news_tone", symbol, as_of)
@@ -209,7 +224,9 @@ class ProviderRegistry:
 
     # Still to arrive, both gated on a free API key:
     #   company_news(symbol, as_of, days)   -- Finnhub
-    #       earnings_calendar(symbol, as_of)    -- Finnhub
+    #       earnings_calendar(symbol, as_of)    -- Finnhub, which would turn the
+    #           blackout check from an ESTIMATE that warns into a CONFIRMED
+    #           date that blocks. See intent/earnings.py.
     #       short_interest(symbol, as_of)       -- FINRA
     #       insider_transactions(symbol, as_of) -- EDGAR Form 4
     #       macro_series(series_id, as_of)      -- FRED

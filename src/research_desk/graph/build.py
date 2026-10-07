@@ -125,7 +125,9 @@ def build_fanout_graph(
 
 
 def build_decision_graph(ctx: NodeContext, *, checkpoint: bool = False) -> Any:
-    """The Stage 3 vertical slice: ``prefetch -> market_analyst -> trader -> persist``.
+    """The Stage 3 vertical slice, plus Stage 6's veto.
+
+        prefetch -> market_analyst -> trader -> compliance -> persist
 
     Three nodes plus a writer, one of them not an LLM. The plan is emphatic
     about why this shape comes first:
@@ -139,6 +141,7 @@ def build_decision_graph(ctx: NodeContext, *, checkpoint: bool = False) -> Any:
     prefetch and the researchers, which is why ``build_fanout_graph`` already
     exists and is already tested for the reducer bug.
     """
+    from .nodes.compliance import compliance
     from .nodes.market_analyst import market_analyst
     from .nodes.persist import persist
     from .nodes.prefetch import prefetch
@@ -149,6 +152,12 @@ def build_decision_graph(ctx: NodeContext, *, checkpoint: bool = False) -> Any:
             ("prefetch", prefetch),
             ("market_analyst", market_analyst),
             ("trader", trader),
+            # Node 14 is in the slice graph too, not only the full one. The
+            # veto is not a feature of the complete pipeline -- it is the
+            # property that makes any decision from this repo safe to act on,
+            # and a graph that writes a proposal.json without it would produce
+            # an artefact `execute` cannot tell apart from a checked one.
+            ("compliance", compliance),
             ("persist", persist),
         ],
         ctx,
@@ -166,7 +175,11 @@ def build_research_graph(ctx: NodeContext, *, checkpoint: bool = False) -> Any:
            +--> positioning_analyst --+--> bull -> bear -> facilitator
            +--> fundamentals_analyst -+              |
                                            (continue)|(stop)
-                                              ^------+--> trader -> persist
+                                   ^------------------+--> trader
+                                                            |
+                                              compliance <--+
+                                                   |
+                                                persist
 
     Two shapes LangGraph is genuinely good at, and the reason §1 kept it: a
     fan-out whose branches merge, and a conditional edge that loops.
@@ -179,6 +192,7 @@ def build_research_graph(ctx: NodeContext, *, checkpoint: bool = False) -> Any:
     session.
     """
     from .nodes.analysts import ANALYSTS, make_analyst
+    from .nodes.compliance import compliance
     from .nodes.market_analyst import market_analyst  # noqa: F401  (Stage 3 shim)
     from .nodes.persist import persist
     from .nodes.prefetch import prefetch
@@ -193,6 +207,7 @@ def build_research_graph(ctx: NodeContext, *, checkpoint: bool = False) -> Any:
         ("bear_researcher", make_researcher("bear")),
         ("research_facilitator", research_facilitator),
         ("trader", trader),
+        ("compliance", compliance),
         ("persist", persist),
     ):
         graph.add_node(name, _bind(name, fn, ctx))
@@ -213,7 +228,8 @@ def build_research_graph(ctx: NodeContext, *, checkpoint: bool = False) -> Any:
         _debate_router,
         {"continue": "bull_researcher", "stop": "trader"},
     )
-    graph.add_edge("trader", "persist")
+    graph.add_edge("trader", "compliance")
+    graph.add_edge("compliance", "persist")
     graph.add_edge("persist", END)
 
     return graph.compile(checkpointer=_saver(checkpoint))
@@ -246,6 +262,8 @@ def build_full_graph(ctx: NodeContext, *, checkpoint: bool = False) -> Any:
                        risky -> neutral -> safe -> fund_manager
                                               |
                                       (loop)  v (stop)
+                                          compliance     <- node 14, no LLM
+                                              |
                                            persist
 
     13 LLM calls at one round each, against a 20-call budget that leaves room
@@ -253,8 +271,13 @@ def build_full_graph(ctx: NodeContext, *, checkpoint: bool = False) -> Any:
     termination conditions through the same helpers (§5), and budget is
     checked before every call rather than after -- a check after the fact is
     an audit, not a cap.
+
+    **The last two nodes call no model**, which is deliberate and is where §9's
+    second key lives: the fund manager is the last judgement, and compliance is
+    the first thing after it that cannot be argued with.
     """
     from .nodes.analysts import ANALYSTS, make_analyst
+    from .nodes.compliance import compliance
     from .nodes.persist import persist
     from .nodes.prefetch import prefetch
     from .nodes.researchers import make_researcher, research_facilitator
@@ -270,6 +293,7 @@ def build_full_graph(ctx: NodeContext, *, checkpoint: bool = False) -> Any:
         ("research_facilitator", research_facilitator),
         ("trader", trader),
         ("fund_manager", fund_manager),
+        ("compliance", compliance),
         ("persist", persist),
     ):
         graph.add_node(name, _bind(name, fn, ctx))
@@ -301,8 +325,9 @@ def build_full_graph(ctx: NodeContext, *, checkpoint: bool = False) -> Any:
 
     graph.add_conditional_edges(
         "fund_manager", _risk_router,
-        {"continue": RISK_TRIO[0][1], "stop": "persist"},
+        {"continue": RISK_TRIO[0][1], "stop": "compliance"},
     )
+    graph.add_edge("compliance", "persist")
     graph.add_edge("persist", END)
 
     return graph.compile(checkpointer=_saver(checkpoint))

@@ -12,6 +12,13 @@ Two artefacts, two jobs, and §1 is explicit that they must not be merged:
 
 Failure direction is HOLD (§5). If any node errored, or the trader degraded, the
 decision written here is a HOLD carrying the reason -- never a trade.
+
+**Stage 6 moved the promotion out of this node.** ``compliance`` (node 14) now
+promotes the verdict, sizes it and may veto it, so this node writes what that
+node decided rather than deciding again. The promotion code stays here for the
+graphs that have no compliance node -- and only for those -- because two nodes
+independently deriving a ``FinalDecision`` is two chances to derive different
+ones, and the one that reached a human would be whichever ran last.
 """
 
 from __future__ import annotations
@@ -41,7 +48,7 @@ DEFAULT_TTL_HOURS = 18
 
 
 async def persist(state: DecisionState, ctx: NodeContext) -> NodePatch:
-    """Promote the proposal to a ``FinalDecision`` and write both artefacts."""
+    """Write both artefacts, promoting the proposal only if nothing else has."""
     intent = load_yaml("portfolio-intent.yaml")
     cadence = intent.get("cadence") or {}
     risk = intent.get("risk") or {}
@@ -49,6 +56,16 @@ async def persist(state: DecisionState, ctx: NodeContext) -> NodePatch:
 
     proposal = state.trader_proposal
     degraded = bool(state.errors) or proposal is None or proposal.parse_failed
+
+    if state.final_decision is not None:
+        # The compliance node already promoted, sized and checked. Writing is
+        # all that is left -- and re-deriving the decision here would discard
+        # its veto, which is the one thing in this pipeline that must not be
+        # overridable by a later node.
+        paths = _write(state, state.final_decision, ctx)
+        return {"notes": [
+            f"{NODE}: {state.final_decision.action} -> {paths['proposal'].name}"
+        ]}
 
     if proposal is None:
         # Nothing to promote. Build the safe decision directly rather than
@@ -106,20 +123,35 @@ def _write(state: DecisionState, decision: FinalDecision, ctx: NodeContext) -> d
     proposals_dir = settings.proposals_dir
     proposals_dir.mkdir(parents=True, exist_ok=True)
     proposal_path = proposals_dir / f"{state.symbol}_{state.run_id}.json"
-    proposal_path.write_text(
-        json.dumps(
-            {
-                "run_id": state.run_id,
-                "as_of": state.as_of.isoformat(),
-                "mode": state.mode.value,
-                "config_hash": state.config_hash,
-                "prompt_pack_version": state.prompt_pack_version,
-                "decision": decision.model_dump(mode="json"),
-            },
-            indent=2,
-            default=str,
-        )
-    )
+    body: dict = {
+        "run_id": state.run_id,
+        "as_of": state.as_of.isoformat(),
+        "mode": state.mode.value,
+        "config_hash": state.config_hash,
+        "prompt_pack_version": state.prompt_pack_version,
+        "decision": decision.model_dump(mode="json"),
+    }
+
+    # §9's middle layer. `execute` reads the plan for the share count and reads
+    # `decision` for the text a human approves; both are needed and neither is
+    # derivable from the other. Absent on a graph with no compliance node,
+    # which `execute` must therefore treat as "nothing sized", not "size it
+    # yourself".
+    if state.order_plan is not None:
+        body["order_plan"] = state.order_plan.model_dump(mode="json")
+
+    # Not the whole book -- the two facts that make the plan auditable without
+    # reopening config/portfolio.yaml, which is overwritten on every re-mark.
+    if state.portfolio is not None:
+        body["book"] = {
+            "as_of": state.portfolio.as_of.isoformat(),
+            "equity": round(state.portfolio.equity, 2),
+            "cash": round(state.portfolio.cash, 2),
+            "position_count": state.portfolio.position_count,
+            "source": state.portfolio.source,
+        }
+
+    proposal_path.write_text(json.dumps(body, indent=2, default=str))
 
     logger.info("wrote %s and appended %s", proposal_path, jsonl)
     return {"proposal": proposal_path, "jsonl": jsonl}

@@ -16,8 +16,10 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 
+from ...config import load_yaml
 from ...context import NodeContext
 from ...llm.structured import structured
+from ...metrics.render import render_drift, render_intent
 from ...models.state import (
     DebateTranscript,
     DebateTurn,
@@ -142,6 +144,22 @@ def make_risk_debater(speaker: str, node: str):
     return debater
 
 
+def _render_book(state: DecisionState) -> str:
+    """The drift table for the fund manager, or an explicit absence.
+
+    Never silently omitted: a fund manager that cannot see the book must be
+    told so, because the alternative is that it assumes one. That assumption is
+    exactly what FOLLOWUPS.md recorded the trader doing at Stage 3.
+    """
+    if state.drift is None:
+        return (
+            "PORTFOLIO DRIFT: unavailable -- the book could not be read. Do NOT "
+            "infer a current position or an available cash balance; neither is "
+            "known here, and no order will be sized without them.\n"
+        )
+    return render_drift(state.drift)
+
+
 async def fund_manager(state: DecisionState, ctx: NodeContext) -> NodePatch:
     """Approve, adjust or veto (§3 node 13). The last judgement before a human."""
     node = "fund_manager"
@@ -176,6 +194,14 @@ async def fund_manager(state: DecisionState, ctx: NodeContext) -> NodePatch:
                 f"{render_research(state)}\n"
                 f"{render_risk_debate(_with(state, scored))}\n"
                 f"{render_reports(state)}\n"
+                # Channels 2 and 3. §8 names the fund manager alongside the
+                # trader as a legitimate recipient of intent, and it had
+                # neither until Stage 6 -- which meant the node deciding
+                # whether to adjust a target weight could not see the book that
+                # weight applies to, nor the limit it is measured against.
+                # Analysts still see neither (§8), which is the whole point.
+                f"{_render_book(state)}\n"
+                f"{render_intent(load_yaml('portfolio-intent.yaml'))}\n"
                 f"Decide on the {state.symbol} proposal."
             )},
         ],

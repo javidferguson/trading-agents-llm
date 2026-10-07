@@ -476,6 +476,19 @@ async def _run_decide(
     print(f"  expires      {decision.expires_at:%Y-%m-%d %H:%M}")
     print()
 
+    # §9's middle layer. Printed after the decision and before the cost, because
+    # that is the order in which it matters: what was decided, what that turns
+    # into in shares, and what it cost to find out.
+    plan = state.order_plan
+    if plan is not None:
+        print(plan.render())
+        if plan.blocked:
+            print()
+            print("  VETOED BY PYTHON. The fund manager approved this and the")
+            print("  compliance node blocked it -- which is the design (§9),")
+            print("  not a malfunction.")
+        print()
+
     spend = sum(r.usd for r in state.llm_calls)
     attempts = len(state.llm_calls)
     repairs = sum(1 for r in state.llm_calls if r.parse_failed)
@@ -493,6 +506,12 @@ async def _run_decide(
         print("DEGRADED -- this HOLD is a failure, not a judgement.")
         print(f"  {state.degraded_reason()}")
         return 1
+
+    if plan is not None and plan.blocked:
+        # Exit 0: nothing failed. A veto is the system working, and the first
+        # live Stage 6 run reporting one as DEGRADED was the bug, not the
+        # veto. The block above already said so loudly on stdout.
+        print("No order will be placed. Nothing failed.")
     return 0
 
 
@@ -711,6 +730,104 @@ def cmd_smoke(args: argparse.Namespace) -> int:
         return 1
 
 
+# --------------------------------------------------------------------------- #
+# portfolio / candidates -- Stage 6, and neither touches IB or a model
+# --------------------------------------------------------------------------- #
+
+
+def cmd_portfolio(args: argparse.Namespace) -> int:
+    """The book, and the drift table computed from it. No LLM, no broker."""
+    from .intent.engine import compute_gaps, load_intent, load_portfolio
+    from .metrics.render import render_drift
+
+    as_of = date.fromisoformat(args.as_of) if args.as_of else date.today()
+
+    try:
+        intent = load_intent()
+        portfolio = load_portfolio()
+    except Exception as exc:  # noqa: BLE001 -- a CLI message beats a traceback
+        print(f"FAILED: {exc}", file=sys.stderr)
+        return 1
+
+    stale = portfolio.staleness_reason(as_of)
+    print(f"book {portfolio.as_of}  source={portfolio.source}  "
+          f"equity {portfolio.equity:,.2f} USD")
+    if stale:
+        # Printed before the table rather than after: every number below is
+        # computed from marks this message says not to trust.
+        print(f"\n{FAIL} STALE: {stale}\n")
+    print()
+    print(render_drift(compute_gaps(intent, portfolio, as_of=as_of)))
+    return 1 if stale else 0
+
+
+def cmd_candidates(args: argparse.Namespace) -> int:
+    """Channel 1: today's tradeable set, computed before any model runs (§8).
+
+    > *"Universe minus exclusions minus earnings blackout minus
+    > at-max-positions -> today's candidates... Saves money and removes a class
+    > of hallucination."*
+    """
+    from .intent.engine import blackout_map, candidates, load_intent, load_portfolio
+    from .providers.registry import ProviderRegistry
+
+    setup_logging()
+    as_of = date.fromisoformat(args.as_of) if args.as_of else date.today()
+
+    try:
+        intent = load_intent()
+        portfolio = load_portfolio()
+    except Exception as exc:  # noqa: BLE001
+        print(f"FAILED: {exc}", file=sys.stderr)
+        return 1
+
+    settings = load_settings()
+    registry = ProviderRegistry.from_config(settings)
+
+    blackouts: dict[str, str] = {}
+    if not args.no_earnings:
+        blackouts = asyncio.run(blackout_map(
+            registry, list(intent.universe.tradeable), as_of,
+            days_before=intent.risk.earnings_blackout_days_before,
+            days_after=intent.risk.earnings_blackout_days_after,
+        ))
+
+    result = candidates(intent, portfolio, as_of=as_of, blackouts=blackouts)
+
+    print(f"candidates for {as_of.isoformat()}  "
+          f"({len(result.eligible)} of {len(intent.universe.include)} eligible)")
+    print(f"  book: {portfolio.position_count}/{intent.risk.max_positions} "
+          f"positions, {portfolio.cash_pct:.1f}% cash\n")
+
+    print("ELIGIBLE")
+    for symbol in result.eligible:
+        held = portfolio.get(symbol)
+        mark = f"held {portfolio.weight_pct(symbol):5.2f}%" if held else "not held"
+        print(f"  {symbol:7} {mark}")
+
+    if result.rejected:
+        print("\nFILTERED OUT")
+        for symbol, reason in result.rejected.items():
+            print(f"  {symbol:7} {' '.join(reason.split())}")
+
+    if args.earnings:
+        from .intent.earnings import estimate_next_report
+
+        print("\nNEXT REPORT ESTIMATES")
+        print("  EDGAR publishes no forward calendar, so these are projected")
+        print("  from filing cadence and WARN rather than block. See")
+        print("  intent/earnings.py.")
+
+        async def _show() -> None:
+            for symbol in intent.universe.tradeable:
+                estimate = await estimate_next_report(registry, symbol, as_of)
+                print(f"  {' '.join(estimate.describe().split())}")
+
+        asyncio.run(_show())
+
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="desk", description=__doc__)
     parser.add_argument("--version", action="version", version=__version__)
@@ -749,6 +866,24 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--preset", default="all_local",
                        help="models.yaml preset (default all_local -- hosted is Stage 5)")
     smoke.set_defaults(func=cmd_smoke)
+
+    pf = sub.add_parser(
+        "portfolio",
+        help="Stage 6: the book and the drift table, no LLM and no broker",
+    )
+    pf.add_argument("--as-of", default=None, help="YYYY-MM-DD (default: today)")
+    pf.set_defaults(func=cmd_portfolio)
+
+    cand = sub.add_parser(
+        "candidates",
+        help="Stage 6 channel 1: today's tradeable set, before any model runs",
+    )
+    cand.add_argument("--as-of", default=None, help="YYYY-MM-DD (default: today)")
+    cand.add_argument("--earnings", action="store_true",
+                      help="also print the next-report estimate for every symbol")
+    cand.add_argument("--no-earnings", action="store_true",
+                      help="skip the earnings filter (it reads EDGAR filing history)")
+    cand.set_defaults(func=cmd_candidates)
 
     toy = sub.add_parser("toy-graph", help="Stage 0 exit gate: two nodes, two spans")
     toy.add_argument("--symbol", default="SPY")

@@ -1,10 +1,19 @@
 """Node 9 -- the trader. **The first node that sees portfolio intent (§8).**
 
-It receives the analyst's report, the same facts, and the intent. At Stage 6 it
-also receives the drift table from ``intent_engine.compute_gaps()``, which is
-the biggest reliability win in the design: it turns an open-ended "how much
-should we buy" into a bounded "close this gap or don't", which small models
-handle far better. Until then the intent arrives as prose.
+It receives the analyst's report, the same facts, the intent as prose
+(channel 3), and -- since Stage 6 -- **the drift table** (channel 2):
+
+> *"The Trader node gets this as a table. Its job is choosing which gap to
+> close, not inventing allocations. This is the biggest reliability win in the
+> design -- it converts an open-ended 'how much should we buy' into a bounded
+> 'close this gap or don't', which small models handle far better."*
+
+FOLLOWUPS.md recorded the failure this is meant to fix, found by reading the
+Stage 3 output: the trader *"still infers a current position occasionally ('the
+position is small'), despite the prompt stating that portfolio state is
+unknown."* It was inferring because it had nothing to read. It has a table now,
+and ``sizing.py`` caps the order at the gap, so a target the table does not
+support cannot reach a broker even if the model asks for it.
 """
 
 from __future__ import annotations
@@ -14,7 +23,7 @@ import logging
 from ...config import load_yaml
 from ...context import NodeContext
 from ...llm.structured import structured
-from ...metrics.render import render_intent, render_snapshot
+from ...metrics.render import render_drift, render_intent, render_snapshot
 from ...models.state import DecisionState, NodeError, NodePatch, TraderProposal
 from ...prompts import load_prompt
 
@@ -67,6 +76,17 @@ async def trader(state: DecisionState, ctx: NodeContext) -> NodePatch:
     facts = render_snapshot(state.snapshot) if state.snapshot is not None else \
         "No market facts were available for this symbol.\n"
 
+    # Channel 2. Absent only when the book could not be loaded, in which case
+    # the compliance node refuses the order anyway -- so the trader is told
+    # plainly rather than left to infer a position, which is the exact failure
+    # the drift table exists to fix.
+    book = (
+        render_drift(state.drift) if state.drift is not None
+        else "PORTFOLIO DRIFT: unavailable -- the book could not be read. Do "
+             "NOT infer a current position; there is no information here either "
+             "way, and an order will not be sized without it.\n"
+    )
+
     result = await structured(
         router, NODE, TraderProposal,
         [
@@ -74,6 +94,7 @@ async def trader(state: DecisionState, ctx: NodeContext) -> NodePatch:
             {"role": "user", "content": (
                 f"{_render_report(state)}\n"
                 f"{facts}\n"
+                f"{book}\n"
                 f"{render_intent(load_yaml('portfolio-intent.yaml'))}\n"
                 f"Decide on {state.symbol}."
             )},

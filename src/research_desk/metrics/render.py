@@ -250,6 +250,94 @@ def has_facts_for(snapshot: MarketSnapshot, kind: str) -> bool:
     )
 
 
+def render_drift(drift: Any) -> str:
+    """The drift table, for the TRADER and FUND MANAGER only (§8, channel 2).
+
+    > *"The Trader node gets this as a table. **Its job is choosing which gap to
+    > close, not inventing allocations.** This is the biggest reliability win."*
+
+    A separate function from ``render_intent`` for the same reason that one is
+    separate from ``render_snapshot``: handing the book to an analyst has to be
+    a deliberate act, not an accident of reuse. An analyst that knows the book
+    is overweight XOM is no longer reading XOM's fundamentals on their merits.
+
+    Written to the §2 rules the rest of this module follows -- finished numbers,
+    no formulas, no adjectives. ``in band`` is a computed state, not a judgement:
+    it says the gap is inside its tolerance, and the model decides whether that
+    matters. The one piece of guidance in the text is the thing the table exists
+    to say, which is that closing a gap is optional.
+
+    Typed ``Any`` to keep ``metrics/`` free of an ``intent/`` import. The shape
+    is ``intent.engine.DriftTable``.
+    """
+    lines = [
+        "PORTFOLIO DRIFT (computed in Python from the book; not an opinion)",
+        f"  Book marked {drift.book_as_of.isoformat()}  |  "
+        f"equity {drift.equity:,.0f} USD",
+        f"  Cash {drift.cash_usd:,.0f} USD ({drift.cash_pct:.1f}% of equity)  |  "
+        f"gross exposure {drift.gross_exposure_pct:.1f}%",
+        f"  Positions held {drift.position_count} of a maximum "
+        f"{drift.max_positions}  ->  {drift.slots_free} free slot(s)",
+    ]
+    if drift.slots_free == 0:
+        # Stated plainly rather than left to be inferred from two numbers,
+        # because it changes which gaps are closeable at all and §2 says a fact
+        # a model has to derive is not a fact it was given.
+        lines.append(
+            "  >> THE BOOK IS AT max_positions. A symbol that is NOT already "
+            "held cannot be opened; adding to, trimming or closing a held "
+            "symbol is still permitted. <<"
+        )
+    lines.append("")
+
+    if drift.themes:
+        lines += [
+            "  By theme. The target is the theme TOTAL across its symbols.",
+            f"    {'theme':28} {'now':>7} {'target':>7} {'gap':>8} "
+            f"{'gap USD':>10}  state",
+        ]
+        for row in drift.themes:
+            lines.append(
+                f"    {row.name[:28]:28} {row.current_weight_pct:6.2f}% "
+                f"{row.target_weight_pct:6.2f}% {row.gap_pct:+7.2f}% "
+                f"{row.gap_usd:+10,.0f}  {row.direction}"
+            )
+            if row.unheld:
+                lines.append(f"      not held: {', '.join(row.unheld)}")
+        lines.append("")
+
+    lines += [
+        "  By symbol. The target is this symbol's share of its theme, after the",
+        "  single-symbol ceiling. A positive gap is room to add; a negative gap",
+        "  is an overweight to trim.",
+        f"    {'symbol':7} {'now':>7} {'target':>7} {'band':>6} {'gap':>8} "
+        f"{'gap USD':>10}  state",
+    ]
+    for row in drift.symbols:
+        lines.append(
+            f"    {row.symbol:7} {row.current_weight_pct:6.2f}% "
+            f"{row.target_weight_pct:6.2f}% {row.band_pct:5.2f}% "
+            f"{row.gap_pct:+7.2f}% {row.gap_usd:+10,.0f}  {row.direction}"
+        )
+
+    if drift.unthemed_holdings:
+        lines += [
+            "",
+            "  Held but in no theme (counts toward gross exposure and the "
+            "position limit, toward no target): "
+            + ", ".join(drift.unthemed_holdings),
+        ]
+
+    lines += [
+        "",
+        "  A gap inside its band needs no action. Closing a gap is a choice, "
+        "not an instruction:",
+        "  leaving the book as it is remains a legitimate outcome.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def render_intent(intent: dict[str, Any]) -> str:
     """Portfolio intent, for the TRADER and FUND MANAGER only (§8).
 
