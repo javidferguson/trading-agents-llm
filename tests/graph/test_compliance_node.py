@@ -24,7 +24,18 @@ from research_desk.intent.engine import load_portfolio
 from research_desk.models.market import MarketSnapshot
 from research_desk.models.state import DecisionState, NodeError, RiskVerdict, TraderProposal
 
-AS_OF = date(2026, 10, 6)
+#: Derived from the shipped book rather than hardcoded, deliberately.
+#:
+#: These tests exercise the node against the REAL config/portfolio.yaml -- some
+#: of them read its marks directly -- so they must share its decision date. A
+#: fixed date went stale the moment the book was re-marked, and compliance then
+#: blocked every order with "the marks are 1 day(s) in the FUTURE -- look-ahead
+#: bias, not freshness", which is the guard being right and the test being
+#: wrong. Deriving it means `make portfolio-refresh` cannot break these again.
+#:
+#: Wiring tests that do NOT want this coupling use their own fixture book --
+#: see `fixture_book()` in tests/graph/test_decision_graph.py.
+AS_OF = load_portfolio().as_of
 
 
 def ctx(tmp_path) -> NodeContext:
@@ -121,13 +132,17 @@ async def test_the_traders_proposal_is_promoted_when_there_is_no_verdict(tmp_pat
 async def test_a_vetoed_order_becomes_a_hold_in_the_final_decision(tmp_path) -> None:
     """Not a BUY with a blocked plan attached.
 
+    PLTR rather than a held name: it is themed and in-universe but UNHELD, and
+    the seeded book sits at max_positions, so the block has a real cause. (This
+    was GOOGL until the 2026-10-07 widening put GOOGL in the book.)
+
     Both objects go to the journal, but only one is what the next process acts
     on, and it must not be possible to read a BUY out of a run Python refused.
     """
-    # GOOGL is themed and in-universe but unheld, and the book is at
+    # PLTR is themed and in-universe but unheld, and the book is at
     # max_positions -- so this is blocked for a real reason.
     patch = await compliance(
-        state(symbol="GOOGL", snapshot=snapshot("GOOGL", close=347.84),
+        state(symbol="PLTR", snapshot=snapshot("PLTR", close=182.40),
               trader_proposal=proposal(weight=5.0, conviction=1.0)),
         ctx(tmp_path),
     )
@@ -153,7 +168,7 @@ async def test_a_veto_is_not_recorded_as_a_failure(tmp_path) -> None:
     that a blocked order no longer looks like a crash.
     """
     patch = await compliance(
-        state(symbol="GOOGL", snapshot=snapshot("GOOGL", close=347.84),
+        state(symbol="PLTR", snapshot=snapshot("PLTR", close=182.40),
               trader_proposal=proposal(weight=5.0, conviction=1.0)),
         ctx(tmp_path),
     )
@@ -169,7 +184,7 @@ async def test_a_veto_on_an_ALREADY_degraded_run_stays_degraded(tmp_path) -> Non
     """The flag tracks the node failure, not the veto -- so a run that both
     degraded and got vetoed is still reported as degraded."""
     patch = await compliance(
-        state(symbol="GOOGL", snapshot=snapshot("GOOGL", close=347.84),
+        state(symbol="PLTR", snapshot=snapshot("PLTR", close=182.40),
               trader_proposal=proposal(weight=5.0, conviction=1.0),
               errors=[NodeError(node="news_analyst", kind="degraded",
                                 message="no usable output")]),
@@ -181,7 +196,7 @@ async def test_a_veto_on_an_ALREADY_degraded_run_stays_degraded(tmp_path) -> Non
 async def test_every_violation_appears_in_the_notes(tmp_path) -> None:
     """The notes are what `desk decide` prints and what a human skims."""
     patch = await compliance(
-        state(symbol="GOOGL", snapshot=snapshot("GOOGL", close=347.84),
+        state(symbol="PLTR", snapshot=snapshot("PLTR", close=182.40),
               trader_proposal=proposal(weight=5.0, conviction=1.0)),
         ctx(tmp_path),
     )
@@ -247,12 +262,12 @@ async def test_persist_does_not_re_promote_over_the_veto(tmp_path) -> None:
     from research_desk.graph.nodes.persist import persist
 
     patch = await compliance(
-        state(symbol="GOOGL", snapshot=snapshot("GOOGL", close=347.84),
+        state(symbol="PLTR", snapshot=snapshot("PLTR", close=182.40),
               trader_proposal=proposal(weight=5.0, conviction=1.0)),
         ctx(tmp_path),
     )
     held = DecisionState(
-        run_id="t", symbol="GOOGL", as_of=AS_OF,
+        run_id="t", symbol="PLTR", as_of=AS_OF,
         trader_proposal=proposal(weight=5.0, conviction=1.0),
         final_decision=patch["final_decision"],
         order_plan=patch["order_plan"],
@@ -261,7 +276,7 @@ async def test_persist_does_not_re_promote_over_the_veto(tmp_path) -> None:
     await persist(held, ctx(tmp_path))
 
     written = json.loads(
-        next((tmp_path / "proposals").glob("GOOGL_*.json")).read_text()
+        next((tmp_path / "proposals").glob("PLTR_*.json")).read_text()
     )
     assert written["decision"]["action"] == "HOLD", (
         "persist re-derived the decision and discarded the veto"

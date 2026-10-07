@@ -145,6 +145,186 @@ symbols:
     # prompt caveat rather than pretending the usual quality stack applies.
     quality_metrics_apply: false
 
+  # ------------------------------------------------------------------------
+  # Added 2026-10-07, widening the universe from 15 to 32 collected symbols.
+  #
+  # TWO THINGS TO KNOW BEFORE EDITING ANY `gdelt_query` BELOW.
+  #
+  # 1. GDELT matches TEXT, NOT TICKERS. Four of these needed a hand-built
+  #    query or they would have measured something else entirely: V (visa
+  #    and immigration documents), CAT (cats, and the insect), TEM (tempus
+  #    fugit), AMD (unrelated acronyms).
+  #
+  #    VERIFIED with `--inspect` on 2026-10-07: V (first attempt was badly
+  #    contaminated and was rewritten -- see its comment) and CAT.
+  #
+  #    *** NOT YET VERIFIED: TEM and AMD. *** The GDELT API put this IP in a
+  #    sustained throttle before they could be checked. Both use a specific
+  #    multi-word phrase rather than the bare ticker, so the risk is lower
+  #    than V's was -- but run these two before trusting their series, and
+  #    fix the query BEFORE the first collection rather than after:
+  #
+  #        uv run python scripts/gdelt_collect.py --inspect TEM
+  #        uv run python scripts/gdelt_collect.py --inspect AMD
+  #
+  # 2. A QUERY CANNOT BE CHANGED ONCE COLLECTED. collect_symbol() warns on a
+  #    changed query because splicing two different measurements into one
+  #    history is invisible downstream. Verify first, collect second.
+  #
+  # SHARED SERIES, DELIBERATELY. VOO and IVV track the same index as SPY,
+  # ONEQ the same family as QQQ, and SMH the same industry as SOXX. They
+  # therefore carry the SAME query and will hold near-identical tone series.
+  # That is correct rather than lazy -- the same news genuinely moves them --
+  # but it means a news analyst reading VOO sees SPY's tone, which is a fact
+  # about the world and not a bug to fix.
+  # ------------------------------------------------------------------------
+
+  # --- Equities -----------------------------------------------------------
+
+  - symbol: V
+    name: "Visa Inc. Class A"
+    sector_etf: XLF
+    # NOT '(Visa)' -- bare "visa" is immigration and travel documents. And NOT
+    # "Visa card" / "Visa payments" either, which was the first attempt and was
+    # measured as badly contaminated: those phrases match every OTHER bank's
+    # card launch (CIB Egypt, a Vegas credit union) plus outright noise -- one
+    # --inspect returned seven copies of a United Way community-funding story.
+    # Card marketing is not news about Visa Inc.
+    #
+    # Corporate terms only: the legal name and the CEO.
+    # "Visa stock" / "Visa earnings" are safe to add: neither phrase occurs in
+    # immigration coverage, and the legal name alone was too sparse to give a
+    # stable tone percentile.
+    gdelt_query: '("Visa Inc" OR "Visa stock" OR "Visa earnings" OR "Ryan McInerney")'
+
+  - symbol: MA
+    name: "Mastercard Incorporated Class A"
+    sector_etf: XLF
+    # Query the company name, never the ticker: "MA" is Massachusetts, and a
+    # hundred other things.
+    gdelt_query: '(Mastercard)'
+
+  - symbol: PLTR
+    name: "Palantir Technologies Inc. Class A"
+    sector_etf: XLK
+    gdelt_query: '(Palantir OR "Alex Karp")'
+
+  - symbol: AMD
+    name: "Advanced Micro Devices, Inc."
+    sector_etf: XLK
+    # "AMD" alone also matches age-related macular degeneration, among
+    # others. The full name plus the CEO is specific.
+    gdelt_query: '("Advanced Micro Devices" OR "Lisa Su")'
+
+  - symbol: FSLR
+    name: "First Solar, Inc."
+    # GICS puts First Solar in Information Technology (semiconductors and
+    # semiconductor equipment), not Energy -- it manufactures thin-film
+    # panels. XLK is the right relative-strength comparison.
+    sector_etf: XLK
+    gdelt_query: '("First Solar")'
+
+  - symbol: LLY
+    name: "Eli Lilly and Company"
+    sector_etf: XLV
+    gdelt_query: '("Eli Lilly" OR Zepbound OR Mounjaro)'
+
+  - symbol: TEM
+    name: "Tempus AI, Inc."
+    # Health-care diagnostics built on AI, so XLV rather than XLK: its
+    # revenue is clinical, and that is what the relative-strength metric
+    # should measure it against.
+    sector_etf: XLV
+    # NOT '(Tempus)'. That matches tempus fugit, several magazines and a
+    # watch brand.
+    gdelt_query: '("Tempus AI")'
+
+  - symbol: HON
+    name: "Honeywell International Inc."
+    sector_etf: XLI
+    gdelt_query: '(Honeywell)'
+
+  - symbol: CAT
+    name: "Caterpillar Inc."
+    sector_etf: XLI
+    # NOT '(CAT)' and not bare '(Caterpillar)'. The ticker is a household
+    # pet and the name is an insect; both flood the result set.
+    # Measured with --inspect: this returns mostly Caterpillar coverage (stock
+    # moves, an institutional sale, a $1bn plant investment) with some
+    # industrials-sector spillover, which is acceptable. "Caterpillar stock" is
+    # added for volume -- at 7 articles a day the tone percentile was too thin
+    # to be stable, and that phrase cannot mean the insect.
+    gdelt_query: '("Caterpillar Inc" OR "Caterpillar stock" OR "Caterpillar earnings")'
+
+  - symbol: SPCX
+    name: "Space Exploration Technologies Corp."
+    # Aerospace and defence. Confirmed against EDGAR's ticker map as
+    # SPACE EXPLORATION TECHNOLOGIES CORP -- worth stating because the same
+    # ticker previously belonged to an unrelated SPAC ETF.
+    sector_etf: XLI
+    gdelt_query: '(SpaceX OR "Space Exploration Technologies")'
+    # Recently listed, so the 5-year bar request returns a short series and
+    # the 12-month momentum and 52-week range metrics will be unavailable
+    # WITH A REASON. That is the designed behaviour, not a failure.
+
+  # --- ETFs ---------------------------------------------------------------
+  # No EDGAR companyfacts, like SPY. Sector ETFs are supporting series only,
+  # but these are tradeable members of the book, so they are full entries.
+
+  - symbol: QQQ
+    name: "Invesco QQQ Trust Series 1"
+    # A broad-index fund is not SECTOR exposure, so max_sector_pct cannot
+    # apply to it. See the documented exemption in tests/intent/test_engine.py.
+    sector_etf: null
+    gdelt_query: '("Nasdaq 100" OR "Nasdaq composite" OR "tech stocks")'
+    has_fundamentals: false
+
+  - symbol: ONEQ
+    name: "Fidelity Nasdaq Composite Index ETF"
+    sector_etf: null
+    # Same query as QQQ on purpose -- same index family, same news.
+    gdelt_query: '("Nasdaq 100" OR "Nasdaq composite" OR "tech stocks")'
+    has_fundamentals: false
+
+  - symbol: VOO
+    name: "Vanguard S&P 500 ETF"
+    sector_etf: null
+    # Same query as SPY on purpose -- same index, same news.
+    gdelt_query: '("S&P 500" OR "stock market")'
+    has_fundamentals: false
+
+  - symbol: IVV
+    name: "iShares Core S&P 500 ETF"
+    sector_etf: null
+    # Same query as SPY and VOO on purpose.
+    gdelt_query: '("S&P 500" OR "stock market")'
+    has_fundamentals: false
+
+  - symbol: SOXX
+    name: "iShares Semiconductor ETF"
+    # XLK, deliberately. A semiconductor ETF IS tech exposure, so holding
+    # NVDA + AVGO + SOXX now counts together toward max_sector_pct -- which
+    # is exactly the hidden concentration that cap exists to catch.
+    sector_etf: XLK
+    gdelt_query: '("semiconductor industry" OR "chip stocks")'
+    has_fundamentals: false
+
+  - symbol: SMH
+    name: "VanEck Semiconductor ETF"
+    sector_etf: XLK
+    # Same query as SOXX on purpose -- same industry, same news.
+    gdelt_query: '("semiconductor industry" OR "chip stocks")'
+    has_fundamentals: false
+
+  - symbol: AIQ
+    name: "Global X Artificial Intelligence & Technology ETF"
+    sector_etf: XLK
+    # Its own query: AI as an investment narrative is distinguishable from
+    # the Nasdaq and from semiconductors, so this one is not a duplicate.
+    gdelt_query: '("AI stocks" OR "artificial intelligence stocks")'
+    has_fundamentals: false
+
+
 # The eleven SPDR sector ETFs, for reference. Add a symbol's mapping above
 # rather than inferring one at runtime.
 sector_etfs:

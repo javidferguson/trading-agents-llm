@@ -237,7 +237,10 @@ def test_render_intent_does_emit_intent() -> None:
     """The other half: giving intent to the trader has to actually work."""
     text = render_intent(load_yaml("portfolio-intent.yaml"))
     assert "PORTFOLIO INTENT" in text
-    assert "AI infrastructure" in text
+    # Read from the file rather than hardcoded: the theme was renamed from
+    # "AI infrastructure" to "AI semiconductors" in the 2026-10-07 widening,
+    # and a literal here is a test that breaks on an unrelated config edit.
+    assert load_yaml("portfolio-intent.yaml")["themes"][0]["name"] in text
 
 
 def test_a_theme_target_is_labelled_as_a_total_not_a_symbol_weight() -> None:

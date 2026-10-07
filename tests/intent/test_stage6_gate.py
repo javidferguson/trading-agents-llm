@@ -232,15 +232,26 @@ def test_the_veto_blocks_on_the_real_book_at_max_positions() -> None:
 
     from research_desk.models.orders import OrderPlan
 
-    # GOOGL is a themed, in-universe symbol the book does not hold.
+    # Pick the unheld symbol from the config rather than naming one. This was
+    # hardcoded to GOOGL until the 2026-10-07 widening put GOOGL in the book,
+    # at which point the test asserted a veto on a symbol that could not
+    # trigger it. Derived, it cannot go stale again.
+    unheld = next(
+        s for s in intent.universe.tradeable
+        if s not in portfolio.symbols and intent.theme_for(s) is not None
+    )
+
     plan = rules.check(
-        OrderPlan(symbol="GOOGL", as_of=portfolio.as_of, action="BUY",
-                  quantity=10, reference_price=347.84,
-                  estimated_notional=3478.40),
-        _decision(symbol="GOOGL"), intent, portfolio, as_of=portfolio.as_of,
+        OrderPlan(symbol=unheld, as_of=portfolio.as_of, action="BUY",
+                  quantity=10, reference_price=100.0,
+                  estimated_notional=1_000.0),
+        _decision(symbol=unheld), intent, portfolio, as_of=portfolio.as_of,
         sectors=sector_map(), dollar_adv=2e9,
     )
-    assert "max_positions" in [v.rule for v in plan.blocking]
+    assert "max_positions" in [v.rule for v in plan.blocking], (
+        f"{unheld} is unheld and the book is full, so opening it must be "
+        f"blocked. Got: {[v.rule for v in plan.blocking]}"
+    )
 
 
 def test_no_model_output_can_switch_a_check_off() -> None:

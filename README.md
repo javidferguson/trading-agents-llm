@@ -109,6 +109,11 @@ report.
   written to `data/proposals/`. `SYMBOL=NVDA make decide` for another name.
   Since Stage 6 the output also carries the `OrderPlan` — the share count, the
   four caps and which one bound, and any compliance violation.
+- `make review` — read past runs out of the decision journal: the decision, the
+  order plan, the debate, the violations. `SYMBOL=TSM make review`, or
+  `desk review --last 10` for a listing and `--full` for every analyst and the
+  raw model calls. The journal is the source of truth for replay (§1), and this
+  is what reads it.
 - `make portfolio` — the Stage 6 exit gate: the book and the drift table, with
   **no model and no broker**. Exits non-zero if the marks are stale, because
   sizing against last week's weights is how a position gets doubled.
@@ -137,6 +142,19 @@ hidden: the test resolved Ollama with the bare `Settings()` default of
 inside `dev`. Tests that reach a real service use `load_settings()`; the
 offline ones keep `Settings()` deliberately, so a local `.env` cannot change a
 result.
+
+## Where a decision's artifacts land
+
+Three places, answering different questions:
+
+| Question | Where |
+|---|---|
+| What did it decide, and what order? | `data/proposals/*.json` — ~2KB, pretty-printed, just open one |
+| Why? What did each agent say? | **Langfuse at http://localhost:3000** — per-node spans with the real prompt and response. Start here. |
+| Everything, replayably | `data/journal/decisions_YYYYMMDD.jsonl` — the full `DecisionState` per run, including `llm_calls[].raw_response` |
+
+The journal is ~50KB per run, so `desk review` exists to read it rather than
+`cat`. `proposal.json` is what `execute` consumes and the only thing it reads.
 
 ## Never run both IB Gateways at once
 

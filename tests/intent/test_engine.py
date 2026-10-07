@@ -335,11 +335,86 @@ def test_the_shipped_drift_table_is_arithmetically_consistent() -> None:
         assert row.current_weight_pct == pytest.approx(expected)
 
 
+#: Tradeable symbols that legitimately have no sector, and are therefore
+#: exempt from ``max_sector_pct``.
+#:
+#: **Named explicitly so the exemption is a decision rather than a silent
+#: gap.** A broad-index fund is not sector exposure -- an S&P 500 tracker spans
+#: all eleven -- so there is no sector figure the cap could meaningfully apply
+#: to. ``compliance.check`` skips an unknown sector rather than pooling every
+#: unclassified name into one bucket that would trip the cap spuriously.
+#:
+#: Note what is NOT here: SOXX, SMH and AIQ are mapped to XLK on purpose, so
+#: holding NVDA + AVGO + SOXX counts together toward the tech cap. That is
+#: exactly the hidden concentration the limit exists to catch, and an ETF is
+#: the easiest way to acquire it by accident.
+SECTORLESS_BY_DESIGN = frozenset({"QQQ", "ONEQ", "VOO", "IVV"})
+
+
 def test_the_sector_map_covers_every_tradeable_symbol() -> None:
-    """``max_sector_pct`` cannot be enforced on a symbol with no sector."""
+    """``max_sector_pct`` cannot be enforced on a symbol with no sector.
+
+    So every exception has to be listed above and justified, which is the point:
+    a new symbol added without a ``sector_etf`` fails here instead of quietly
+    escaping the sector cap.
+    """
     sectors = sector_map()
-    missing = [s for s in load_intent().universe.tradeable if s not in sectors]
+    missing = {
+        s for s in load_intent().universe.tradeable if s not in sectors
+    } - SECTORLESS_BY_DESIGN
     assert not missing, (
-        f"{missing} have no sector_etf in universe.yaml, so max_sector_pct "
-        "cannot be evaluated for them"
+        f"{sorted(missing)} have no sector_etf in universe.yaml, so "
+        "max_sector_pct cannot be evaluated for them. Either map them to a "
+        "sector ETF or add them to SECTORLESS_BY_DESIGN with a reason."
+    )
+
+
+def test_the_sector_exemption_is_not_a_blanket() -> None:
+    """Guard against the exemption growing to cover everything.
+
+    If somebody adds a symbol to SECTORLESS_BY_DESIGN to silence the test
+    above, this catches the case where it has a sector after all.
+    """
+    sectors = sector_map()
+    wrongly_exempt = {s for s in SECTORLESS_BY_DESIGN if s in sectors}
+    assert not wrongly_exempt, (
+        f"{sorted(wrongly_exempt)} are listed as sectorless but DO have a "
+        "sector_etf. Remove them from the exemption."
+    )
+    tradeable = set(load_intent().universe.tradeable)
+    assert len(SECTORLESS_BY_DESIGN & tradeable) < len(tradeable) / 4, (
+        "more than a quarter of the tradeable universe is exempt from "
+        "max_sector_pct. The cap is becoming decoration."
+    )
+
+
+def test_every_theme_target_exceeds_its_own_band() -> None:
+    """**An unheld exemplar must always be actionable.** The widening guard.
+
+    ``in_band`` means "no action needed", so if a symbol's per-symbol target is
+    not GREATER than its band, an unheld symbol -- gap exactly equal to the
+    target -- reads ``in band`` and the trader never sees it. A whole theme can
+    go dark that way with nothing erroring.
+
+    This fired for real on 2026-10-07: widening to 31 symbols pushed three
+    themes to 1.00% per-symbol targets against a 1.0pp ``BAND_FLOOR_PCT``,
+    which made every unheld symbol in them permanently invisible. The floor
+    came down to 0.5; this test is what will catch the next widening.
+    """
+    intent = load_intent()
+    dark = []
+    for theme in intent.themes:
+        per_symbol = min(
+            theme.implied_symbol_weight_pct, intent.risk.max_position_pct
+        )
+        if per_symbol <= band_for(per_symbol):
+            dark.append(
+                f"{theme.name!r}: target {per_symbol:.2f}% <= band "
+                f"{band_for(per_symbol):.2f}%"
+            )
+    assert not dark, (
+        "these themes are invisible to the trader when unheld:\n  "
+        + "\n  ".join(dark)
+        + "\nRaise the theme target, cut its exemplar count, or lower "
+        "BAND_FLOOR_PCT."
     )

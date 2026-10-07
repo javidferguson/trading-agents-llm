@@ -221,6 +221,10 @@ decide:  ## THE STAGE 3 GATE: a real decision end to end -> proposal.json
 # Stage 6 -- intent, sizing, compliance. None of these touches IB or a model.
 # --------------------------------------------------------------------------- #
 
+.PHONY: review
+review:  ## Read past runs out of the decision journal. No model, no network.
+	$(RUN) desk review $(if $(SYMBOL),--symbol $(SYMBOL),) $(if $(LAST),--last $(LAST),)
+
 .PHONY: portfolio
 portfolio:  ## THE STAGE 6 GATE (part 1): the book and the drift table, no LLM, no broker
 	$(RUN) desk portfolio

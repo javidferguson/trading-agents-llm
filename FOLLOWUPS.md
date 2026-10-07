@@ -245,3 +245,77 @@ At Stage 7 `execute` overwrites this file from the live paper account and
 `source:` becomes `ib`. Until then `make portfolio-refresh` re-marks it from the
 bars cache, and `as_of` tracks the **oldest** mark it used so that re-marking
 against a stale cache cannot reset the staleness clock.
+
+## The conversational research agent — gated on Stage 8
+
+**The goal.** A chat surface where the desk's agents research openly, propose
+equities worth adding, and then *configure them into the desk*: universe entry,
+provider symbols, sector ETF, `gdelt_query`, collection started.
+
+**The gate is §11's B4 comparison, and it is not negotiable.** Build this only
+once the full pipeline beats a single LLM call over the same snapshot by a
+margin outside B2's noise band. If it does not, the plan says ship B4 and
+discard the debate machinery — and a chat agent built first would be decorating
+the part that got thrown away. *"Most multi-agent systems fail this test."*
+
+**The architecture already permits it.** §2's "Keeping the door open to
+tool-calling" is explicit that no-tool-calling is *"a statement about today's
+models, not a permanent architectural commitment"*, and its three enabling
+conditions are already satisfied: one registry (`providers/registry.py`),
+tool-shaped signatures, and `as_of` on every method. The stated upgrade is to
+generate schemas from the registry, hand them to a tool-capable node, and keep
+the deterministic path as the fallback and the replay substrate.
+
+**The hard constraint: it must be a separate process from `decide`.**
+Tool-calling makes a run non-reproducible, and CLAUDE.md forbids it in that
+path. `decide` stays deterministic; the chat agent is a sibling, like `execute`.
+
+**What actually makes "auto-configure" safe is not the LLM.** The 2026-10-07
+widening added 17 symbols by hand and every one of these had to be right:
+
+- `gdelt_query` must be verified against real headlines, once, before the first
+  collection — `collect_symbol` warns on a changed query because splicing two
+  measurements into one history is invisible downstream. Measured: a plausible
+  `("Visa Inc" OR "Visa card" OR "Visa payments")` returned Egyptian bank card
+  launches and seven copies of a United Way community-funding story. It was
+  measuring card marketing, not Visa Inc.
+- `sector_etf` is hand-maintained because free sector classification is poor,
+  and getting it wrong weakens `max_sector_pct` silently.
+- `provider_symbols` differ per provider: BRK.B is `brk-b.us` / `BRK B` /
+  `BRK-B` / `BRK-B`.
+- §7.5: no survivorship-bias-free universe and no point-in-time index
+  membership. Screening "today's best names" bakes in the bias §11 calls the
+  single largest threat to its numbers.
+
+So the agent should **propose a universe diff for human approval** — the same
+"LLM proposes, Python vetoes" shape as `compliance.py` — and the mechanical half
+belongs in a deterministic `desk universe add SYMBOL` helper it calls rather
+than reimplements. That helper is the prerequisite and is worth having alone.
+
+## Scheduling the GDELT collector — deferred to deployment prep
+
+Run `make gdelt` by hand daily for now. Automating it belongs in a
+post-validation deployment-prep task, alongside whatever else needs to run
+unattended.
+
+When it happens, **prefer launchd over cron on macOS.** A laptop asleep at 03:00
+misses a crontab entry outright, and here a missed day is permanently absent
+from the Stage 8 evaluation; launchd's `StartCalendarInterval` runs the job on
+wake instead. It should call the collector through `uv` on the host rather than
+`make gdelt`, which routes through the container and would need Docker running.
+
+## Dead config in `universe.yaml`
+
+Three per-symbol fields are declared and never read:
+
+| Field | Status |
+|---|---|
+| `files_20f` | zero code references |
+| `quality_metrics_apply` | zero code references |
+| `has_fundamentals` | asserted only in `tests/test_config.py` |
+
+The pipeline discovers absent fundamentals at runtime instead, from EDGAR
+returning `None` — which `providers/edgar.py` is explicit is *"an answer, not a
+failure"*. Harmless today, actively misleading to anyone adding a symbol by
+hand, and directly in the way of automating that. Either wire them up or delete
+them; leaving them is the worst of the three.

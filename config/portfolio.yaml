@@ -19,52 +19,87 @@
 # At Stage 7, `execute` overwrites this file from the live paper account and
 # `source:` becomes `ib`.
 
-as_of: '2026-10-06'
+as_of: '2026-10-07'
 source: seed
 base_currency: USD
 stale_after_days: 7
 note: Seeded for the Stage 6 exit gate. Share counts are hand-chosen to put the book
   at max_positions with two symbols at max_position_pct, one theme underweight and
   one overweight; every price is a real cached close. Regenerate with `make portfolio-seed`.
-cash: 115950.26
+cash: 90279.72
 positions:
 - symbol: NVDA
-  quantity: 104.0
-  avg_cost: 198.35
-  last_price: 240.15
-  marked_on: '2026-10-06'
+  quantity: 105.0
+  avg_cost: 201.68
+  last_price: 237.08
+  marked_on: '2026-10-07'
 - symbol: AVGO
   quantity: 40.0
-  avg_cost: 398.47
-  last_price: 379.53
-  marked_on: '2026-10-06'
+  avg_cost: 406.54
+  last_price: 373.21
+  marked_on: '2026-10-07'
+- symbol: AMD
+  quantity: 19.0
+  avg_cost: 278.39
+  last_price: 641.81
+  marked_on: '2026-10-07'
 - symbol: TSM
-  quantity: 12.0
-  avg_cost: 363.35
-  last_price: 484.79
-  marked_on: '2026-10-06'
+  quantity: 11.0
+  avg_cost: 370.5
+  last_price: 472.15
+  marked_on: '2026-10-07'
+- symbol: GOOGL
+  quantity: 36.0
+  avg_cost: 341.68
+  last_price: 349.08
+  marked_on: '2026-10-07'
+- symbol: AMZN
+  quantity: 39.0
+  avg_cost: 250.56
+  last_price: 259.42
+  marked_on: '2026-10-07'
+- symbol: META
+  quantity: 14.0
+  avg_cost: 688.55
+  last_price: 723.06
+  marked_on: '2026-10-07'
 - symbol: MSFT
   quantity: 47.0
-  avg_cost: 420.26
-  last_price: 531.48
-  marked_on: '2026-10-06'
+  avg_cost: 422.79
+  last_price: 530.32
+  marked_on: '2026-10-07'
 - symbol: AAPL
-  quantity: 60.0
-  avg_cost: 263.4
-  last_price: 332.91
-  marked_on: '2026-10-06'
-- symbol: XOM
-  quantity: 120.0
-  avg_cost: 151.98
-  last_price: 165.44
-  marked_on: '2026-10-06'
+  quantity: 22.0
+  avg_cost: 270.23
+  last_price: 337.09
+  marked_on: '2026-10-07'
+- symbol: LLY
+  quantity: 6.0
+  avg_cost: 927.03
+  last_price: 1187.07
+  marked_on: '2026-10-07'
 - symbol: UNH
-  quantity: 40.0
-  avg_cost: 316.4
-  last_price: 374.6
-  marked_on: '2026-10-06'
+  quantity: 20.0
+  avg_cost: 324.63
+  last_price: 376.46
+  marked_on: '2026-10-07'
+- symbol: JNJ
+  quantity: 19.0
+  avg_cost: 234.18
+  last_price: 258.3
+  marked_on: '2026-10-07'
+- symbol: XOM
+  quantity: 46.0
+  avg_cost: 146.44
+  last_price: 164.54
+  marked_on: '2026-10-07'
 - symbol: JPM
-  quantity: 25.0
-  avg_cost: 309.95
-  last_price: 331.38
-  marked_on: '2026-10-06'
+  quantity: 15.0
+  avg_cost: 310.29
+  last_price: 329.09
+  marked_on: '2026-10-07'
+- symbol: QQQ
+  quantity: 7.0
+  avg_cost: 648.85
+  last_price: 756.83
+  marked_on: '2026-10-07'

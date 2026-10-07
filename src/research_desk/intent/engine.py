@@ -51,7 +51,20 @@ BAND_FRACTION = 0.25
 
 #: Minimum band in percentage points. Below this, a day's price move alone
 #: pushes a symbol out of band and the table cries wolf.
-BAND_FLOOR_PCT = 1.0
+#:
+#: **1.0 -> 0.5 on 2026-10-07, and it was required rather than cosmetic.** The
+#: floor was calibrated when the tradeable universe was 14 symbols and
+#: per-symbol targets ran 3-8%. At 31 symbols the tail themes land on 1.00%
+#: targets, and at a 1.0pp floor ``band_for(1.0) == 1.0`` -- so an *unheld*
+#: symbol's gap of exactly 1.0pp is not GREATER than its band, reads ``in
+#: band``, and is invisible to the trader forever. A whole theme can go dark
+#: that way without anything erroring.
+#:
+#: 0.5 keeps what the floor is for -- one day's price move must not flip a
+#: symbol out of band -- while leaving a 1% target actionable.
+#: ``tests/intent/test_engine.py`` asserts every shipped theme's per-symbol
+#: target exceeds its own band, so the next widening fails loudly here instead.
+BAND_FLOOR_PCT = 0.5
 
 #: The file the book lives in. Not in ``CONFIG_FILES``, and not in
 #: ``config_hash`` -- see ``load_portfolio``.

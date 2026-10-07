@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .modes import RunMode
 from .orders import OrderPlan, Violation
+from .portfolio import PortfolioSnapshot
 
 
 class Degradable(BaseModel):
@@ -596,14 +597,19 @@ class DecisionState(BaseModel):
 
     # --- Stage 6: intent, portfolio, sizing, the veto ------------------------
 
-    #: The book sizing ran against (``models.portfolio.PortfolioSnapshot``).
-    #: Typed ``Any`` for the same reason ``snapshot`` is -- it keeps
-    #: ``models/state.py`` free of an import cycle.
+    #: The book sizing ran against.
+    #:
+    #: Properly typed, unlike ``snapshot`` and ``drift``, because it costs
+    #: nothing: ``models/portfolio.py`` imports nothing from this package, so
+    #: there is no cycle to avoid. The payoff is that a run read back out of the
+    #: journal has a real ``PortfolioSnapshot`` with its derived ``equity`` and
+    #: ``weight_pct`` rather than a bare dict -- ``desk review`` tripped over
+    #: exactly that on its first run.
     #:
     #: Recorded in full rather than as a reference to ``config/portfolio.yaml``,
     #: because that file is overwritten every time the book is re-marked and a
     #: replay must see the weights the decision was actually made against.
-    portfolio: Any | None = None
+    portfolio: PortfolioSnapshot | None = None
 
     #: The drift table the trader was given (``intent.engine.DriftTable``).
     #: Channel 2's output, kept so that at Stage 8 a decision can be read
@@ -646,6 +652,7 @@ __all__ = [
     "NodeError",
     "NodePatch",
     "OrderPlan",
+    "PortfolioSnapshot",
     "RunMode",
     "Violation",
 ]

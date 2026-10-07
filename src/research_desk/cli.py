@@ -453,80 +453,25 @@ async def _run_decide(
 
     state = DecisionState.model_validate(result)
     decision = state.final_decision
-
-    for note in state.notes:
-        print(f"  {note}")
-    print()
-
-    report = state.analyst_reports.get("market")
-    if report is not None:
-        print(f"ANALYST  {report.stance} @ {report.confidence:.2f}")
-        print(f"  {' '.join(report.summary.split())}")
-        for point in report.key_points:
-            print(f"  - {' '.join(point.split())}")
-        if report.data_gaps:
-            print(f"  gaps: {'; '.join(report.data_gaps)}")
-        print()
-
-    debate = state.research_debate
-    if debate.turns:
-        print(f"DEBATE  {debate.rounds_completed} round(s), "
-              f"stopped: {debate.stop_reason}")
-        for turn in debate.turns:
-            flag = "" if turn.new_information else "  [no new information]"
-            print(f"  r{turn.round} {turn.speaker:<5} {' '.join(turn.claim.split())[:120]}{flag}")
-        verdict = state.research_verdict
-        if verdict is not None:
-            print(f"  verdict: {verdict.winner} @ {verdict.confidence:.2f}"
-                  + (f" (converged: {verdict.converged_reason})" if verdict.converged else ""))
-        print()
-
-    risk = state.risk_debate
-    if risk.turns:
-        print(f"RISK COMMITTEE  {risk.rounds_completed} round(s), "
-              f"stopped: {risk.stop_reason}")
-        for turn in risk.turns:
-            print(f"  r{turn.round} {turn.speaker:<8} "
-                  f"{' '.join(turn.claim.split())[:110]}")
-        rv = state.risk_verdict
-        if rv is not None:
-            print(f"  fund manager: {rv.decision.upper()} -> {rv.action} "
-                  f"{rv.target_weight_pct:.1f}% @ {rv.conviction:.2f}")
-            if rv.adjustment:
-                print(f"    adjusted: {' '.join(rv.adjustment.split())}")
-        print()
+    plan = state.order_plan
 
     if decision is None:
         print("No decision was produced.", file=sys.stderr)
         return 1
 
-    print(f"DECISION  {decision.action}  {decision.target_weight_pct:.1f}% of equity"
-          f"  conviction {decision.conviction:.2f}  horizon {decision.horizon_days}d")
-    print(f"  rationale    {' '.join(decision.rationale.split())}")
-    print(f"  invalidation {' '.join(decision.invalidation.split())}")
-    print(f"  dissent      {' '.join(decision.dissent.split())}")
-    print(f"  expires      {decision.expires_at:%Y-%m-%d %H:%M}")
-    print()
+    # ONE renderer, shared with `desk review` -- see runlog.render_run. This
+    # used to be ~70 lines of print() right here, which meant `review` could
+    # only have copied them and the two would have drifted on the first edit.
+    # The header above is printed before the graph runs, so render_run's own
+    # header is skipped by slicing it off.
+    from .runlog import render_run
 
-    # §9's middle layer. Printed after the decision and before the cost, because
-    # that is the order in which it matters: what was decided, what that turns
-    # into in shares, and what it cost to find out.
-    plan = state.order_plan
-    if plan is not None:
-        print(plan.render())
-        if plan.blocked:
-            print()
-            print("  VETOED BY PYTHON. The fund manager approved this and the")
-            print("  compliance node blocked it -- which is the design (§9),")
-            print("  not a malfunction.")
-        print()
+    rendered = render_run(state).split("\n")
+    print("\n".join(rendered[2:]))
 
-    spend = sum(r.usd for r in state.llm_calls)
-    attempts = len(state.llm_calls)
-    repairs = sum(1 for r in state.llm_calls if r.parse_failed)
-    wall = sum(r.latency_ms or 0 for r in state.llm_calls) / 1000
-    print(f"{attempts} model call(s), {repairs} repair turn(s), "
-          f"{wall:.1f}s of inference, ${spend:.4f}")
+    # The one thing a replayed run cannot honestly show: the budget CAPS live
+    # in models.yaml, not the journal, so only a live run knows what was in
+    # force. render_run prints the spend; this adds the denominator.
     exhausted = budget.exhausted()
     print(f"budget: {budget.calls}/{budget.max_llm_calls} calls, "
           f"{budget.elapsed_s:.0f}/{budget.max_wall_s:.0f}s, "
@@ -763,6 +708,58 @@ def cmd_smoke(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# review -- read what already happened. No model, no network, no broker.
+# --------------------------------------------------------------------------- #
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    """Read recorded runs out of the decision journal (§1's source of truth).
+
+    Nine subcommands shipped before this one and none of them could read a past
+    run: `data/proposals/*.json` carries the decision but none of the
+    reasoning, and the journal is ~50KB per run.
+    """
+    from .runlog import read_runs, render_run, render_summary
+
+    settings = load_settings()
+    on = date.fromisoformat(args.date) if args.date else None
+
+    # Default to the single most recent run rather than the whole history: the
+    # overwhelmingly common question is "what did it just do".
+    last = args.last
+    if last is None and not (args.symbol or args.date or args.run_id):
+        last = 1
+
+    runs = read_runs(
+        settings.journal_dir,
+        symbol=args.symbol, on=on, run_id=args.run_id,
+        last=last, actionable=args.actionable,
+    )
+
+    if not runs:
+        where = settings.journal_dir
+        print(f"No matching runs in {where}.", file=sys.stderr)
+        if not where.exists():
+            print("That directory does not exist yet -- run `desk decide` "
+                  "first.", file=sys.stderr)
+        return 1
+
+    # One run gets the full treatment; several get a line each, because twenty
+    # full transcripts is not a listing.
+    if len(runs) == 1:
+        print(render_run(runs[0], full=args.full))
+        return 0
+
+    print(f"{len(runs)} run(s), newest first\n")
+    for state in runs:
+        print(f"  {render_summary(state)}")
+    print()
+    print("Pass --run-id <prefix> for one run in full, or --full with it for "
+          "every analyst and the raw model calls.")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # portfolio / candidates -- Stage 6, and neither touches IB or a model
 # --------------------------------------------------------------------------- #
 
@@ -898,6 +895,20 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--preset", default="all_local",
                        help="models.yaml preset (default all_local -- hosted is Stage 5)")
     smoke.set_defaults(func=cmd_smoke)
+
+    rev = sub.add_parser(
+        "review", help="read past runs out of the decision journal")
+    rev.add_argument("--symbol", default=None, help="only this symbol")
+    rev.add_argument("--date", default=None, help="only this decision date (YYYY-MM-DD)")
+    rev.add_argument("--run-id", default=None,
+                     help="run id or any prefix of one")
+    rev.add_argument("--last", type=int, default=None,
+                     help="at most N runs, newest first (default 1 with no filters)")
+    rev.add_argument("--actionable", action="store_true",
+                     help="only runs whose decision was a BUY or SELL")
+    rev.add_argument("--full", action="store_true",
+                     help="every analyst and the raw model calls, not just the summary")
+    rev.set_defaults(func=cmd_review)
 
     pf = sub.add_parser(
         "portfolio",
