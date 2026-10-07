@@ -141,12 +141,73 @@ def _dedup_latest_filed(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(best.values(), key=lambda r: r.get("end") or "")
 
 
+#: How far behind a *newer* alias the first-listed one may fall before it is
+#: treated as abandoned rather than merely reported on a different cadence.
+#:
+#: The two cases have to be told apart because the alias lists are not lists of
+#: synonyms. `REVENUE` is one measure spelled several ways, so any of its
+#: entries is as good as another. `SHARES` is a preference chain of *different*
+#: measures -- shares outstanding, then weighted-average diluted -- where
+#: order encodes which definition is wanted. Switching that for recency alone
+#: would silently redefine the metric.
+#:
+#: 400 days separates the measured cases cleanly. Genuine abandonments ran
+#: 821-4,018 days (NVDA revenue and capex, MSFT short-term debt, BRK.B and JPM
+#: cash, UNH equity, META and JPM interest). The false positives were NVDA and
+#: JPM `SHARES` at 181-182 days, which is not staleness at all -- it is a
+#: cover-page share count carrying a different as-at date from the statements.
+ALIAS_ABANDONED_DAYS = 400
+
+
 def _rows_for(facts: CompanyFacts, concepts: list[str]) -> list[dict[str, Any]]:
+    """Rows for the first-listed alias that has not been abandoned.
+
+    PREFERENCE ORDER WINS UNLESS THE CHOSEN ALIAS IS STALE BY OVER A YEAR.
+
+    Filers migrate between concepts and never backfill the spelling they left
+    behind, so an abandoned concept keeps a stub of old facts forever.
+    Returning the first alias that had *any* rows therefore locked onto
+    whichever concept the company had stopped using -- and because every
+    caller here (`ttm`, `annual`, `instant`, `instant_series`, `pair`) reads
+    through this one function, a single stale pick silently aged a whole block
+    of metrics.
+
+    Measured, which is the only reason this is known. NVDA reports revenue
+    under `Revenues` (121 facts, latest ending 2026-07-26) but also carries 18
+    `RevenueFromContractWithCustomerExcludingAssessedTax` facts that stop at
+    2022-01-30. That one is listed first because it is the modern ASC 606
+    spelling nearly every filer uses -- so AAPL and MSFT, where the first alias
+    *is* the current one, looked perfectly correct. NVDA is the inverted case:
+    TTM revenue came back as fiscal 2020's $10.9bn against 2026 gross profit of
+    $209bn, and the snapshot reported a 1,914% gross margin.
+
+    That shape is the danger rather than the loudness. A ratio wrong by 19x
+    still renders as a number, and the fundamentals analyst dutifully reasoned
+    about a "1,664% operating margin" instead of rejecting it.
+
+    Aliases are never merged into one series. Two concepts can have genuinely
+    different definitions, and stitching them yields a figure that appears in
+    no filing -- the same reasoning that makes `CompanyFacts.concept` commit to
+    a single unit rather than interleaving currencies.
+    """
+    candidates: list[tuple[str, list[dict[str, Any]]]] = []
     for name in concepts:
         rows = facts.concept(name)
         if rows:
-            return _dedup_latest_filed(rows)
-    return []
+            # ISO-8601 dates sort chronologically as plain strings.
+            candidates.append((max((row.get("end") or "") for row in rows), rows))
+    if not candidates:
+        return []
+
+    chosen_end, chosen = candidates[0]
+    freshest_end = max(end for end, _ in candidates)
+    if chosen_end and freshest_end:
+        behind = (date.fromisoformat(freshest_end) - date.fromisoformat(chosen_end)).days
+        if behind > ALIAS_ABANDONED_DAYS:
+            # Abandoned. Fall through to the first alias that is current, which
+            # keeps preference order among the remaining live candidates.
+            chosen = next(rows for end, rows in candidates if end == freshest_end)
+    return _dedup_latest_filed(chosen)
 
 
 def instant(facts: CompanyFacts, concepts: list[str], *, before: str | None = None) -> float | None:

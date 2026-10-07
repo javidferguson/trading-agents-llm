@@ -111,6 +111,15 @@ The live model tests are deselected from `make test` (they add ~30s and need
 Ollama up); `make test-smoke` runs them explicitly, and `make verify` includes
 them.
 
+`make test-smoke` sets `REQUIRE_SMOKE=1`, which turns "Ollama unavailable" from
+a skip into a failure. Without it the gate exited 0 on four skips — green
+without having loaded any weights. That is also how a container-only bug stayed
+hidden: the test resolved Ollama with the bare `Settings()` default of
+`127.0.0.1`, which is correct on the host and points at the container itself
+inside `dev`. Tests that reach a real service use `load_settings()`; the
+offline ones keep `Settings()` deliberately, so a local `.env` cannot change a
+result.
+
 ## Never run both IB Gateways at once
 
 This repo runs **its own** Gateway, `desk-ib-gateway`, started with `make

@@ -84,6 +84,33 @@ and nothing routes to it — so Stage 5 runs fully local at $0. What remains:
 - **Re-derive §12's cost table** against rates current at that time, as §12
   explicitly asks.
 
+## Concept aliases: abandonment is handled, semantics are not
+
+`_rows_for` now rejects an alias that is over 400 days behind a fresher one
+(`ALIAS_ABANDONED_DAYS`), which fixed eight stale metric blocks. Two cases in
+that sweep are only *arguably* right, because some alias lists are preference
+chains over genuinely different measures rather than lists of synonyms:
+
+- **`INTEREST` on a bank.** JPM stopped reporting `InterestExpense` in 2024-03
+  and reports `InterestIncomeExpenseNet` now, so the fall-through takes it —
+  but for a bank, gross interest expense and *net* interest income are
+  different quantities, and `interest_coverage` wants the former. Current and
+  arguably wrong beats two years stale and definitely wrong, so this is the
+  better default; it is not a correct answer. The fix is a per-metric notion of
+  which aliases are substitutable, which is more taxonomy modelling than
+  Stage 5 warranted.
+- **`SHARES` is deliberately left alone.** Shares outstanding vs
+  weighted-average diluted sit 181 days apart on NVDA and JPM, below the
+  threshold, so preference order still decides. That is the intended outcome —
+  the threshold exists precisely so a quarter of reporting lag cannot redefine
+  a metric — but it means the two concepts are never reconciled.
+
+Worth revisiting if a fundamentals metric looks wrong on a financial. The
+general lesson is recorded because it cost real time: **a ratio built from two
+concepts can be wrong by a large factor and still render as a plausible
+number**, and nothing downstream will reject it. NVDA reported a 1,914% gross
+margin and the analyst reasoned about it rather than refusing it.
+
 ## Smaller things
 
 - **`make gdelt-probe` has never run.** §7.5 flags a contradiction in GDELT's

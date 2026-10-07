@@ -9,24 +9,35 @@ real weights rather than against a stub that always complies. The second
 proves the repair turn works against a model that has actually just made a
 mistake, which is a different thing from a scripted reply.
 
-These skip when Ollama is not running or the model is not pulled, so the suite
-stays green in CI and on a laptop with no models. `make smoke` runs them
-explicitly and fails loudly if they are skipped.
+These skip when Ollama is not running or the model is not pulled, so `make
+test` stays green in CI and on a laptop with no models. `make test-smoke` sets
+`REQUIRE_SMOKE=1`, which turns that skip into a hard failure -- see below.
+
+SETTINGS COME FROM `load_settings()`, NOT `Settings()`. The offline tests
+construct `Settings()` directly and should: it is hermetic, so a developer's
+`.env` cannot change a test outcome. This module is the opposite case. It
+reaches a real daemon, so it has to resolve the address the way the application
+does, and the bare dataclass default is `http://127.0.0.1:11434`.
+
+Inside the `dev` container that default is wrong and wrong in the quietest
+possible way: 127.0.0.1 is the container itself, nothing is listening, and all
+four tests skipped while `make check-ollama` reported the daemon reachable at
+`host.docker.internal` in that same container. `make test-smoke` then exited 0
+on 4 skips -- the Stage 1 gate reporting success having never run a model.
 """
 
 from __future__ import annotations
 
 import json
+import os
 
 import httpx
 import pytest
 
-from research_desk.config import Settings, load_yaml
+from research_desk.config import load_settings, load_yaml
 from research_desk.llm.router import LLMRouter
 from research_desk.llm.structured import structured
 from research_desk.models.state import AnalystReport
-
-pytestmark = pytest.mark.smoke
 
 #: The profile Stage 1's gate names. Not deep_local -- the claim being tested
 #: is that an *8B* model is usable here, which is the whole §2 bet.
@@ -34,7 +45,7 @@ SMOKE_PROFILE = "quick"
 
 
 def _ollama_state() -> tuple[bool, str]:
-    settings = Settings()
+    settings = load_settings()
     model = load_yaml("models.yaml")["profiles"][SMOKE_PROFILE]["model"]
     try:
         response = httpx.get(f"{settings.ollama_base_url}/api/tags", timeout=5.0)
@@ -48,12 +59,28 @@ def _ollama_state() -> tuple[bool, str]:
 
 
 AVAILABLE, REASON = _ollama_state()
+
+# A GATE THAT CAN SKIP IS NOT A GATE. When these tests are asked for by name,
+# an unavailable model is a failure, not a pass -- otherwise `make test-smoke`
+# and `make verify` both report a green Stage 1 without having loaded weights.
+# Raising at import time surfaces as a collection error with a non-zero exit,
+# which is the loud outcome; `make test` leaves REQUIRE_SMOKE unset and still
+# skips cleanly.
+if not AVAILABLE and os.getenv("REQUIRE_SMOKE") == "1":
+    raise RuntimeError(
+        f"REQUIRE_SMOKE=1 but the Stage 1 gate cannot run: {REASON}. "
+        "`make check-ollama` shows whether the daemon is reachable from the "
+        "context you are in, which is usually the answer."
+    )
+
 pytestmark = [pytest.mark.smoke, pytest.mark.skipif(not AVAILABLE, reason=REASON)]
 
 
 @pytest.fixture
 async def router():
-    r = LLMRouter.from_config(Settings(), config=load_yaml("models.yaml"), preset="all_local")
+    r = LLMRouter.from_config(
+        load_settings(), config=load_yaml("models.yaml"), preset="all_local"
+    )
     yield r
     await r.aclose()
 

@@ -101,6 +101,80 @@ def test_concept_aliases_are_tried_in_order() -> None:
     assert fun.ttm(preferred, fun.REVENUE) == pytest.approx(520)
 
 
+def test_the_alias_with_current_data_beats_the_one_listed_first() -> None:
+    """NVDA's shape, and the reason a snapshot once claimed a 1,914% margin.
+
+    A filer that migrates between concepts never backfills the one it left, so
+    the abandoned spelling keeps a stub of old facts forever. Preference order
+    alone picked that stub and every metric downstream aged with it.
+    """
+    f = facts_from({
+        # The modern ASC 606 spelling -- listed first, abandoned in 2022.
+        "RevenueFromContractWithCustomerExcludingAssessedTax": [
+            year("2021-01-01", "2021-12-31", 11_000, "2022-02-01"),
+        ],
+        # Where this filer actually reports now.
+        "Revenues": [
+            quarter("2025-10-01", "2025-12-31", 70_000, "2026-01-30"),
+            quarter("2026-01-01", "2026-03-31", 75_000, "2026-04-30"),
+            quarter("2026-04-01", "2026-06-30", 80_000, "2026-07-30"),
+            quarter("2026-07-01", "2026-09-30", 85_000, "2026-10-01"),
+        ],
+    })
+    # Not 11,000 -- the stale alias must not win merely by being listed first.
+    assert fun.ttm(f, fun.REVENUE) == pytest.approx(310_000)
+
+
+def test_aliases_are_never_merged_into_one_series() -> None:
+    """Two concepts can mean different things; stitching them invents a figure
+    that appears in no filing. The loser contributes nothing, not even for a
+    period the winner is missing."""
+    f = facts_from({
+        "RevenueFromContractWithCustomerExcludingAssessedTax": [
+            year("2021-01-01", "2021-12-31", 11_000, "2022-02-01"),
+        ],
+        "Revenues": [
+            year("2025-01-01", "2025-12-31", 90_000, "2026-02-01"),
+        ],
+    })
+    rows = fun._rows_for(f, fun.REVENUE)
+    assert [r["val"] for r in rows] == [90_000]
+    # The prior year is absent rather than borrowed from the other concept, so
+    # a YoY that would have been +718% is reported unavailable instead.
+    assert fun.annual(f, fun.REVENUE, offset=1) is None
+
+
+def test_a_quarter_of_reporting_lag_does_not_redefine_the_metric() -> None:
+    """The counterweight to the test above, and the reason this is a threshold
+    rather than plain recency.
+
+    `SHARES` is not a list of synonyms -- it is shares outstanding first, then
+    weighted-average diluted, two different measures ordered by which one the
+    metric actually wants. NVDA and JPM report the cover-page share count with
+    an as-at date ~181 days behind the statements, so "newest wins" would have
+    quietly swapped the definition on both. Only abandonment, not cadence,
+    may override preference order.
+    """
+    f = facts_from({
+        "CommonStockSharesOutstanding": [point("2026-01-25", 24_000, "2026-02-20")],
+        "WeightedAverageNumberOfDilutedSharesOutstanding":
+            [point("2026-07-26", 24_900, "2026-08-20")],
+    })
+    assert fun.instant(f, fun.SHARES) == pytest.approx(24_000)
+
+
+def test_recency_selection_applies_to_instants_too() -> None:
+    """The same inversion was measured on CASH and EQUITY, where the values are
+    balance-sheet instants rather than durations -- UNH's equity alias was
+    4,018 days stale."""
+    f = facts_from({
+        "StockholdersEquity": [point("2015-06-30", 1_000, "2015-07-30")],
+        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest":
+            [point("2026-06-30", 95_000, "2026-07-30")],
+    })
+    assert fun.instant(f, fun.EQUITY) == pytest.approx(95_000)
+
+
 # --------------------------------------------------------------------------- #
 # Instants vs durations -- the bug that reached real data
 # --------------------------------------------------------------------------- #

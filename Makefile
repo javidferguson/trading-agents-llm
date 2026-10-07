@@ -40,6 +40,18 @@ RUN = $(COMPOSE) run --rm --no-deps dev
 IN  = container
 endif
 
+# As RUN, but with REQUIRE_SMOKE=1 set, which turns the live-model tests' skip
+# into a hard failure (see tests/llm/test_smoke_ollama.py). Compose does not
+# forward host environment to `run` unless asked, so the container form needs
+# an explicit -e rather than a `VAR=1 make ...` prefix, which would be
+# silently dropped at the container boundary -- the same class of mistake the
+# gate itself exists to catch.
+ifdef HOST
+RUN_SMOKE = REQUIRE_SMOKE=1 $(UV) run
+else
+RUN_SMOKE = $(COMPOSE) run --rm --no-deps -e REQUIRE_SMOKE=1 dev
+endif
+
 # --env-file is not optional here. Compose resolves ${VAR} interpolation against
 # a .env in the PROJECT directory, which defaults to the first -f file's parent
 # -- docker/, not the repo root. Without this the Langfuse init keys silently
@@ -190,7 +202,7 @@ smoke:  ## THE STAGE 1 GATE: a real AnalystReport from a local 8B model
 
 .PHONY: test-smoke
 test-smoke:  ## Run the live model tests, failing if they are skipped
-	$(RUN) pytest tests/llm/test_smoke_ollama.py -p no:randomly -q -rs -m smoke
+	$(RUN_SMOKE) pytest tests/llm/test_smoke_ollama.py -p no:randomly -q -rs -m smoke
 
 # --------------------------------------------------------------------------- #
 # Containers
@@ -265,7 +277,11 @@ verify:  ## Run the whole Stage 0 gate in order, stopping at the first failure
 	@$(MAKE) --no-print-directory config-check
 	@echo
 	@echo "=== 2/7  tests ============================================="
-	@$(UV) run pytest -q
+	@# Via the target, not $(UV) directly: this step used to run on the host
+	@# even in container mode, one line after announcing "running in:
+	@# container". A gate that reports a context it did not use is the same
+	@# defect as one that passes without running.
+	@$(MAKE) --no-print-directory test
 	@echo
 	@echo "=== 3/7  environment ======================================="
 	@$(MAKE) --no-print-directory doctor
