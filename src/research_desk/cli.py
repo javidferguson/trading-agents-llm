@@ -154,6 +154,18 @@ def _check_gateway(settings: Any) -> bool:
     conflict = _orb_gateway_detected()
     tried = ", ".join(f"{h}:{p}" for h, p in candidates)
 
+    if conflict == ORB_UNKNOWN:
+        # Not folded into "not reachable": that would claim the other Gateway
+        # is absent on the strength of a check that never ran. This is the
+        # normal result inside the container, where the guard cannot see the
+        # host's Docker daemon or its loopback.
+        _line(WARN, "ib gateway", f"ours is down ({tried})")
+        print("         Whether the ORB+GEX Gateway is up could NOT be determined")
+        print("         from here -- that check reads host state, so it does not")
+        print("         work inside the container. On the host:")
+        print("           make check-gateway")
+        return False
+
     if conflict:
         _line(WARN, "ib gateway", f"ours is down, but the ORB+GEX Gateway IS up ({conflict})")
         print("         Both use the same IB credentials and one username supports")
@@ -167,24 +179,44 @@ def _check_gateway(settings: Any) -> bool:
     return False
 
 
+#: What ``_orb_gateway_detected`` returns when the guard could not look.
+#: A distinct value, because "no conflict" and "could not tell" have opposite
+#: meanings for a safety check and were previously the same ``None``.
+ORB_UNKNOWN = "__unknown__"
+
+
 def _orb_gateway_detected() -> str | None:
-    """Describe the ORB+GEX Gateway if it is running, else None.
+    """Describe the ORB+GEX Gateway if it is running.
+
+    Returns its description on a conflict, ``None`` when there is genuinely no
+    conflict, and ``ORB_UNKNOWN`` when the guard could not determine either.
 
     Delegates to the standalone guard so there is one definition of "the other
     Gateway is up" rather than two that can drift.
+
+    **The three-way return is the fix for a silent fail-open.** This used to
+    map every non-conflict exit code to ``None``, which folded exit 2 ("could
+    not tell") into exit 0 ("clear"). Inside the container that is always the
+    outcome -- the guard has no Docker socket and its port probe reads the
+    container's own loopback -- so `desk doctor`, which runs in the container by
+    default, could never report an ORB conflict and said "not reachable"
+    instead. A guard that cannot see must say so: the whole point is that two
+    Gateways on one IB username evict each other.
     """
     script = REPO_ROOT / "scripts" / "check_gateway_exclusive.py"
     if not script.exists():
-        return None
+        return ORB_UNKNOWN
     try:
         result = subprocess.run(
             [sys.executable, str(script), "--quiet"],
             capture_output=True, text=True, timeout=20,
         )
     except (subprocess.SubprocessError, OSError):
+        return ORB_UNKNOWN
+    if result.returncode == 0:
         return None
     if result.returncode != 1:
-        return None
+        return ORB_UNKNOWN
     for line in result.stderr.splitlines():
         stripped = line.strip()
         if stripped.startswith("- "):

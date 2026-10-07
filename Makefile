@@ -52,6 +52,21 @@ else
 RUN_SMOKE = $(COMPOSE) run --rm --no-deps -e REQUIRE_SMOKE=1 dev
 endif
 
+# ALWAYS the host, container default or not. For the few commands that inspect
+# the host itself -- the Docker daemon, or a port on the host's loopback -- and
+# are therefore meaningless anywhere else.
+#
+# `make gateway-start` was broken by routing one of these through $(RUN):
+# scripts/check_gateway_exclusive.py shells out to `docker ps`, the dev service
+# has no Docker CLI and no socket, so the check exited 2 ("could not tell") and
+# took the target down with it. Worse, its port probe did not fail -- inside a
+# container 127.0.0.1:4002 is the container's own loopback, so it cheerfully
+# reported the host's port clear without having looked at it.
+#
+# The rest of gateway-start was already host-native ($(COMPOSE), not $(RUN)),
+# which is what made the one container call easy to miss.
+HOST_RUN = $(UV) run
+
 # --env-file is not optional here. Compose resolves ${VAR} interpolation against
 # a .env in the PROJECT directory, which defaults to the first -f file's parent
 # -- docker/, not the repo root. Without this the Langfuse init keys silently
@@ -130,7 +145,10 @@ check-ollama:  ## Curl Ollama /api/tags from inside the container -- the only vi
 
 .PHONY: check-gateway
 check-gateway:  ## Is our Gateway up? And is the ORB engine's conflicting?
-	@$(RUN) python scripts/check_gateway_exclusive.py || true
+	@# HOST_RUN, not RUN: both of this script's checks read host state. See the
+	@# HOST_RUN comment at the top. `|| true` stays because this target is a
+	@# report -- it prints the conflict rather than failing on it.
+	@$(HOST_RUN) python scripts/check_gateway_exclusive.py || true
 	@nc -z -G 3 127.0.0.1 $${IB_HOST_PORT:-4012} 2>/dev/null \
 		&& echo "ok   desk-ib-gateway reachable on 127.0.0.1:$${IB_HOST_PORT:-4012}" \
 		|| echo "warn desk-ib-gateway not running. \`make gateway-start\`. Not needed until Stage 7."
@@ -141,7 +159,10 @@ check-gateway:  ## Is our Gateway up? And is the ORB engine's conflicting?
 
 .PHONY: gateway-start
 gateway-start:  ## Start this project's IB Gateway (refuses if the ORB one is up)
-	@$(RUN) python scripts/check_gateway_exclusive.py
+	@# HOST_RUN, and no `|| true`: this one is a GATE, not a report. One IB
+	@# username supports one Gateway session, so a check that cannot see the
+	@# other Gateway must stop the start rather than shrug.
+	@$(HOST_RUN) python scripts/check_gateway_exclusive.py
 	@grep -qE '^IB_USERNAME=.+' .env \
 		|| { echo "IB_USERNAME is empty in .env -- the Gateway will start and sit"; \
 		     echo "on the login screen forever. Fill it in first."; exit 1; }

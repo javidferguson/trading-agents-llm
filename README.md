@@ -161,6 +161,24 @@ Host ports are deliberately different so a connection is never ambiguous:
 | ORB+GEX `ajj-ib-gateway` | 4002 | 5900 |
 | Research desk `desk-ib-gateway` | **4012** | **5912** |
 
+**The exclusivity guard is the one thing here that always runs on the host, and
+it is the exception to "containers are the default."** Both of its checks read
+host state: `docker ps` needs the Docker CLI and a mounted socket, which the
+`dev` service deliberately does not have, and `127.0.0.1:4002` inside a
+container is the *container's* loopback rather than the host's. The Makefile
+uses `$(HOST_RUN)` for it, and `tests/test_gateway_exclusive.py` fails the build
+if that ever reverts to `$(RUN)`.
+
+It was routed through the container once, which broke `make gateway-start` with
+a compose error and a message that said only "could not ask Docker". The subtler
+half is why the redundancy did not save it: the container check *abstained*, but
+the port check *answered* — about the wrong loopback. Two checks are only
+independent if both can see the thing they are checking.
+
+`desk doctor` runs in the container by default, so it cannot evaluate this guard
+either. It now says so explicitly instead of reporting the Gateway as merely
+unreachable, which had made a missing safety check look like an absent one.
+
 ## Known gaps
 
 [`FOLLOWUPS.md`](FOLLOWUPS.md) lists what is deliberately missing and what

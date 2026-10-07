@@ -27,6 +27,20 @@ misses a Gateway started outside Docker or under another name, and the port
 check misses a container whose ports are not published. Neither alone is
 sufficient; either alone is conclusive.
 
+**THIS SCRIPT IS HOST-ONLY, AND NOT BY ACCIDENT.** Both of its checks read
+things a container cannot see:
+
+* ``docker ps`` needs the Docker CLI and a mounted socket. The ``dev`` service
+  has neither, on purpose -- a decide/execute container with the host's Docker
+  socket is a far bigger hole than this check is worth.
+* ``127.0.0.1:4002`` inside a container is the *container's* loopback, not the
+  host's. The probe does not fail there, which is worse: it succeeds and
+  reports "clear" about the wrong machine.
+
+So in a container both checks are void and this script says so and exits 2,
+rather than reporting a reassuring answer about a namespace nobody cares about.
+``make gateway-start`` runs it on the host for exactly this reason.
+
 Deliberately stdlib-only and importing nothing from ``research_desk``, so it
 runs from a Makefile before any environment exists.
 
@@ -40,6 +54,7 @@ import shutil
 import socket
 import subprocess
 import sys
+from pathlib import Path
 
 #: The ORB+GEX engine's Gateway container.
 OTHER_CONTAINER = "ajj-ib-gateway"
@@ -49,6 +64,27 @@ OTHER_HOST_PORT = 4002
 
 OUR_CONTAINER = "desk-ib-gateway"
 OUR_HOST_PORT = 4012
+
+
+def in_container() -> bool:
+    """Are we inside a container, where neither of this script's checks works?
+
+    ``/.dockerenv`` is written by the Docker runtime and is the cheapest
+    reliable signal. The cgroup fallback covers runtimes that do not create it
+    (podman, and Docker under some cgroup v2 configurations).
+
+    A false negative here is harmless -- the message simply stays generic. A
+    false positive would be worse, so neither check looks at anything as soft
+    as a hostname or an environment variable.
+    """
+    if Path("/.dockerenv").exists():
+        return True
+    try:
+        cgroup = Path("/proc/1/cgroup").read_text()
+    except OSError:
+        # No procfs: macOS or Windows, i.e. a host.
+        return False
+    return any(marker in cgroup for marker in ("docker", "containerd", "kubepods"))
 
 
 def _container_running(name: str) -> bool | None:
@@ -84,10 +120,33 @@ def check() -> tuple[int, list[str]]:
 
     if not container and not port:
         if container is None:
+            if in_container():
+                # The original message said only "could not ask Docker", which
+                # is true and useless: it does not say that the reason is where
+                # you are standing. `make gateway-start` failed on exactly this
+                # and the compose output on screen was about the wrong thing.
+                return 2, [
+                    "This check cannot run inside a container, and it was.",
+                    "",
+                    "  - `docker ps` needs the Docker CLI and a mounted socket;",
+                    "    the dev service has neither, deliberately.",
+                    f"  - 127.0.0.1:{OTHER_HOST_PORT} in here is the CONTAINER's",
+                    "    loopback, not the host's, so a clear port proves nothing.",
+                    "",
+                    "Both checks read host state, so run it on the host:",
+                    "",
+                    "    make check-gateway",
+                    "    uv run python scripts/check_gateway_exclusive.py",
+                ]
             return 2, [
                 "Could not ask Docker whether the ORB+GEX Gateway is running.",
                 f"Port {OTHER_HOST_PORT} is clear, but that alone is not proof.",
-                "Check by hand before starting this project's Gateway.",
+                "",
+                "Docker is not on PATH, or the daemon refused the query. If it",
+                "is not running, start it; otherwise check by hand before",
+                "starting this project's Gateway:",
+                "",
+                f"    docker ps --filter name={OTHER_CONTAINER}",
             ]
         return 0, [
             f"ok   no conflict: {OTHER_CONTAINER} is not running and "
