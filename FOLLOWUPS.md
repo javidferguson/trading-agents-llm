@@ -319,3 +319,118 @@ returning `None` — which `providers/edgar.py` is explicit is *"an answer, not 
 failure"*. Harmless today, actively misleading to anyone adding a symbol by
 hand, and directly in the way of automating that. Either wire them up or delete
 them; leaving them is the worst of the three.
+
+## GDELT: what is left, as of 2026-10-07
+
+The universe widened to 32 collected symbols and the API put this IP in a
+sustained throttle partway through. Three things remain, in this order.
+
+**1. Verify two queries BEFORE their first collection.** `TEM` and `AMD` are
+the only new symbols whose `gdelt_query` was never checked with `--inspect`:
+
+```bash
+uv run python scripts/gdelt_collect.py --inspect TEM
+uv run python scripts/gdelt_collect.py --inspect AMD
+```
+
+Order matters and is not a preference. `collect_symbol` warns on a changed
+query because the query *defines what the series measures*, and splicing two
+measurements into one history is invisible downstream. Fix first, collect
+second. `universe.yaml` carries the same warning inline at the entries.
+
+This is not hypothetical: the first `V` query was
+`("Visa Inc" OR "Visa card" OR "Visa payments")`, which looked careful and
+returned Egyptian bank card launches, a World Cup economy story, and seven
+copies of a United Way community-funding piece. It was measuring card
+marketing. `CAT` was checked and is fine.
+
+**2. Backfill the 28 symbols with no history.**
+
+```bash
+uv run python scripts/gdelt_collect.py --days 90
+uv run python scripts/gdelt_collect.py --status     # expect 32/32, no gaps
+```
+
+Two requests per symbol covering the whole window in one call, so ~64 requests
+at one per five seconds -- **5-6 minutes**, not hours. The constraint is the
+throttle, not the volume: a sustained per-IP block survives the full backoff,
+and the collector says so and stops rather than extending it. Re-run
+opportunistically; it is idempotent and resumes.
+
+**3. Run `--probe-window`, which has still never run.**
+
+```bash
+uv run python scripts/gdelt_collect.py --probe-window
+```
+
+§7.5 flags a contradiction in GDELT's own documentation -- the API is described
+as searching "a rolling window of the last 3 months" while also referencing an
+index back to 1 January 2017 -- and asks explicitly for the real reachable
+`startdatetime` to be **measured** rather than trusted.
+
+Worth doing before scoping the conversational research agent above, because it
+decides one of that design's load-bearing constraints:
+
+* if the window really is ~3 months, a day not collected is gone and late
+  universe additions permanently cost history;
+* if more is reachable, late additions are backfillable and the strongest
+  objection to an agent that discovers symbols disappears.
+
+Write the answer and its date into §7.5, replacing the caveat.
+
+## Stage 7 residual
+
+### The exit gate still needs one human-placed trade
+
+Everything up to the gate is verified against the live paper account
+(`DUT052405`): connect, both `assert_paper_account` firings, reconciliation,
+a delayed bid/ask quote, the marketable limit, a real `whatIfOrder` (init margin
+9,845.94, commission 1.00 USD), and the full prompt. `execute --dry-run`
+declines and leaves no receipt.
+
+What remains is the part that cannot be automated by design -- typing the ticker:
+
+```bash
+desk decide --symbol TSM     # or whatever has headroom
+execute                      # then type the symbol
+```
+
+Then confirm in the log that the account was verified twice and that a parent
+LMT plus a child STP were both accepted.
+
+### The stop covers only the shares just bought
+
+`broker.build_orders` attaches a protective `STP` to every BUY, which is what
+makes sizing's `cap_risk` true rather than notional -- `per_trade_risk_pct /
+stop_dist` sizes every position on the arithmetic that the stop bounds the loss.
+
+**It protects the new shares only.** Add to a symbol that already has a stop and
+the account ends up with two stops rather than one for the whole position.
+Proper stop management means cancel-and-replace on every add, which needs order
+state the desk does not currently track, and is a real piece of work rather than
+another flag. Until it exists, adding to a held position leaves a stop ladder
+rather than a single protective level.
+
+### `config/portfolio.yaml` is no longer committed
+
+It is state, and from Stage 7 the broker owns it. It held an account balance in
+version control, and the one reason it was committed -- "so the Stage 6 gate is
+reproducible from a clone" -- stopped being true once the gate started building
+its own book from `scripts/seed_portfolio.py:SEED_BOOK` plus the bars cache.
+
+The suite now passes with the seeded book, the real book, or none. That
+separation was forced by the first real `execute` run: writing the account's
+actual (all-cash) book over the seed turned twelve Stage 6 tests red for reasons
+that had nothing to do with what they tested -- the third time in two days that
+a test depended on a file that moves.
+
+### The seeded book is fiction, and reconciliation says so
+
+The committed seed was $250,000 across fifteen positions. The real paper account
+is **$1,003,109.96 in cash with no positions at all**, so every proposal sized
+against the seed is refused by reconciliation -- correctly. Position sizes are
+roughly 4x larger against the real book, and with fifteen free slots almost
+everything is buyable.
+
+`make portfolio-seed` still installs the demo book, which is useful for working
+on `decide` without a Gateway. Just expect `execute` to refuse it.

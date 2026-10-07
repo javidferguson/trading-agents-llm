@@ -35,12 +35,50 @@ from research_desk.models.state import DecisionState, NodeError, RiskVerdict, Tr
 #:
 #: Wiring tests that do NOT want this coupling use their own fixture book --
 #: see `fixture_book()` in tests/graph/test_decision_graph.py.
-AS_OF = load_portfolio().as_of
+#: The seeded book's mark date, which is the newest cached bar. Derived rather
+#: than hardcoded: compliance treats marks dated after the decision as
+#: look-ahead bias and blocks, so a fixed date goes stale the moment `make bars`
+#: runs. (It was `load_portfolio().as_of` until that file became the broker's.)
+def _seed_as_of():
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "scripts" / "seed_portfolio.py"
+    spec = importlib.util.spec_from_file_location("seed_portfolio_asof", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["seed_portfolio_asof"] = module
+    spec.loader.exec_module(module)
+    try:
+        return module.seed().as_of
+    except SystemExit:
+        return date.today()
+
+
+AS_OF = _seed_as_of()
 
 
 def ctx(tmp_path) -> NodeContext:
     return NodeContext(settings=Settings(data_dir=tmp_path), as_of=AS_OF,
                        extras={"registry": None})
+
+
+@pytest.fixture(autouse=True)
+def _book(monkeypatch, seeded_book):
+    """Give the node the SEEDED book, not ``config/portfolio.yaml``.
+
+    The node calls ``load_portfolio()`` itself, so the fixture has to be
+    injected there. Without this the tests assert against the live account:
+    once Stage 7's ``execute`` wrote the real (all-cash) book over the seed,
+    four of them failed because the book had fifteen free slots and the symbol
+    they expected to be blocked by ``max_positions`` no longer was.
+
+    The file is state. The seed recipe is the fixture.
+    """
+    import research_desk.graph.nodes.compliance as node
+
+    monkeypatch.setattr(node, "load_portfolio", lambda **kw: seeded_book)
+    return seeded_book
 
 
 def proposal(action="BUY", weight=7.0, conviction=0.8) -> TraderProposal:
@@ -101,11 +139,13 @@ async def test_the_node_sizes_against_the_snapshots_fresh_price(tmp_path) -> Non
     assert patch["order_plan"].reference_price == pytest.approx(500.0)
 
 
-async def test_the_node_falls_back_to_the_books_mark(tmp_path) -> None:
+async def test_the_node_falls_back_to_the_books_mark(tmp_path, seeded_book) -> None:
+    """Which is the reason a ``Position`` stores a price at all: ``decide``
+    builds a snapshot for ONE symbol and has no quote for the others."""
     patch = await compliance(
         state(snapshot=snapshot(close=None)), ctx(tmp_path)
     )
-    expected = load_portfolio().get("TSM").last_price
+    expected = seeded_book.get("TSM").last_price
     assert patch["order_plan"].reference_price == pytest.approx(expected)
 
 

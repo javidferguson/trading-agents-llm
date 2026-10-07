@@ -157,17 +157,45 @@ def test_a_missing_file_is_an_error_not_an_empty_book(tmp_path) -> None:
 
 
 def test_the_shipped_book_loads_and_is_internally_consistent() -> None:
-    """The seeded book is committed, so the gate is reproducible from a clone."""
+    """``config/portfolio.yaml`` must always parse and self-agree.
+
+    Asserts the INVARIANTS, not a share count. The file is state: it holds
+    whatever the account holds, and from Stage 7 ``execute`` overwrites it from
+    the broker -- so an all-cash book with no positions is a perfectly valid
+    state, and one with fifteen is too. Tests that need a specific shape use
+    the ``seeded_book`` fixture instead (see conftest.py).
+    """
     from research_desk.intent.engine import load_portfolio
 
     pf = load_portfolio()
-    assert pf.position_count > 0
-    assert pf.cash > 0
+    assert pf.cash >= 0
     assert pf.equity == pytest.approx(pf.cash + pf.net_value)
     assert all(p.last_price > 0 for p in pf.positions)
-    # as_of is the oldest mark, which is what makes a refresh unable to reset
-    # the staleness clock.
-    assert pf.as_of == min(p.marked_on for p in pf.positions)
+    if pf.positions:
+        # as_of is the oldest mark, which is what makes a refresh unable to
+        # reset the staleness clock.
+        assert pf.as_of == min(p.marked_on for p in pf.positions)
+
+
+def test_the_seeded_fixture_book_has_the_shape_the_gate_needs(seeded_book) -> None:
+    """The properties scripts/seed_portfolio.py:SEED_BOOK exists to produce.
+
+    This is the fixture the Stage 6 gate asserts against, so if the recipe
+    stops producing a full book with headroom in it, the gate stops testing
+    what it was built for -- and would do so silently.
+    """
+    from research_desk.intent.engine import load_intent
+
+    intent = load_intent()
+    assert seeded_book.position_count == intent.risk.max_positions
+    assert seeded_book.cash > 0
+    assert seeded_book.equity == pytest.approx(
+        seeded_book.cash + seeded_book.net_value
+    )
+    # At least one symbol at the position cap, and one with real headroom.
+    weights = {p.symbol: seeded_book.weight_pct(p.symbol) for p in seeded_book.positions}
+    assert any(w >= intent.risk.max_position_pct - 0.1 for w in weights.values())
+    assert seeded_book.get("TSM") is not None, "TSM is the BUY-sizes case"
 
 
 def test_yaml_round_trip_preserves_every_number() -> None:

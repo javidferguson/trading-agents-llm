@@ -108,7 +108,7 @@ def test_conviction_has_no_effect_on_the_share_count(conviction: float) -> None:
     assert result.binding_cap == "requested"
 
 
-def test_the_live_tsm_decision_sizes_to_the_approved_weight() -> None:
+def test_the_live_tsm_decision_sizes_to_the_approved_weight(seeded_book) -> None:
     """Pinned to the run that produced this change, against the real book.
 
     The first live Stage 6 run: the drift table offered TSM 5.83%, the trader
@@ -118,10 +118,12 @@ def test_the_live_tsm_decision_sizes_to_the_approved_weight() -> None:
     applied twice, once as a judgement and once by the formula. It is +11 now,
     and the approved 4.5% is honoured.
     """
-    from research_desk.intent.engine import load_intent, load_portfolio
+    from research_desk.intent.engine import load_intent
 
     real_intent = load_intent()
-    real_book = load_portfolio()
+    # The SEEDED book, not config/portfolio.yaml: that file is state the broker
+    # owns from Stage 7 on. See tests/intent/conftest.py.
+    real_book = seeded_book
     drift = compute_gaps(real_intent, real_book, as_of=real_book.as_of)
     held = real_book.get("TSM")
 

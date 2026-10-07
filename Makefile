@@ -172,6 +172,17 @@ gateway-start:  ## Start this project's IB Gateway (refuses if the ORB one is up
 	@echo "will only see it over VNC:  open vnc://localhost:5912"
 	@echo "Watch progress with: make gateway-logs"
 
+.PHONY: execute
+execute:  ## THE STAGE 7 GATE: place an approved proposal. Needs a human and the Gateway.
+	@# `compose run` not `$(RUN)`: the confirmation gate reads stdin, so the
+	@# execute service sets stdin_open/tty. A closed stdin DECLINES rather than
+	@# proceeding, which is why this must not be run detached.
+	$(COMPOSE) --profile execute run --rm execute execute $(EXEC_ARGS)
+
+.PHONY: execute-list
+execute-list:  ## Which proposals are pending, and which already executed
+	$(COMPOSE) --profile execute run --rm execute execute --list
+
 .PHONY: gateway-stop
 gateway-stop:  ## Stop this project's IB Gateway. Never touches ajj-ib-gateway.
 	$(COMPOSE) --profile execute stop ib-gateway
