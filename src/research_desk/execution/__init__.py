@@ -13,7 +13,16 @@ import the submodule you need, explicitly::
     from research_desk.execution.journal import Journal   # no ib_async
     from research_desk.execution.safety import assert_paper_account  # ib_async
 
-Still to arrive, at Stage 7: ``confirmation.py`` (carried, renderer rewritten for
-``FinalDecision`` and gaining ``dissent``, ``invalidation`` and an ``expires_at``
-refusal) and ``broker.py``.
+As built at Stage 7:
+
+* ``confirmation.py`` -- carried from the ORB engine, renderer rewritten for
+  ``FinalDecision`` + ``OrderPlan``, and it now shows the ``dissent`` and the
+  ``invalidation`` §4 marks required *"because both surface in the confirmation
+  prompt"*. An expired proposal raises before a prompt is drawn.
+* ``broker.py`` -- the only module that calls ``placeOrder``. Marketable limit,
+  never market; ``assert_paper_account`` immediately before the order; a
+  protective stop attached to every BUY.
+* ``reconcile.py`` -- book versus account. A mismatch refuses rather than
+  warning, because the share count came from the book.
+* ``cli.py`` -- the ``execute`` entry point. Never scheduled (§15.8).
 """
