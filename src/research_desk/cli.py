@@ -727,13 +727,15 @@ def cmd_review(args: argparse.Namespace) -> int:
     # Default to the single most recent run rather than the whole history: the
     # overwhelmingly common question is "what did it just do".
     last = args.last
-    if last is None and not (args.symbol or args.date or args.run_id):
+    if last is None and not (
+        args.symbol or args.date or args.run_id or args.actionable or args.wanted
+    ):
         last = 1
 
     runs = read_runs(
         settings.journal_dir,
         symbol=args.symbol, on=on, run_id=args.run_id,
-        last=last, actionable=args.actionable,
+        last=last, actionable=args.actionable, wanted=args.wanted,
     )
 
     if not runs:
@@ -905,7 +907,12 @@ def build_parser() -> argparse.ArgumentParser:
     rev.add_argument("--last", type=int, default=None,
                      help="at most N runs, newest first (default 1 with no filters)")
     rev.add_argument("--actionable", action="store_true",
-                     help="only runs whose decision was a BUY or SELL")
+                     help="only runs whose FINAL decision was a BUY or SELL")
+    rev.add_argument("--wanted", action="store_true",
+                     help="only runs the PIPELINE wanted to act on, whatever "
+                          "Python did to them after. Use this for a sweep: "
+                          "--actionable hides everything the cadence limit "
+                          "rewrote to HOLD.")
     rev.add_argument("--full", action="store_true",
                      help="every analyst and the raw model calls, not just the summary")
     rev.set_defaults(func=cmd_review)

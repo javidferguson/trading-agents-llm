@@ -109,6 +109,13 @@ report.
   written to `data/proposals/`. `SYMBOL=NVDA make decide` for another name.
   Since Stage 6 the output also carries the `OrderPlan` — the share count, the
   four caps and which one bound, and any compliance violation.
+- `make decide-many SYMBOLS="TSM AMD"` / `make decide-all` — a **research
+  sweep**: `desk decide` once per symbol, independently, in one container.
+  `decide-all` is the whole 31-symbol universe at ~100s each, so **~50
+  minutes**. Safe because each run reads the book and never writes it. Past the
+  third actionable symbol the cadence limit vetoes the rest to HOLD — that is
+  the limit working, and `desk review --wanted` shows what the pipeline
+  actually decided.
 - `make review` — read past runs out of the decision journal: the decision, the
   order plan, the debate, the violations. `SYMBOL=TSM make review`, or
   `desk review --last 10` for a listing and `--full` for every analyst and the
@@ -176,6 +183,11 @@ other.
 3. **Approval requires typing the ticker**, a closed stdin declines, and an
    expired proposal refuses before a prompt is drawn. There is no flag that
    turns any of it off.
+4. **Compliance is re-run at execute time**, against the book as it is then.
+   The share count was sized at *decide* time, and reconciliation only proves
+   the book matches the broker — not that the order still passes the vetoes.
+   Those have the same answer only when nothing changed in between, which
+   batching and "decided this morning, executed after lunch" both break.
 
 ## Where a decision's artifacts land
 

@@ -414,3 +414,159 @@ def test_every_receipt_write_in_the_run_path_goes_through_the_guard() -> None:
         "_run calls write_receipt directly; use _receipt(dry_run=...) so a "
         "rehearsal leaves the proposal pending"
     )
+
+
+# --------------------------------------------------------------------------- #
+# The execute-time compliance re-check
+# --------------------------------------------------------------------------- #
+#
+# `rules.check` used to be called in exactly ONE place -- the decide graph. So
+# a proposal's share count was sized against the book at decide time and
+# `execute` never asked whether it still passed the vetoes.
+#
+# Reconciliation looks like it covers this and does not: it asks "does the book
+# match the broker?", never "does this order still pass against that book?".
+# The two have the same answer only when nothing changed in between.
+#
+# The concrete failure: execute A, it fills, book != broker so execute B is
+# refused, `make sync-book`, now book == broker so execute B PASSES
+# reconciliation -- and places a quantity computed when you held nothing, with
+# no limit re-evaluated. Repeat and you walk past max_positions one proposal at
+# a time, each sync making the check pass without the check happening.
+
+
+def _intent(**risk_overrides):
+    from research_desk.models.intent import PortfolioIntent
+
+    risk = {
+        "per_trade_risk_pct": 0.75, "default_stop_pct": 8.0,
+        "max_position_pct": 10.0, "max_sector_pct": 65.0,
+        "min_cash_pct": 10.0, "max_gross_exposure_pct": 95.0,
+        "max_positions": 2, "min_trade_usd": 500, "max_order_shares": 2000,
+        "max_adv_participation_pct": 2.0,
+        "earnings_blackout_days_before": 2, "earnings_blackout_days_after": 1,
+    }
+    risk.update(risk_overrides)
+    return PortfolioIntent.from_dict({
+        "objective": {"horizon_days": 60},
+        "risk": risk,
+        "universe": {"include": ["AAA", "BBB", "TSM"], "exclude": []},
+        "themes": [{"name": "T", "target_weight_pct": 15.0, "conviction": 0.8,
+                    "exemplars": ["AAA", "BBB", "TSM"]}],
+    })
+
+
+def _book(cash, **holdings):
+    from research_desk.models.portfolio import PortfolioSnapshot, Position
+
+    return PortfolioSnapshot(
+        as_of=date.today(), cash=cash,
+        positions=[
+            Position(symbol=s, quantity=q, avg_cost=p, last_price=p,
+                     marked_on=date.today())
+            for s, (q, p) in holdings.items()
+        ],
+    )
+
+
+def test_a_plan_that_breaches_max_positions_now_is_refused() -> None:
+    """Sized when there was room; executed when there is not.
+
+    The plan itself is untouched and still looks fine -- it is the BOOK that
+    moved. Only a re-check against the current book can see that.
+    """
+    from research_desk.intent import compliance as rules
+
+    intent = _intent(max_positions=2)
+    # Two positions already held, so opening a third breaches the limit.
+    book = _book(500_000.0, AAA=(100, 100.0), BBB=(100, 100.0))
+
+    sized_when_there_was_room = plan(symbol="TSM", quantity=10,
+                                     reference_price=100.0)
+    result = rules.check(
+        sized_when_there_was_room, decision(), intent, book,
+        as_of=date.today(), sectors={}, dollar_adv=None, earnings=None,
+        prior_decisions_today=0,
+    )
+
+    assert result.blocked
+    assert "max_positions" in [v.rule for v in result.blocking]
+    assert result.quantity == 0, "a blocked plan must carry no shares"
+
+
+def test_the_same_plan_passes_when_the_book_still_has_room() -> None:
+    """Guard against the re-check refusing everything."""
+    from research_desk.intent import compliance as rules
+
+    result = rules.check(
+        plan(symbol="TSM", quantity=10, reference_price=100.0),
+        decision(), _intent(max_positions=15), _book(500_000.0),
+        as_of=date.today(), sectors={}, dollar_adv=None, earnings=None,
+        prior_decisions_today=0,
+    )
+    assert not result.blocked
+    assert result.quantity == 10
+
+
+def test_decide_time_only_inputs_warn_rather_than_block() -> None:
+    """`execute` has no MarketSnapshot and no provider registry, so the ADV and
+    earnings checks cannot be evaluated there.
+
+    They must degrade to warnings. Blocking on data that is simply absent at
+    this stage would refuse every order, and the proposal already carries the
+    verdict from when the data existed.
+    """
+    from research_desk.intent import compliance as rules
+
+    result = rules.check(
+        plan(symbol="TSM", quantity=10, reference_price=100.0),
+        decision(), _intent(max_positions=15), _book(500_000.0),
+        as_of=date.today(), sectors={}, dollar_adv=None, earnings=None,
+        prior_decisions_today=0,
+    )
+    warned = [v.rule for v in result.warnings]
+    assert "adv_participation" in warned
+    assert not result.blocked, "an unevaluable check must not block"
+
+
+def test_the_recheck_runs_before_the_gate_is_drawn() -> None:
+    """**Placement in the flow, not merely presence.**
+
+    Same reasoning as reconciliation: do not render an approval screen for an
+    order that cannot be placed. Asserted on the source order rather than
+    behaviour, because the alternative is a live broker and a human.
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2]
+           / "src" / "research_desk" / "execution" / "cli.py").read_text()
+    body = src.split("async def _run(")[1]
+
+    recheck = body.index("rechecked = rules.check(")
+    reconcile = body.index("result = compare(")
+    gate = body.index("approved = gate.confirm(")
+
+    assert reconcile < recheck < gate, (
+        "the compliance re-check must sit AFTER reconciliation (it needs a book "
+        "that matches the broker) and BEFORE the gate (never prompt for an "
+        "order that cannot be placed)"
+    )
+
+
+def test_a_stale_plan_refusal_is_its_own_receipt_outcome() -> None:
+    """So `execute --list` can tell it apart from a decline or a veto."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2]
+           / "src" / "research_desk" / "execution" / "cli.py").read_text()
+    assert 'outcome="rejected_stale_plan"' in src
+
+
+def test_execute_actually_calls_the_checker() -> None:
+    """The regression guard. If this import disappears, the hole is back."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2]
+           / "src" / "research_desk" / "execution" / "cli.py").read_text()
+    assert "from ..intent import compliance as rules" in src
+    assert "rules.check(" in src

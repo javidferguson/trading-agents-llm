@@ -34,7 +34,7 @@ import asyncio
 import json
 import logging
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -418,7 +418,13 @@ async def _run(args: argparse.Namespace) -> int:
         render_rejection,
     )
     from ..config import load_yaml
-    from ..intent.engine import load_portfolio, portfolio_path
+    from ..intent import compliance as rules
+    from ..intent.engine import (
+        load_intent,
+        load_portfolio,
+        portfolio_path,
+        sector_map,
+    )
 
     settings = load_settings()
 
@@ -436,6 +442,7 @@ async def _run(args: argparse.Namespace) -> int:
         raise ProposalError(str(exc)) from exc
 
     book = load_portfolio()
+    intent = load_intent()
 
     # --- the broker ---------------------------------------------------------
     try:
@@ -514,6 +521,79 @@ async def _run(args: argparse.Namespace) -> int:
         parent, child = build_orders(plan, limit_price, stop)
 
         report = await preflight(ib, contract, parent)
+
+        # --- re-check compliance against the book AS IT IS NOW --------------
+        #
+        # The share count in this proposal was sized against the book at
+        # DECIDE time. Reconciliation above proved the book matches the broker;
+        # it did not ask whether the order still passes the vetoes. Those are
+        # different questions, and for a single symbol executed immediately
+        # they happen to have the same answer -- which is why this was missing.
+        #
+        # They diverge the moment anything changes in between: a fill from
+        # another proposal, a sweep that sized fifteen symbols against the same
+        # empty book, or simply deciding before lunch and executing after. The
+        # concrete failure was walking past max_positions one proposal at a
+        # time, each sync making reconciliation pass without the limit ever
+        # being re-evaluated.
+        #
+        # Runs BEFORE the gate, for the same reason reconciliation does: do not
+        # draw an approval screen for an order that cannot be placed.
+        rechecked = rules.check(
+            plan, decision, intent, book,
+            as_of=date.today(),
+            sectors=sector_map(),
+            # Both of these only exist at decide time. `check` degrades each to
+            # a WARN rather than a block when it cannot evaluate them, which is
+            # the honest behaviour: the proposal already carries the verdict
+            # from when the data was available.
+            #   dollar_adv -- came from the run's MarketSnapshot
+            #   earnings   -- needs the provider registry
+            dollar_adv=None,
+            earnings=None,
+            # Already enforced at decide time against the same journal, and
+            # re-counting here would veto the first execution of a legitimately
+            # decided proposal.
+            prior_decisions_today=0,
+        )
+
+        if rechecked.blocked:
+            rules_hit = ", ".join(v.rule for v in rechecked.blocking)
+            print()
+            print("=" * 72)
+            print("REJECTED -- THIS PROPOSAL NO LONGER PASSES COMPLIANCE.")
+            print("=" * 72)
+            for violation in rechecked.blocking:
+                print(f"  {violation.render()}")
+            print()
+            print("  It was compliant when `desk decide` wrote it. The book has")
+            print("  changed since -- a fill, a sync, or simply time -- and the")
+            print("  share count was computed against the older one.")
+            print()
+            print("  You are not being asked to approve it: the number on screen")
+            print("  is arithmetic over a book that no longer exists.")
+            print()
+            print("  Fix: re-run `desk decide` so the order is sized against what")
+            print("  the account holds now.")
+            print("=" * 72)
+
+            journal.write(
+                "compliance_recheck_failed", run_id=body.get("run_id", "?"),
+                symbol=decision.symbol, quantity=plan.quantity,
+                rules=[v.rule for v in rechecked.blocking],
+            )
+            _receipt(
+                path, dry_run=args.dry_run, outcome="rejected_stale_plan",
+                rules=[v.rule for v in rechecked.blocking],
+                limit_price=limit_price,
+            )
+            return 2
+
+        # Warnings the re-check surfaced that the original plan did not carry
+        # (an ADV check that can no longer be evaluated, say) are merged in so
+        # the human sees them on the gate rather than nowhere.
+        if rechecked.warnings:
+            plan = plan.model_copy(update={"violations": rechecked.violations})
 
         # --- the gate -------------------------------------------------------
         gate = RejectAllGate() if args.dry_run else CLIConfirmationGate()

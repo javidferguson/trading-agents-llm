@@ -358,3 +358,134 @@ def test_the_real_journal_is_readable() -> None:
         assert state.run_id and state.symbol
         assert render_summary(state)
         assert render_run(state)
+
+
+# --------------------------------------------------------------------------- #
+# Intent vs outcome: the sweep's whole reason for existing
+# --------------------------------------------------------------------------- #
+
+
+def verdict(action="BUY", **overrides):
+    from research_desk.models.state import RiskVerdict
+
+    body = {
+        "decision": "approve", "action": action, "conviction": 0.7,
+        "target_weight_pct": 0.0 if action == "HOLD" else 5.0,
+        "horizon_days": 45,
+        "rationale": "the committee is satisfied with the risk here",
+        "dissent": "a liquidity shock would hit this harder than the index",
+        "invalidation": "a close below the 200-day moving average at 389",
+    }
+    body.update(overrides)
+    return RiskVerdict(**body)
+
+
+def test_a_cadence_vetoed_buy_does_not_read_as_a_hold() -> None:
+    """**The reason a sweep needed this.**
+
+    `max_decisions_per_day` rewrites everything past the third actionable
+    symbol to HOLD, so a 31-symbol research sweep printed ~28 rows saying
+    "HOLD" when the fund manager had said BUY. That is the opposite of the
+    signal a sweep exists to produce, and the intent was in the journal the
+    whole time -- only the renderer dropped it.
+    """
+    plan = OrderPlan(
+        symbol="TSM", as_of=AS_OF, action="HOLD", quantity=0,
+        violations=[Violation(rule="max_decisions_per_day",
+                              message="3 other symbols already decided")],
+    )
+    state = run(
+        action="HOLD",
+        final_decision=decision("HOLD"),
+        risk_verdict=verdict("BUY"),
+        order_plan=plan,
+    )
+
+    line = render_summary(state)
+    assert "BUY->HOLD" in line, f"intent was dropped: {line}"
+    assert "VETOED:max_decisions_per_day" in line
+
+
+def test_an_unchanged_decision_shows_one_action_not_an_arrow() -> None:
+    """The arrow has to mean something. Showing `BUY->BUY` on every row would
+    make the rows where Python actually intervened invisible again."""
+    state = run(action="BUY", risk_verdict=verdict("BUY"))
+    line = render_summary(state)
+    assert "->" not in line
+    assert "BUY" in line
+
+
+def test_the_traders_proposal_is_the_intent_when_there_is_no_verdict() -> None:
+    """The --slice and --research graphs stop before the risk committee, so the
+    trader is the last word there."""
+    from research_desk.models.state import TraderProposal
+    from research_desk.runlog import wanted_action
+
+    proposal = TraderProposal(
+        action="SELL", conviction=0.6, target_weight_pct=2.0, horizon_days=30,
+        rationale="relative strength has deteriorated against the sector",
+        invalidation="a reclaim of the 50-day moving average",
+        strongest_counterargument="the fundamental trend is still intact",
+    )
+    state = run(action="HOLD", final_decision=decision("HOLD"),
+                trader_proposal=proposal)
+    assert wanted_action(state) == "SELL"
+    assert "SELL->HOLD" in render_summary(state)
+
+
+def test_a_run_with_no_proposal_at_all_has_no_intent() -> None:
+    from research_desk.runlog import wanted_action
+
+    state = run(action="HOLD", final_decision=decision("HOLD"),
+                trader_proposal=None)
+    assert wanted_action(state) is None
+    assert "->" not in render_summary(state)
+
+
+# --------------------------------------------------------------------------- #
+# The --wanted filter
+# --------------------------------------------------------------------------- #
+
+
+def test_wanted_finds_what_actionable_hides(tmp_path) -> None:
+    """These two filters must not be the same, and a sweep is where it shows.
+
+    `--actionable` reads ``final_decision`` -- so it hides exactly the rows a
+    research sweep is for, every symbol the cadence limit rewrote.
+    """
+    vetoed = OrderPlan(
+        symbol="TSM", as_of=AS_OF, action="HOLD", quantity=0,
+        violations=[Violation(rule="max_decisions_per_day", message="full")],
+    )
+    write(tmp_path,
+          run(run_id="placed", action="BUY", risk_verdict=verdict("BUY")),
+          run(run_id="vetoed", action="HOLD",
+              final_decision=decision("HOLD"),
+              risk_verdict=verdict("BUY"), order_plan=vetoed),
+          run(run_id="genuine-hold", action="HOLD",
+              final_decision=decision("HOLD"), risk_verdict=verdict("HOLD")))
+
+    actionable = {r.run_id for r in read_runs(tmp_path, actionable=True)}
+    wanted = {r.run_id for r in read_runs(tmp_path, wanted=True)}
+
+    assert actionable == {"placed"}
+    assert wanted == {"placed", "vetoed"}, (
+        "the vetoed BUY is what a sweep is looking for and --wanted must find it"
+    )
+    # And neither should surface a decision nobody wanted to act on.
+    assert "genuine-hold" not in wanted
+
+
+def test_wanted_falls_back_to_the_trader_when_no_verdict_exists(tmp_path) -> None:
+    from research_desk.models.state import TraderProposal
+
+    proposal = TraderProposal(
+        action="BUY", conviction=0.6, target_weight_pct=3.0, horizon_days=30,
+        rationale="relative strength is improving against the sector",
+        invalidation="a close below the 200-day moving average",
+        strongest_counterargument="momentum could reverse from here",
+    )
+    write(tmp_path, run(run_id="slice-run", action="HOLD",
+                        final_decision=decision("HOLD"),
+                        trader_proposal=proposal))
+    assert {r.run_id for r in read_runs(tmp_path, wanted=True)} == {"slice-run"}

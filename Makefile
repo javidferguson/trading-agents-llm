@@ -260,6 +260,22 @@ bars:  ## Fetch daily bars from IB into the cache (needs the Gateway up)
 	# resolve_ib_endpoint() probes both, so the command is identical either way.
 	$(RUN) python scripts/fetch_bars.py $(if $(SYMBOLS),--symbols $(SYMBOLS),)
 
+.PHONY: decide-many
+decide-many:  ## Research sweep over SYMBOLS="TSM AMD". One container, continues on failure.
+	@test -n "$(SYMBOLS)" || { \
+	  echo 'usage: make decide-many SYMBOLS="TSM AMD PLTR"'; \
+	  echo '       make decide-all                 # the whole universe'; exit 2; }
+	$(RUN) bash scripts/sweep.sh $(SYMBOLS)
+
+.PHONY: decide-all
+decide-all:  ## Research sweep over the WHOLE tradeable universe. ~50 MINUTES.
+	@# Per-symbol by design (architecture decision 3), so this is N independent
+	@# runs in one container. Each READS the book and never writes it, which is
+	@# what makes the sweep safe. Past the third actionable symbol the cadence
+	@# limit vetoes the rest to HOLD -- that is the limit working; use
+	@# `desk review --wanted` to see what the pipeline actually decided.
+	$(RUN) bash scripts/sweep.sh
+
 .PHONY: snapshot
 snapshot:  ## THE STAGE 2 GATE: every §7.1 metric for a symbol, no LLM
 	$(RUN) desk snapshot --symbol $${SYMBOL:-SPY}

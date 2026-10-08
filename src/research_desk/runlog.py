@@ -84,13 +84,22 @@ def read_runs(
     run_id: str | None = None,
     last: int | None = None,
     actionable: bool = False,
+    wanted: bool = False,
 ) -> list[DecisionState]:
     """Recorded runs, newest first.
 
     ``run_id`` matches by prefix, so a timestamp fragment is enough to find a
-    run without copying the whole id. ``actionable`` keeps only runs whose
-    final decision was a BUY or SELL -- the same definition the cadence check
-    uses, so "what did the desk actually do today" has one answer.
+    run without copying the whole id.
+
+    Two filters, and the difference matters in a sweep:
+
+    * ``actionable`` -- the FINAL decision was a BUY or SELL. The same
+      definition the cadence check uses, so "what did the desk actually do
+      today" has one answer.
+    * ``wanted`` -- the PIPELINE decided BUY or SELL, whatever Python did to it
+      afterwards. In a 31-symbol sweep the cadence limit rewrites most
+      actionable rows to HOLD, so ``actionable`` hides exactly the rows a
+      research sweep is for.
 
     A row that no longer validates against the current schema is skipped with a
     warning rather than raising. That is the honest behaviour for an
@@ -110,6 +119,13 @@ def read_runs(
             if actionable:
                 final = row.get("final_decision") or {}
                 if final.get("action") not in {"BUY", "SELL"}:
+                    continue
+            if wanted:
+                # Read the pre-veto intent straight off the row rather than
+                # validating the whole state first: the filter runs on every
+                # line of every file and most of them will not match.
+                verdict = row.get("risk_verdict") or row.get("trader_proposal") or {}
+                if verdict.get("action") not in {"BUY", "SELL"}:
                     continue
             try:
                 day.append(DecisionState.model_validate(row))
@@ -138,12 +154,41 @@ def _flat(text: str) -> str:
     return " ".join((text or "").split())
 
 
+def wanted_action(state: DecisionState) -> str | None:
+    """What the PIPELINE decided, before any Python veto rewrote it.
+
+    The fund manager's call when there is one (§3 node 13 is the decision;
+    everything before it is advice), otherwise the trader's.
+    """
+    if state.risk_verdict is not None:
+        return state.risk_verdict.action
+    if state.trader_proposal is not None:
+        return state.trader_proposal.action
+    return None
+
+
 def render_summary(state: DecisionState) -> str:
-    """One line per run, for a listing."""
+    """One line per run, showing INTENT and OUTCOME when they differ.
+
+    **Showing only ``final_decision`` was actively misleading in a sweep.**
+    The cadence limit rewrites everything past the third actionable symbol to
+    HOLD, so a 31-symbol research sweep printed ~28 rows reading "HOLD" when
+    the fund manager had said BUY. That is the opposite of the signal a sweep
+    exists to produce, and the data was already in the journal -- only the
+    renderer was dropping it.
+
+    So a vetoed run reads ``BUY->HOLD`` with the rule that did it, and a run
+    nobody overrode reads as a single action. The veto itself is untouched:
+    the report was the thing that was wrong.
+    """
     decision = state.final_decision
     plan = state.order_plan
 
-    action = decision.action if decision else "-"
+    outcome = decision.action if decision else "-"
+    wanted = wanted_action(state)
+    # Only show the arrow when something actually changed the answer.
+    action = f"{wanted}->{outcome}" if wanted and wanted != outcome else outcome
+
     shares = f"{plan.quantity:+d}" if plan and plan.quantity else ""
 
     flags = []
@@ -156,7 +201,7 @@ def render_summary(state: DecisionState) -> str:
 
     return (
         f"{state.as_of}  {state.run_id:<22} {state.symbol:<6} "
-        f"{action:<4} {shares:>6}  {' '.join(flags)}"
+        f"{action:<12} {shares:>6}  {' '.join(flags)}"
     ).rstrip()
 
 
@@ -311,4 +356,5 @@ __all__ = [
     "read_runs",
     "render_run",
     "render_summary",
+    "wanted_action",
 ]

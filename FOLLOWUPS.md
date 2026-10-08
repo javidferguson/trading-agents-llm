@@ -575,3 +575,49 @@ names the deeper check. `make gateway-session` does a real `managedAccounts()`
 round-trip and prints the account, the positions and NetLiquidation. It lives in
 `execute` because that is the only process permitted to import `ib_async`, which
 is also why `desk doctor` keeps its bare TCP connect.
+
+## Sweeps accumulate expired proposals
+
+A full `make decide-all` writes 31 proposals, and `cadence.proposal_ttl_hours`
+is 18 -- so by the next morning every one of them is expired. That is the TTL
+doing its job and is what makes "sweep today, trade tomorrow" safe: tomorrow's
+trades come from tomorrow's sweep, and today's thinking cannot be executed by
+accident once it is stale.
+
+The side effect is that `data/proposals/` grows by ~31 files a day and
+`execute --list` grows a long EXPIRED section. Nothing breaks -- `assert_actionable`
+refuses an expired proposal before touching the network -- but the listing stops
+being scannable.
+
+**Follow-up: `make prune-proposals`.** Delete proposals that are expired AND
+have no receipt, keeping anything that was acted on. Receipts are the audit
+trail and must survive; an expired never-executed proposal is just noise. Worth
+a `--keep-days N` so a week of history stays browsable.
+
+Deliberately not built yet: it deletes files, and the right retention policy is
+clearer after a few weeks of real sweeps than it is now.
+
+## A batch executor is possible now, and still deliberately absent
+
+The prerequisite is done -- `execute` re-runs `rules.check` against the live
+book before the gate, so an order that was compliant when written and is not now
+gets refused rather than placed. That was the missing safety property, and it
+closes the specific hole where syncing the book made reconciliation pass without
+the limits ever being re-evaluated.
+
+What is still missing is not safety but *design*: `execute --all` would be a loop
+placing multiple real orders, and the confirmation gate would have to become
+per-order or stop being a gate. "Type the ticker thirty times" is not a gate
+either -- it is a gate people learn to defeat. Options worth thinking about
+before building anything:
+
+* one confirmation listing every order, approved as a batch, with the re-check
+  run per order against a running book and the whole batch refused if any order
+  fails
+* sequential with a per-order gate, which is honest but is thirty prompts
+* a "plan" artefact the human approves once, after which execution is
+  mechanical -- closest to how a real desk works, and the furthest from what
+  exists today
+
+Not urgent: executing one symbol at a time with `make sync-book` between is
+correct, and the re-check now makes it safe even when the book has moved.
