@@ -289,8 +289,18 @@ decide:  ## THE STAGE 3 GATE: a real decision end to end -> proposal.json
 # --------------------------------------------------------------------------- #
 
 .PHONY: review
-review:  ## Read past runs out of the decision journal. No model, no network.
-	$(RUN) desk review $(if $(SYMBOL),--symbol $(SYMBOL),) $(if $(LAST),--last $(LAST),)
+review:  ## Read past runs out of the journal. WANTED=1 after a sweep. No model.
+	@# WANTED=1 is the one you want after `decide-all`: past the third
+	@# actionable symbol the cadence limit rewrites everything to HOLD, so
+	@# --actionable hides exactly the rows the sweep exists to produce.
+	$(RUN) desk review \
+	  $(if $(SYMBOL),--symbol $(SYMBOL),) \
+	  $(if $(LAST),--last $(LAST),) \
+	  $(if $(DATE),--date $(DATE),) \
+	  $(if $(RUN_ID),--run-id $(RUN_ID),) \
+	  $(if $(WANTED),--wanted,) \
+	  $(if $(ACTIONABLE),--actionable,) \
+	  $(if $(FULL),--full,)
 
 .PHONY: portfolio
 portfolio:  ## THE STAGE 6 GATE (part 1): the book and the drift table, no LLM, no broker
