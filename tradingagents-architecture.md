@@ -1426,6 +1426,30 @@ took its own Gateway (migration plan §0, revised). All measured, none obvious:
    reflection rows is exact, instant, and one fewer container.
 8. **Do not schedule `execute`.** `decide` on a cron is fine; `execute` must be
    human-initiated, always.
+
+   > **As built at Stage 7, after the batch executor.** `execute --all` places
+   > a whole sweep's worth of orders in one invocation, which is exactly the
+   > shape that tempts someone to cron it. It is not schedulable and it was not
+   > made so: it reads stdin **twice over** -- once for the batch review word,
+   > then once per order for that order's ticker -- and a closed stdin declines
+   > at every one of them. The gate class is the same `CLIConfirmationGate` a
+   > single order uses, unmodified, and `--yes --all` is **refused** rather
+   > than ignored, because a flag quietly having no effect leaves the operator
+   > believing something false about what just ran.
+   >
+   > What the batch adds is not fewer approvals but **a book that advances**.
+   > Five of `compliance.check`'s rules read the post-trade state, so N orders
+   > checked against one pre-batch snapshot walk past `max_positions`,
+   > `min_cash_pct`, `max_gross_exposure_pct`, `max_sector_pct` and
+   > `max_position_pct` together. Each order is re-checked against the book as
+   > it is after the previous fill, advanced by `compliance.post_trade` using
+   > IB's own reported fill quantity. An order still working when the wait
+   > times out **stops the batch**: never size an order against one you cannot
+   > describe.
+   >
+   > It also shows the aggregate effect before anything is sent -- the one
+   > thing no sequence of per-order prompts can show, since each prompt only
+   > knows about itself.
 9. **Scope risk.** 14 nodes × prompts × 6 providers is a lot of surface. Build
    the Stage 3 vertical slice before anything else.
 10. **GEX cannot be backtested from IB** — expired contracts are removed from the

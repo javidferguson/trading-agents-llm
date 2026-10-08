@@ -389,30 +389,47 @@ def test_a_real_run_does_write_a_receipt(tmp_path) -> None:
     assert json.loads(receipt.read_text())["outcome"] == "declined"
 
 
-def test_every_receipt_write_in_the_run_path_goes_through_the_guard() -> None:
+def test_every_receipt_write_in_the_module_goes_through_the_guard() -> None:
     """A new outcome added later must not bypass the dry-run check.
 
     Asserted on the source because the alternative is noticing it the next time
     a dry run eats a proposal.
+
+    **This used to walk only the function literally named ``_run``**, which was
+    fine while ``_run`` was the only thing that wrote receipts and became a
+    hole the moment the batch executor split the per-order body out into
+    ``_execute_one``. A new write there would have bypassed the guard with this
+    test still green -- exactly the failure it exists to catch, one level up.
+    So it now walks the whole module and allow-lists the one definition that is
+    *supposed* to call the raw writer.
     """
     import ast
     from pathlib import Path
 
+    #: The only function permitted to call ``write_receipt`` directly -- it is
+    #: the guard.
+    GUARD = "_receipt"
+
     src = Path(cli.__file__)
     tree = ast.parse(src.read_text(), filename=str(src))
-    run = next(
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run"
-    )
-    direct = [
-        node for node in ast.walk(run)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "write_receipt"
-    ]
-    assert not direct, (
-        "_run calls write_receipt directly; use _receipt(dry_run=...) so a "
-        "rehearsal leaves the proposal pending"
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name == GUARD:
+            continue
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Name)
+                and inner.func.id == "write_receipt"
+            ):
+                offenders.append(f"{node.name}:{inner.lineno}")
+
+    assert not offenders, (
+        f"{', '.join(offenders)} call write_receipt directly; use "
+        "_receipt(dry_run=...) so a rehearsal leaves the proposal pending"
     )
 
 
@@ -529,6 +546,44 @@ def test_decide_time_only_inputs_warn_rather_than_block() -> None:
     assert not result.blocked, "an unevaluable check must not block"
 
 
+def _call_order(function: str) -> dict[str, int]:
+    """First line each named call appears on, inside one function of `cli.py`.
+
+    **AST rather than string indexes.** This assertion used to be
+    ``body.index("result = compare(") < body.index(...)`` over the text after
+    ``async def _run(``, which pinned the invariant to three exact statement
+    spellings *and* to all three living in one function. The batch executor
+    moved reconciliation into ``_reconcile`` and the per-order sequence into
+    ``_execute_one``, so the string form broke while the property it was
+    guarding held perfectly. Matching on call names states the actual rule and
+    survives a rename of the variable it is assigned to.
+    """
+    import ast
+    from pathlib import Path
+
+    src = Path(cli.__file__)
+    tree = ast.parse(src.read_text(), filename=str(src))
+    node = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and n.name == function
+    )
+
+    seen: dict[str, int] = {}
+    for inner in ast.walk(node):
+        if not isinstance(inner, ast.Call):
+            continue
+        func = inner.func
+        if isinstance(func, ast.Name):
+            name = func.id
+        elif isinstance(func, ast.Attribute):
+            name = func.attr
+        else:
+            continue
+        seen.setdefault(name, inner.lineno)
+    return seen
+
+
 def test_the_recheck_runs_before_the_gate_is_drawn() -> None:
     """**Placement in the flow, not merely presence.**
 
@@ -536,20 +591,36 @@ def test_the_recheck_runs_before_the_gate_is_drawn() -> None:
     order that cannot be placed. Asserted on the source order rather than
     behaviour, because the alternative is a live broker and a human.
     """
-    from pathlib import Path
+    order = _call_order("_execute_one")
+    assert order["check"] < order["confirm"], (
+        "the compliance re-check must run BEFORE the gate -- never prompt for "
+        "an order that cannot be placed"
+    )
+    assert order["confirm"] < order["place"], (
+        "nothing may be placed before the gate returns"
+    )
 
-    src = (Path(__file__).resolve().parents[2]
-           / "src" / "research_desk" / "execution" / "cli.py").read_text()
-    body = src.split("async def _run(")[1]
 
-    recheck = body.index("rechecked = rules.check(")
-    reconcile = body.index("result = compare(")
-    gate = body.index("approved = gate.confirm(")
+def test_reconciliation_runs_before_any_order_is_priced() -> None:
+    """The re-check needs a book that matches the broker, so this comes first.
 
-    assert reconcile < recheck < gate, (
-        "the compliance re-check must sit AFTER reconciliation (it needs a book "
-        "that matches the broker) and BEFORE the gate (never prompt for an "
-        "order that cannot be placed)"
+    Asserted for BOTH entry points. A batch reconciles once for the whole
+    session and then advances its own running book; if `_run_all` ever called
+    `_execute_one` before reconciling, every order in the batch would be sized
+    against a file nobody had checked.
+    """
+    single = _call_order("_run")
+    assert single["_reconcile"] < single["_execute_one"]
+
+    batch = _call_order("_run_all")
+    assert batch["_reconcile"] < batch["_execute_one"]
+    assert batch["_reconcile"] < batch["confirm_batch_review"], (
+        "do not draw the batch review over a book that disagrees with the "
+        "account -- its projected aggregate would be arithmetic over a wrong "
+        "starting point"
+    )
+    assert batch["confirm_batch_review"] < batch["_execute_one"], (
+        "the aggregate effect must be shown before the first order is offered"
     )
 
 

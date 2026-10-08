@@ -42,6 +42,7 @@ person can approve anyway.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
@@ -376,6 +377,174 @@ class RejectAllGate:
         return False
 
 
+# --------------------------------------------------------------------------- #
+# The batch review. One screen, nothing sent.
+# --------------------------------------------------------------------------- #
+
+#: What has to be typed to move from the batch review into the per-order gates.
+#: Its own word for the same reason ``REWRITE_WORD`` is: a ticker approves one
+#: order, and nothing should let one muscle-memory answer stand in for both a
+#: portfolio decision and a trade.
+REVIEW_WORD = "REVIEW"
+
+
+@dataclass(frozen=True)
+class BatchRow:
+    """One pending order as the review screen shows it.
+
+    Deliberately not a ``FinalDecision``/``OrderPlan`` pair: the screen needs a
+    notional estimate and the absent-analyst flag side by side, and building
+    that here keeps the renderer from reaching back into the proposal files.
+    """
+
+    symbol: str
+    action: str
+    quantity: int
+    notional: float
+    absent_analysts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class BatchProjection:
+    """The book before and after the whole batch, with the caps to read it against.
+
+    Computed by folding ``compliance.post_trade`` over every order, which is
+    the same function the per-order veto uses -- so the projection cannot
+    disagree with the checks that follow it.
+    """
+
+    cash_before: float
+    cash_after: float
+    cash_pct_after: float
+    cash_pct_floor: float
+    positions_before: int
+    positions_after: int
+    positions_cap: int
+    gross_before_pct: float
+    gross_after_pct: float
+    gross_cap_pct: float
+    #: sector -> (before_pct, after_pct, cap_pct). Only sectors the batch moves.
+    sectors: tuple[tuple[str, float, float, float], ...] = ()
+
+    @property
+    def breaches(self) -> tuple[str, ...]:
+        """Caps the projected state would cross. **Reported, never enforced here.**
+
+        The per-order ``rules.check`` against the running book is what blocks,
+        and it must stay the only thing that does -- two places that can veto
+        an order are two places that can disagree about why. This exists so the
+        human can stop before typing the first ticker rather than discovering
+        it at order four.
+        """
+        out: list[str] = []
+        if self.cash_pct_after < self.cash_pct_floor:
+            out.append("min_cash_pct")
+        if self.positions_after > self.positions_cap:
+            out.append("max_positions")
+        if self.gross_after_pct > self.gross_cap_pct:
+            out.append("max_gross_exposure_pct")
+        out += [f"max_sector_pct ({name})"
+                for name, _, after, cap in self.sectors if after > cap]
+        return tuple(out)
+
+
+def render_batch(rows: Sequence[BatchRow], projection: BatchProjection) -> str:
+    """The batch review screen. **Approves nothing.**
+
+    This is the only place the portfolio-level effect of a set of orders is
+    visible. Every order in the batch was sized and vetoed *in isolation*, so a
+    set of individually-compliant orders can still move the book somewhere
+    nobody chose -- five names in one theme, or a cash balance no single order
+    would have breached. A sequence of per-order prompts cannot show that, by
+    construction, because each one only knows about itself.
+    """
+    total = sum(r.notional for r in rows)
+    lines = [
+        "",
+        "=" * RULE,
+        f"BATCH REVIEW -- {len(rows)} order(s), NOTHING HAS BEEN SENT",
+        "=" * RULE,
+    ]
+    for row in rows:
+        flag = f"   partial:{','.join(row.absent_analysts)}" if row.absent_analysts else ""
+        lines.append(
+            f"  {row.symbol:<6} {row.action:<4} {row.quantity:+5d}"
+            f"   ~{row.notional:>12,.0f} USD{flag}"
+        )
+
+    def row(label: str, before: str, after: str, cap: str) -> str:
+        """One aggregate line. Columns are shared so the caps read down."""
+        return f"    {label:<20} {before:>12} -> {after:<10} {cap}"
+
+    lines += [
+        "",
+        "  AGGREGATE EFFECT ON THE BOOK",
+        f"    {'total notional':<20} {total:>12,.0f} USD",
+        row("cash", f"{projection.cash_before:,.0f}",
+            f"{projection.cash_after:,.0f}",
+            f"= {projection.cash_pct_after:.1f}% "
+            f"(floor {projection.cash_pct_floor:.1f}%)"),
+        row("positions", str(projection.positions_before),
+            str(projection.positions_after),
+            f"(max {projection.positions_cap})"),
+        row("gross exposure", f"{projection.gross_before_pct:.1f}%",
+            f"{projection.gross_after_pct:.1f}%",
+            f"(cap {projection.gross_cap_pct:.1f}%)"),
+    ]
+    for name, before, after, cap in projection.sectors:
+        lines.append(row(name[:20], f"{before:.1f}%", f"{after:.1f}%",
+                         f"(cap {cap:.1f}%)"))
+
+    if projection.breaches:
+        lines += [
+            "",
+            "  >> THE PROJECTED STATE WOULD CROSS: "
+            + ", ".join(projection.breaches),
+            "     Compliance is re-checked per order against the book as it",
+            "     actually is, so later orders will be REFUSED. Stop here and",
+            "     re-run `desk decide` against a current book instead. <<",
+        ]
+
+    lines += [
+        "",
+        "  Orders are offered in the sequence above, each with its own live",
+        "  price and its own prompt. When a cap binds, the earlier orders take",
+        "  the headroom. You can decline any one of them.",
+        "=" * RULE,
+    ]
+    return "\n".join(lines)
+
+
+def confirm_batch_review(rows: Sequence[BatchRow], projection: BatchProjection) -> bool:
+    """Show the batch, then ask only to *proceed to the order gates*.
+
+    **This is not an approval of any order**, and the prompt says so. Each
+    order still has to be approved by typing its ticker, through the same
+    ``CLIConfirmationGate`` a single-order run uses. The alternative -- one
+    token approving fifteen orders -- would make the ticker stand for a set
+    rather than a trade, which is the property the gate exists to hold.
+
+    A closed stdin stops the batch, like every other prompt in this module.
+    """
+    print(render_batch(rows, projection))
+    prompt = (
+        f"\nType {REVIEW_WORD} to go through these {len(rows)} order(s) one at "
+        "a time, or anything else to stop: "
+    )
+    try:
+        answer = input(prompt).strip().upper()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        logger.warning("No interactive input available; placing nothing.")
+        return False
+
+    if answer == REVIEW_WORD:
+        logger.info("Batch review accepted; %d order(s) to review", len(rows))
+        return True
+    logger.info("Batch stopped at the review screen (entered %r)", answer)
+    return False
+
+
 #: What has to be typed to overwrite the book from the broker. A different word
 #: from the ticker on purpose: it is a different action with a different
 #: consequence, and reusing the ticker would let one muscle-memory answer do
@@ -409,15 +578,20 @@ def confirm_rewrite(path: Any) -> bool:
 
 
 __all__ = [
+    "BatchProjection",
+    "BatchRow",
     "CLIConfirmationGate",
     "ConfirmationGate",
     "ExpiredProposalError",
     "Preflight",
+    "REVIEW_WORD",
     "REWRITE_WORD",
     "RULE",
     "RejectAllGate",
     "StaleBookError",
     "assert_not_expired",
+    "confirm_batch_review",
     "confirm_rewrite",
+    "render_batch",
     "render_decision",
 ]

@@ -25,6 +25,14 @@ nothing connects to a broker until the proposal is known to be worth acting on:
 **`execute` is never scheduled.** §15.8: *"Do not schedule `execute`."* A cron
 for `decide` is fine and intended; this one requires a person, which is the
 entire point of the confirmation gate.
+
+``--all`` does not change any of that. It reviews every actionable pending
+proposal in one screen, then walks them through step 6 onward **individually**,
+each with its own live price and its own typed ticker. What it adds over
+running the single-order path N times is a *running book*: each order is
+re-checked against the account as it is after the previous fill, because five
+of ``rules.check``'s rules read the post-trade state and handing each order the
+same pre-batch snapshot walks straight past all five. See ``_run_all``.
 """
 
 from __future__ import annotations
@@ -34,6 +42,7 @@ import asyncio
 import json
 import logging
 import sys
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -261,6 +270,161 @@ def _select(args: argparse.Namespace, directory: Path) -> Path:
     return fresh[0]
 
 
+def _select_all(
+    directory: Path,
+) -> list[tuple[Path, FinalDecision, OrderPlan]]:
+    """Every proposal a batch may act on, newest first, **one per symbol.**
+
+    Not ``_select`` in a loop: that returns ``[0]`` and deliberately keeps
+    receipted files so its refusal can explain itself. A batch needs the
+    opposite -- the set of things that *can* be placed -- so the filtering is
+    inverted here rather than bolted onto the single-order selector.
+
+    Dropped: receipted (already acted on), unreadable, expired, HOLD, blocked,
+    and zero-quantity. Each of those is a refusal ``assert_actionable`` would
+    raise for one proposal; in a batch they are simply not candidates, and
+    raising on the first one would make a single stale file hide fourteen good
+    orders.
+
+    **Deduplicated by symbol, newest wins, and that is a safety property.**
+    Two proposals for one symbol are two sizings of the same intent, not two
+    orders -- placing both doubles the position. It is not hypothetical: AMD
+    had pending proposals for ``+46`` and ``+77`` shares from two runs on the
+    same day. It also keeps a batch out of the known stop-management hole at
+    ``broker.py``'s header: the protective stop covers only the shares just
+    bought, so two orders in one symbol would leave two stops on one position.
+
+    **A symbol with ANY receipt is out of the batch entirely**, not merely that
+    one file. Found by running the first real rehearsal: AMD's newest proposal
+    (``+46``) had been executed, so dropping receipted files *first* left its
+    older sibling (``+77``) as the newest survivor -- and the batch offered to
+    buy 77 more shares of a position it had just opened, sized against a book
+    from before the fill. Dedupe-after-filter reintroduced exactly the
+    double-position the dedupe exists to prevent.
+
+    The rule reads the same way the receipt does: a receipt means *this symbol
+    has been acted on*, and every older proposal for it was sized against an
+    even older book. Re-run ``desk decide`` for a current one.
+    """
+    now = datetime.now()
+    out: list[tuple[Path, FinalDecision, OrderPlan]] = []
+    seen: set[str] = set()
+
+    acted_on = {
+        _symbol_of(path) for path in proposals(directory)
+        if receipt_path(path).exists()
+    }
+
+    for path in proposals(directory):
+        if receipt_path(path).exists():
+            continue
+        try:
+            decision, plan, _ = load_proposal(path)
+        except ProposalError:
+            continue
+        if plan is None or plan.blocked or plan.quantity == 0:
+            continue
+        if decision.action == "HOLD":
+            continue
+        if decision.expires_at <= now:
+            continue
+        symbol = decision.symbol.upper()
+        if symbol in acted_on:
+            logger.info(
+                "%s: %s already has an executed proposal today -- out of the "
+                "batch. Re-run `desk decide` for a current sizing.",
+                path.name, symbol,
+            )
+            continue
+        if symbol in seen:
+            logger.info(
+                "%s: superseded by a newer proposal for %s", path.name, symbol
+            )
+            continue
+        seen.add(symbol)
+        out.append((path, decision, plan))
+
+    return out
+
+
+def _symbol_of(path: Path) -> str:
+    """The symbol from a proposal filename, ``SYMBOL_runid.json``.
+
+    From the name rather than the contents because this runs over receipted
+    files too, and re-reading every one of them to learn something the
+    filename already carries is work for nothing. ``persist`` writes the name;
+    ``BRK.B_20261008-...json`` splits correctly because the run id has no dot.
+    """
+    return path.name.split("_", 1)[0].upper()
+
+
+def _project_batch(
+    selected: list[tuple[Path, FinalDecision, OrderPlan]],
+    book: Any,
+    intent: Any,
+) -> tuple[list[Any], Any]:
+    """Fold every order onto the book and read the caps off the result.
+
+    Uses ``compliance.post_trade`` -- the same function the per-order veto uses
+    internally -- so the projection on the review screen cannot disagree with
+    the checks that follow it. A second implementation of "what would the book
+    look like" is a second answer, and the human would be shown whichever one
+    was wrong.
+    """
+    from .confirmation import BatchProjection, BatchRow
+    from ..intent.compliance import post_trade, sector_exposure_pct
+    from ..intent.engine import sector_map
+
+    sectors = sector_map()
+    rows = [
+        BatchRow(
+            symbol=decision.symbol,
+            action=plan.action,
+            quantity=plan.quantity,
+            notional=abs(plan.quantity) * (plan.reference_price or 0.0),
+            absent_analysts=tuple(decision.absent_analysts),
+        )
+        for _, decision, plan in selected
+    ]
+
+    projected = book
+    for _, decision, plan in selected:
+        price = plan.reference_price or 0.0
+        if price > 0:
+            projected = post_trade(projected, decision.symbol, plan.quantity, price)
+
+    # Only the sectors this batch actually moves. Listing all seven themes
+    # would bury the two that changed.
+    touched = {
+        sectors[d.symbol] for _, d, _ in selected
+        if sectors.get(d.symbol)
+    }
+    allow_shorts = intent.universe.allow_shorts
+    return rows, BatchProjection(
+        cash_before=book.cash,
+        cash_after=projected.cash,
+        cash_pct_after=projected.cash_pct,
+        cash_pct_floor=intent.risk.min_cash_pct,
+        positions_before=book.position_count,
+        positions_after=projected.position_count,
+        positions_cap=intent.risk.max_positions,
+        gross_before_pct=book.gross_exposure_pct,
+        gross_after_pct=projected.gross_exposure_pct,
+        gross_cap_pct=intent.risk.effective_gross_cap_pct(
+            allow_shorts=allow_shorts
+        ),
+        sectors=tuple(
+            (
+                name,
+                sector_exposure_pct(book, sectors, name),
+                sector_exposure_pct(projected, sectors, name),
+                intent.risk.max_sector_pct,
+            )
+            for name in sorted(touched)
+        ),
+    )
+
+
 async def _check_session(args: argparse.Namespace) -> int:
     """Prove the Gateway has a LIVE API session, not merely an open port.
 
@@ -389,42 +553,257 @@ async def _sync_book(args: argparse.Namespace) -> int:
         ib.disconnect()
 
 
-async def _run(args: argparse.Namespace) -> int:
+@dataclass(frozen=True)
+class OrderOutcome:
+    """What happened to one proposal. The unit a batch reports and loops on.
+
+    ``stop_batch`` is the only field that is not a record: it is set when the
+    batch cannot honestly continue -- an order that is still working, so the
+    book's next state is unknown. Everything else (a refusal, a decline, a
+    missing quote) is per-order and the batch moves on.
+    """
+
+    path: Path
+    symbol: str
+    outcome: str
+    reason: str = ""
+    filled: int = 0
+    avg_price: float = 0.0
+    stop_batch: bool = False
+
+
+async def _execute_one(
+    *,
+    ib: Any,
+    path: Path,
+    decision: FinalDecision,
+    plan: OrderPlan,
+    body: dict,
+    book: Any,
+    intent: Any,
+    journal: Any,
+    gate: Any,
+    args: argparse.Namespace,
+    universe: dict,
+    accounts: list[str],
+    prior_in_batch: int = 0,
+) -> OrderOutcome:
+    """Price, re-check, gate and place ONE order against ``book``.
+
+    Extracted from ``_run`` so that ``_run_all`` can call it per order with a
+    *running* book rather than the file loaded once at the start. That
+    distinction is the whole reason a batch is not a shell loop: five of
+    ``rules.check``'s rules read ``post_trade(portfolio, ...)``, so handing
+    each order the same pre-batch snapshot silently under-counts
+    ``max_positions``, ``min_cash_pct``, ``max_gross_exposure_pct``,
+    ``max_sector_pct`` and ``max_position_pct``.
+
+    The sequence below is load-bearing and ``tests/execution/test_execute_cli``
+    asserts its source order: reconciliation (the caller's job, once per
+    session), then the compliance re-check, and only then the gate. Never draw
+    an approval screen for an order that cannot be placed.
+    """
     from .broker import (
+        FILL_TIMEOUT_S,
         NoQuoteError,
         build_orders,
-        connect,
         contract_for,
+        filled_quantity,
         marketable_limit,
         place,
         preflight,
         quote,
         stop_price_for,
+        wait_for_terminal,
     )
+    from ..intent import compliance as rules
+    from ..intent.engine import sector_map
+
+    run_id = body.get("run_id", "?")
+
+    # --- price it -----------------------------------------------------------
+    contract = contract_for(
+        decision.symbol, _provider_symbols(universe, decision.symbol)
+    )
+    await ib.qualifyContractsAsync(contract)
+
+    try:
+        market = await quote(ib, contract)
+    except NoQuoteError as exc:
+        _receipt(path, dry_run=args.dry_run, outcome="no_quote", reason=str(exc))
+        return OrderOutcome(path, decision.symbol, "no_quote", reason=str(exc))
+
+    limit_price = marketable_limit(market, plan.action, decision.limit_offset_bps)
+    stop = stop_price_for(decision, plan, limit_price)
+    parent, child = build_orders(plan, limit_price, stop)
+
+    report = await preflight(ib, contract, parent)
+
+    # --- re-check compliance against the book AS IT IS NOW ------------------
+    #
+    # The share count in this proposal was sized against the book at DECIDE
+    # time. Reconciliation proved the book matches the broker; it did not ask
+    # whether the order still passes the vetoes. Those are different
+    # questions, and for a single symbol executed immediately they happen to
+    # have the same answer -- which is why this was missing.
+    #
+    # They diverge the moment anything changes in between: a fill from another
+    # proposal, a sweep that sized fifteen symbols against the same empty
+    # book, or simply deciding before lunch and executing after. The concrete
+    # failure was walking past max_positions one proposal at a time, each sync
+    # making reconciliation pass without the limit ever being re-evaluated.
+    rechecked = rules.check(
+        plan, decision, intent, book,
+        as_of=date.today(),
+        sectors=sector_map(),
+        # Both of these only exist at decide time. `check` degrades each to a
+        # WARN rather than a block when it cannot evaluate them, which is the
+        # honest behaviour: the proposal already carries the verdict from when
+        # the data was available.
+        #   dollar_adv -- came from the run's MarketSnapshot
+        #   earnings   -- needs the provider registry
+        dollar_adv=None,
+        earnings=None,
+        # Zero for a single order: already enforced at decide time against the
+        # same journal, and re-counting it here would veto the first execution
+        # of a legitimately decided proposal.
+        #
+        # Inside a batch it is the number of DISTINCT SYMBOLS THIS PROCESS HAS
+        # ALREADY PLACED, which is a different number and the honest one.
+        # `decisions_today` counts symbols the desk *decided* on; this counts
+        # the ones it actually touched, and "how many positions the desk
+        # touches" is what the limit says it protects.
+        prior_decisions_today=prior_in_batch,
+    )
+
+    if rechecked.blocked:
+        print()
+        print("=" * 72)
+        print(f"REJECTED -- {decision.symbol} NO LONGER PASSES COMPLIANCE.")
+        print("=" * 72)
+        for violation in rechecked.blocking:
+            print(f"  {violation.render()}")
+        print()
+        print("  It was compliant when `desk decide` wrote it. The book has")
+        print("  changed since -- a fill, a sync, or simply time -- and the")
+        print("  share count was computed against the older one.")
+        print()
+        print("  You are not being asked to approve it: the number on screen")
+        print("  is arithmetic over a book that no longer exists.")
+        print()
+        print("  Fix: re-run `desk decide` so the order is sized against what")
+        print("  the account holds now.")
+        print("=" * 72)
+
+        journal.write(
+            "compliance_recheck_failed", run_id=run_id,
+            symbol=decision.symbol, quantity=plan.quantity,
+            rules=[v.rule for v in rechecked.blocking],
+        )
+        _receipt(
+            path, dry_run=args.dry_run, outcome="rejected_stale_plan",
+            rules=[v.rule for v in rechecked.blocking],
+            limit_price=limit_price,
+        )
+        return OrderOutcome(
+            path, decision.symbol, "rejected_stale_plan",
+            reason=", ".join(v.rule for v in rechecked.blocking),
+        )
+
+    # Warnings the re-check surfaced that the original plan did not carry (an
+    # ADV check that can no longer be evaluated, say) are merged in so the
+    # human sees them on the gate rather than nowhere.
+    if rechecked.warnings:
+        plan = plan.model_copy(update={"violations": rechecked.violations})
+
+    # --- the gate -----------------------------------------------------------
+    approved = gate.confirm(
+        decision, plan,
+        limit_price=limit_price, stop_price=stop,
+        preflight=report, quote_source=market.source,
+    )
+
+    if not approved:
+        journal.write(
+            "order_declined", run_id=run_id,
+            symbol=decision.symbol, quantity=plan.quantity,
+            limit_price=limit_price, dry_run=args.dry_run,
+        )
+        _receipt(path, dry_run=args.dry_run, outcome="declined",
+                 limit_price=limit_price, stop_price=stop)
+        print(f"\n{decision.symbol}: nothing was placed.")
+        return OrderOutcome(path, decision.symbol, "declined")
+
+    # --- place --------------------------------------------------------------
+    trades = await place(
+        ib, contract, parent, child, journal=journal, run_id=run_id,
+    )
+    # Through the guard like every other outcome. A dry run cannot reach here
+    # -- the gate declined -- but keeping the invariant total means a future
+    # outcome cannot bypass it by being added in the wrong place.
+    _receipt(
+        path, dry_run=args.dry_run, outcome="placed",
+        limit_price=limit_price, stop_price=stop,
+        accounts=accounts,
+        orders=[
+            {
+                "order_id": t.order.orderId,
+                "action": t.order.action,
+                "quantity": t.order.totalQuantity,
+                "type": t.order.orderType,
+                "status": t.orderStatus.status,
+                "filled": t.orderStatus.filled,
+                "avg_fill_price": t.orderStatus.avgFillPrice,
+            }
+            for t in trades
+        ],
+    )
+    print(f"\nPlaced {len(trades)} order(s) for {decision.symbol}.")
+
+    # --- what filled, so the caller can advance the book --------------------
+    #
+    # Only a batch needs this. A single order is followed by a human reading
+    # the fill and running `make sync-book`; a batch has to check the NEXT
+    # order against the book, and "probably filled" is not an input a
+    # compliance check can use.
+    if not args.all:
+        return OrderOutcome(path, decision.symbol, "placed")
+
+    # The PARENT only. The child is a GTC stop whose job is to stay working.
+    #
+    # Passed explicitly rather than relying on the default: a default argument
+    # is bound at import, so the value in the message below could drift from
+    # the value actually waited for, and the operator would be told the wrong
+    # number about the one thing that just stopped their batch.
+    settled = await wait_for_terminal(trades[0], timeout_s=FILL_TIMEOUT_S)
+    shares, price = filled_quantity(trades[0])
+
+    if not settled:
+        return OrderOutcome(
+            path, decision.symbol, "placed", filled=shares, avg_price=price,
+            reason=(
+                f"still {trades[0].orderStatus.status} after "
+                f"{int(FILL_TIMEOUT_S)}s"
+            ),
+            stop_batch=True,
+        )
+
+    return OrderOutcome(
+        path, decision.symbol, "placed", filled=shares, avg_price=price,
+    )
+
+
+async def _run(args: argparse.Namespace) -> int:
+    from .broker import connect
     from .confirmation import (
         CLIConfirmationGate,
         ExpiredProposalError,
         RejectAllGate,
         assert_not_expired,
-        confirm_rewrite,
     )
     from .journal import Journal
-    from .reconcile import (
-        account_values,
-        book_from_ib,
-        compare,
-        holdings_from_ib,
-        render,
-        render_rejection,
-    )
     from ..config import load_yaml
-    from ..intent import compliance as rules
-    from ..intent.engine import (
-        load_intent,
-        load_portfolio,
-        portfolio_path,
-        sector_map,
-    )
+    from ..intent.engine import load_intent, load_portfolio
 
     settings = load_settings()
 
@@ -457,202 +836,337 @@ async def _run(args: argparse.Namespace) -> int:
     journal = Journal(settings.journal_dir)
 
     try:
-        # --- reconcile ------------------------------------------------------
-        holdings = await holdings_from_ib(ib)
-        values = await account_values(ib)
-        result = compare(
-            book, holdings,
-            broker_equity=values.get("NetLiquidation"),
-            broker_cash=values.get("TotalCashValue"),
-            broker_account=", ".join(accounts),
+        matched = await _reconcile(
+            ib, book, accounts, journal, args,
+            run_id=body.get("run_id", "?"), symbol=decision.symbol,
+            receipt_for=path,
         )
-        print()
-        print(render(result))
-
-        if not result.matches:
-            print(render_rejection(result, portfolio_path()))
-            journal.write(
-                "reconciliation_failed", run_id=body.get("run_id", "?"),
-                symbol=decision.symbol,
-                mismatched=[r.symbol for r in result.mismatched],
-            )
-            _receipt(
-                path, dry_run=args.dry_run, outcome="rejected_stale_book",
-                mismatched=[
-                    {"symbol": r.symbol, "book": r.book_qty, "broker": r.broker_qty}
-                    for r in result.mismatched
-                ],
-            )
-
-            if args.dry_run:
-                print("\nDRY RUN -- not offering to rewrite the book.")
-                return 2
-
-            if confirm_rewrite(portfolio_path()):
-                fresh = await book_from_ib(
-                    ib, stale_after_days=book.stale_after_days
-                )
-                _write_book(fresh, portfolio_path())
-                print(f"\nWrote {portfolio_path()} from the broker "
-                      f"({fresh.position_count} position(s), source=ib).")
-                print("Marks are average cost -- run `make portfolio-refresh` "
-                      "to mark to market.")
-                print("\nNow re-run `desk decide` so the order is sized against "
-                      "what the account actually holds.")
-            else:
-                print("\nLeft the book alone. Nothing was placed.")
+        if not matched:
             return 2
 
-        # --- price it -------------------------------------------------------
-        contract = contract_for(
-            decision.symbol, _provider_symbols(load_yaml("universe.yaml"), decision.symbol)
-        )
-        await ib.qualifyContractsAsync(contract)
-
-        try:
-            market = await quote(ib, contract)
-        except NoQuoteError as exc:
-            _receipt(path, dry_run=args.dry_run, outcome="no_quote",
-                     reason=str(exc))
-            raise ProposalError(str(exc)) from exc
-
-        limit_price = marketable_limit(market, plan.action, decision.limit_offset_bps)
-        stop = stop_price_for(decision, plan, limit_price)
-        parent, child = build_orders(plan, limit_price, stop)
-
-        report = await preflight(ib, contract, parent)
-
-        # --- re-check compliance against the book AS IT IS NOW --------------
-        #
-        # The share count in this proposal was sized against the book at
-        # DECIDE time. Reconciliation above proved the book matches the broker;
-        # it did not ask whether the order still passes the vetoes. Those are
-        # different questions, and for a single symbol executed immediately
-        # they happen to have the same answer -- which is why this was missing.
-        #
-        # They diverge the moment anything changes in between: a fill from
-        # another proposal, a sweep that sized fifteen symbols against the same
-        # empty book, or simply deciding before lunch and executing after. The
-        # concrete failure was walking past max_positions one proposal at a
-        # time, each sync making reconciliation pass without the limit ever
-        # being re-evaluated.
-        #
-        # Runs BEFORE the gate, for the same reason reconciliation does: do not
-        # draw an approval screen for an order that cannot be placed.
-        rechecked = rules.check(
-            plan, decision, intent, book,
-            as_of=date.today(),
-            sectors=sector_map(),
-            # Both of these only exist at decide time. `check` degrades each to
-            # a WARN rather than a block when it cannot evaluate them, which is
-            # the honest behaviour: the proposal already carries the verdict
-            # from when the data was available.
-            #   dollar_adv -- came from the run's MarketSnapshot
-            #   earnings   -- needs the provider registry
-            dollar_adv=None,
-            earnings=None,
-            # Already enforced at decide time against the same journal, and
-            # re-counting here would veto the first execution of a legitimately
-            # decided proposal.
-            prior_decisions_today=0,
+        outcome = await _execute_one(
+            ib=ib, path=path, decision=decision, plan=plan, body=body,
+            book=book, intent=intent, journal=journal,
+            gate=RejectAllGate() if args.dry_run else CLIConfirmationGate(),
+            args=args, universe=load_yaml("universe.yaml"), accounts=accounts,
         )
 
-        if rechecked.blocked:
-            rules_hit = ", ".join(v.rule for v in rechecked.blocking)
-            print()
-            print("=" * 72)
-            print("REJECTED -- THIS PROPOSAL NO LONGER PASSES COMPLIANCE.")
-            print("=" * 72)
-            for violation in rechecked.blocking:
-                print(f"  {violation.render()}")
-            print()
-            print("  It was compliant when `desk decide` wrote it. The book has")
-            print("  changed since -- a fill, a sync, or simply time -- and the")
-            print("  share count was computed against the older one.")
-            print()
-            print("  You are not being asked to approve it: the number on screen")
-            print("  is arithmetic over a book that no longer exists.")
-            print()
-            print("  Fix: re-run `desk decide` so the order is sized against what")
-            print("  the account holds now.")
-            print("=" * 72)
-
-            journal.write(
-                "compliance_recheck_failed", run_id=body.get("run_id", "?"),
-                symbol=decision.symbol, quantity=plan.quantity,
-                rules=[v.rule for v in rechecked.blocking],
-            )
-            _receipt(
-                path, dry_run=args.dry_run, outcome="rejected_stale_plan",
-                rules=[v.rule for v in rechecked.blocking],
-                limit_price=limit_price,
-            )
+        if outcome.outcome == "no_quote":
+            raise ProposalError(outcome.reason)
+        if outcome.outcome == "rejected_stale_plan":
             return 2
-
-        # Warnings the re-check surfaced that the original plan did not carry
-        # (an ADV check that can no longer be evaluated, say) are merged in so
-        # the human sees them on the gate rather than nowhere.
-        if rechecked.warnings:
-            plan = plan.model_copy(update={"violations": rechecked.violations})
-
-        # --- the gate -------------------------------------------------------
-        gate = RejectAllGate() if args.dry_run else CLIConfirmationGate()
-        approved = gate.confirm(
-            decision, plan,
-            limit_price=limit_price, stop_price=stop,
-            preflight=report, quote_source=market.source,
-        )
-
-        if not approved:
-            journal.write(
-                "order_declined", run_id=body.get("run_id", "?"),
-                symbol=decision.symbol, quantity=plan.quantity,
-                limit_price=limit_price, dry_run=args.dry_run,
-            )
-            _receipt(path, dry_run=args.dry_run, outcome="declined",
-                     limit_price=limit_price, stop_price=stop)
-            print("\nNothing was placed.")
-            return 0
-
-        # --- place ----------------------------------------------------------
-        trades = await place(
-            ib, contract, parent, child,
-            journal=journal, run_id=body.get("run_id", "?"),
-        )
-        # Through the guard like every other outcome. A dry run cannot reach
-        # here -- the gate declined -- but keeping the invariant total means a
-        # future outcome cannot bypass it by being added in the wrong place.
-        _receipt(
-            path, dry_run=args.dry_run, outcome="placed",
-            limit_price=limit_price, stop_price=stop,
-            accounts=accounts,
-            orders=[
-                {
-                    "order_id": t.order.orderId,
-                    "action": t.order.action,
-                    "quantity": t.order.totalQuantity,
-                    "type": t.order.orderType,
-                    "status": t.orderStatus.status,
-                    "filled": t.orderStatus.filled,
-                    "avg_fill_price": t.orderStatus.avgFillPrice,
-                }
-                for t in trades
-            ],
-        )
-        print(f"\nPlaced {len(trades)} order(s). "
-              f"`make gateway-logs` and the trade journal have the detail.")
-        print()
-        print("The book no longer matches the account. Once the fill settles:")
-        print("    make sync-book          # quantities and cash, FROM THE BROKER")
-        print("    make portfolio-refresh  # then mark those positions to market")
-        print()
-        print("`portfolio-refresh` alone cannot do this -- it re-prices")
-        print("positions the book already lists, from the bars cache, and never")
-        print("talks to IB. It has no way to discover a position you just opened.")
+        if outcome.outcome == "placed":
+            _print_sync_reminder()
         return 0
 
     finally:
         ib.disconnect()
+
+
+async def _run_all(args: argparse.Namespace) -> int:
+    """``execute --all``: a reviewed batch, one running book, one gate per order.
+
+    Three things make this more than ``_run`` in a shell loop, and each one is
+    a defect in the loop version:
+
+    **The book advances.** ``_execute_one`` re-checks every order against the
+    book as it is after the previous fill, using ``compliance.post_trade`` --
+    the same function the veto itself uses. A loop that re-read
+    ``data/portfolio.yaml`` would see the pre-batch state and walk straight
+    past every portfolio-level limit.
+
+    **The aggregate is shown first.** Every order was sized and vetoed in
+    isolation, so a set of individually-compliant orders can still move the
+    book somewhere nobody chose. The review screen is the only place that is
+    visible; no sequence of per-order prompts can show it.
+
+    **An ambiguous fill stops the batch.** Never size order N+1 against an
+    order N that is still working. Same rule as reconciliation's: a thing we
+    cannot describe is a refusal, not a warning.
+
+    What it deliberately does NOT do is weaken the gate. Each order goes
+    through the same ``CLIConfirmationGate`` a single run uses, and approval is
+    still the ticker.
+    """
+    from .broker import connect
+    from .confirmation import (
+        CLIConfirmationGate,
+        RejectAllGate,
+        confirm_batch_review,
+    )
+    from .journal import Journal
+    from .reconcile import account_values, book_from_ib, holdings_from_ib
+    from ..config import load_yaml
+    from ..intent.compliance import post_trade
+    from ..intent.engine import load_intent, load_portfolio, portfolio_path
+
+    settings = load_settings()
+
+    selected = _select_all(settings.proposals_dir)
+    if not selected:
+        print(f"No actionable pending proposals in {settings.proposals_dir}.")
+        print("`execute --list` shows what is there and why each one is out.")
+        return 1
+
+    book = load_portfolio()
+    intent = load_intent()
+
+    print(f"{len(selected)} actionable proposal(s), newest first:")
+    for path, decision, plan in selected:
+        print(f"  {path.name:<46} {decision.action} {plan.quantity:+d}")
+
+    try:
+        host, port = resolve_ib_endpoint(settings)
+    except ConfigError as exc:
+        raise ProposalError(str(exc)) from exc
+
+    ib, accounts = await connect(
+        host=host, port=port, client_id=settings.ib_client_id, mode=settings.mode,
+    )
+    journal = Journal(settings.journal_dir)
+
+    try:
+        # One reconciliation for the whole batch. A stale book refuses the
+        # BATCH, and deliberately writes no per-proposal receipts: every one of
+        # them is still valid once the book is synced, and consuming fifteen
+        # proposals over one stale file would be the opposite of helpful.
+        matched = await _reconcile(
+            ib, book, accounts, journal, args,
+            run_id="batch", symbol=f"{len(selected)} symbols", receipt_for=None,
+        )
+        if not matched:
+            return 2
+
+        rows, projection = _project_batch(selected, book, intent)
+        if not confirm_batch_review(rows, projection):
+            print("\nNothing was placed.")
+            return 0
+
+        universe = load_yaml("universe.yaml")
+        gate = RejectAllGate() if args.dry_run else CLIConfirmationGate()
+        outcomes: list[OrderOutcome] = []
+        placed_symbols: set[str] = set()
+        stopped = ""
+
+        for index, (path, decision, plan) in enumerate(selected, start=1):
+            print()
+            print("-" * 72)
+            print(f"ORDER {index} OF {len(selected)}   {path.name}")
+            print("-" * 72)
+
+            outcome = await _execute_one(
+                ib=ib, path=path, decision=decision, plan=plan,
+                body=load_proposal(path)[2],
+                book=book, intent=intent, journal=journal, gate=gate,
+                args=args, universe=universe, accounts=accounts,
+                prior_in_batch=len(placed_symbols),
+            )
+            outcomes.append(outcome)
+
+            if outcome.outcome == "placed":
+                placed_symbols.add(outcome.symbol)
+                # Advance the running book by what ACTUALLY filled. In a dry
+                # run nothing filled, so project the proposed order instead --
+                # otherwise a rehearsal would check every order against an
+                # unchanged book and prove nothing about the sequence.
+                shares = plan.quantity if args.dry_run else outcome.filled
+                price = (
+                    plan.reference_price or 0.0
+                ) if args.dry_run else outcome.avg_price
+                if shares and price > 0:
+                    book = post_trade(book, outcome.symbol, shares, price)
+
+            if outcome.stop_batch:
+                stopped = outcome.reason
+                break
+
+        print()
+        print("=" * 72)
+        print(f"BATCH COMPLETE -- {len(outcomes)} of {len(selected)} order(s) reached")
+        print("=" * 72)
+        for outcome in outcomes:
+            detail = f"  {outcome.reason}" if outcome.reason else ""
+            fill = f" filled {outcome.filled:+d}" if outcome.filled else ""
+            print(f"  {outcome.symbol:<6} {outcome.outcome:<22}{fill}{detail}")
+        skipped = len(selected) - len(outcomes)
+        if skipped:
+            print(f"  ({skipped} not reached -- no receipt, still pending)")
+
+        if stopped:
+            print()
+            print("  STOPPED: an order did not settle "
+                  f"({stopped}).")
+            print("  The remaining proposals were not offered, carry no receipt,")
+            print("  and are still pending. Check the order in the IB UI, run")
+            print("  `make sync-book`, then re-run.")
+
+        if args.dry_run:
+            print("\nDRY RUN -- nothing was sent and no receipts were written.")
+            return 0
+
+        if not placed_symbols:
+            print("\nNothing was placed, so the book is unchanged.")
+            return 0
+
+        await _write_book_if_it_reconciles(
+            ib, book, journal,
+            holdings_from_ib=holdings_from_ib,
+            account_values=account_values,
+            book_from_ib=book_from_ib,
+            portfolio_path=portfolio_path,
+        )
+        return 0
+
+    finally:
+        ib.disconnect()
+
+
+async def _reconcile(
+    ib: Any,
+    book: Any,
+    accounts: list[str],
+    journal: Any,
+    args: argparse.Namespace,
+    *,
+    run_id: str,
+    symbol: str,
+    receipt_for: Path | None,
+) -> bool:
+    """Book versus account. True to continue, False to refuse.
+
+    Shared by ``_run`` and ``_run_all`` so there is one definition of "the
+    share count was computed from this file, so the file has to be right".
+
+    ``receipt_for`` is the proposal to mark as refused, or ``None`` for a batch
+    -- see the call site in ``_run_all``.
+    """
+    from .confirmation import confirm_rewrite
+    from .reconcile import (
+        account_values,
+        book_from_ib,
+        compare,
+        holdings_from_ib,
+        render,
+        render_rejection,
+    )
+    from ..intent.engine import portfolio_path
+
+    holdings = await holdings_from_ib(ib)
+    values = await account_values(ib)
+    result = compare(
+        book, holdings,
+        broker_equity=values.get("NetLiquidation"),
+        broker_cash=values.get("TotalCashValue"),
+        broker_account=", ".join(accounts),
+    )
+    print()
+    print(render(result))
+
+    if result.matches:
+        return True
+
+    print(render_rejection(result, portfolio_path()))
+    journal.write(
+        "reconciliation_failed", run_id=run_id, symbol=symbol,
+        mismatched=[r.symbol for r in result.mismatched],
+    )
+    if receipt_for is not None:
+        _receipt(
+            receipt_for, dry_run=args.dry_run, outcome="rejected_stale_book",
+            mismatched=[
+                {"symbol": r.symbol, "book": r.book_qty, "broker": r.broker_qty}
+                for r in result.mismatched
+            ],
+        )
+
+    if args.dry_run:
+        print("\nDRY RUN -- not offering to rewrite the book.")
+        return False
+
+    if confirm_rewrite(portfolio_path()):
+        fresh = await book_from_ib(ib, stale_after_days=book.stale_after_days)
+        _write_book(fresh, portfolio_path())
+        print(f"\nWrote {portfolio_path()} from the broker "
+              f"({fresh.position_count} position(s), source=ib).")
+        print("Marks are average cost -- run `make portfolio-refresh` "
+              "to mark to market.")
+        print("\nNow re-run `desk decide` so the order is sized against "
+              "what the account actually holds.")
+    else:
+        print("\nLeft the book alone. Nothing was placed.")
+    return False
+
+
+async def _write_book_if_it_reconciles(
+    ib: Any,
+    running: Any,
+    journal: Any,
+    *,
+    holdings_from_ib: Any,
+    account_values: Any,
+    book_from_ib: Any,
+    portfolio_path: Any,
+) -> bool:
+    """Write the book from the broker, but only if the broker agrees with us.
+
+    A batch that places five orders and leaves ``data/portfolio.yaml`` five
+    orders stale is a trap for the next ``decide`` run, so unlike single-order
+    `execute` this does write the book. What makes that safe rather than
+    convenient is the check: ``--sync-book`` overwrites unconditionally, while
+    this one first confirms that **the delta is the one the batch intended.**
+
+    A disagreement here means something happened that this process did not do
+    -- a fill at a different size, a manual trade, another session. Writing
+    then would launder an unexplained change into the file that sizes the next
+    run, so it refuses and names the command that overwrites on purpose.
+    """
+    from .reconcile import compare, render
+
+    print()
+    print("Confirming the account matches what this batch intended...")
+    holdings = await holdings_from_ib(ib)
+    values = await account_values(ib)
+    result = compare(
+        running, holdings,
+        broker_equity=values.get("NetLiquidation"),
+        broker_cash=values.get("TotalCashValue"),
+    )
+
+    if not result.matches:
+        print(render(result))
+        print()
+        print("  The account does NOT match the batch's own running book, so")
+        print("  the file was left alone. Something changed that this process")
+        print("  did not do -- a different fill size, a manual trade, or")
+        print("  another session.")
+        print()
+        print("  Run `make sync-book` to overwrite it from the broker")
+        print("  deliberately, then `make portfolio-refresh` to mark to market.")
+        journal.write(
+            "batch_book_write_refused", run_id="batch", symbol="-",
+            mismatched=[r.symbol for r in result.mismatched],
+        )
+        return False
+
+    fresh = await book_from_ib(ib, stale_after_days=running.stale_after_days)
+    _write_book(fresh, portfolio_path())
+    print(f"  ok -- wrote {portfolio_path()} from the broker "
+          f"({fresh.position_count} position(s), source=ib).")
+    print()
+    print("Marks are average cost. Run `make portfolio-refresh` to mark them")
+    print("to market before the next `desk decide`.")
+    return True
+
+
+def _print_sync_reminder() -> None:
+    print()
+    print("The book no longer matches the account. Once the fill settles:")
+    print("    make sync-book          # quantities and cash, FROM THE BROKER")
+    print("    make portfolio-refresh  # then mark those positions to market")
+    print()
+    print("`portfolio-refresh` alone cannot do this -- it re-prices")
+    print("positions the book already lists, from the bars cache, and never")
+    print("talks to IB. It has no way to discover a position you just opened.")
 
 
 def _provider_symbols(universe: dict, symbol: str) -> dict[str, str] | None:
@@ -708,6 +1222,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--yes", action="store_true",
                         help="skip the confirmation on --sync-book only. Never "
                              "affects the order gate.")
+    parser.add_argument("--all", action="store_true",
+                        help="review every actionable pending proposal, then go "
+                             "through them one at a time. Each order still "
+                             "needs its ticker typed.")
     parser.add_argument("--symbol", default=None, help="newest proposal for this symbol")
     parser.add_argument("--run-id", default=None, help="run id, or any part of one")
     parser.add_argument("--dry-run", action="store_true",
@@ -725,9 +1243,38 @@ def main(argv: list[str] | None = None) -> int:
     if args.list or args.command == "list":
         return cmd_list(args)
 
+    # --- flag combinations that must not silently do something else ---------
+    #
+    # `--yes` skips one confirmation: the book rewrite in `--sync-book`. Its
+    # help text has always promised it "never affects the order gate", and it
+    # does not. But `--yes --all` is a request nobody should be able to make
+    # by accident, and a flag that is quietly IGNORED is worse than one that
+    # is refused -- the operator believes something about what just ran.
+    if args.yes and args.all:
+        print(
+            "REFUSED: --yes does not apply to --all.\n\n"
+            "  --yes skips the book-rewrite confirmation and nothing else.\n"
+            "  Every order in a batch is approved by typing its ticker, and\n"
+            "  there is no flag that changes that (architecture §9: the\n"
+            "  confirmation gate has no off switch).",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.all and (args.symbol or args.run_id):
+        print(
+            "REFUSED: --all selects every actionable pending proposal, so\n"
+            "  --symbol / --run-id would contradict it. Drop --all to act on\n"
+            "  one proposal.",
+            file=sys.stderr,
+        )
+        return 2
+
     try:
         if args.check_session:
             return asyncio.run(_check_session(args))
+        if args.all:
+            return asyncio.run(_run_all(args))
         if args.sync_book:
             return asyncio.run(_sync_book(args))
         return asyncio.run(_run(args))

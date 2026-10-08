@@ -142,13 +142,19 @@ def decisions_today(
     return len(symbols)
 
 
-def _sector_exposure_pct(
+def sector_exposure_pct(
     book: PortfolioSnapshot, sectors: dict[str, str], sector: str
 ) -> float:
     """Gross exposure to one sector, as a percent of equity.
 
     Absolute values, like ``gross_value``: a long and a short in the same
     sector are two positions to unwind, not zero exposure.
+
+    **Public because the batch review screen needs it.** ``execute --all``
+    shows the projected sector exposure of a whole batch before anything is
+    sent, and that projection has to be computed by the same function the veto
+    below uses. A second implementation would be a second answer, and the human
+    would be shown whichever one was wrong.
     """
     total = sum(
         abs(p.market_value) for p in book.positions
@@ -275,7 +281,7 @@ def check(
 
     sector = sectors.get(symbol)
     if sector:
-        exposure = _sector_exposure_pct(book, sectors, sector)
+        exposure = sector_exposure_pct(book, sectors, sector)
         if exposure > risk.max_sector_pct + EPSILON_PCT:
             add("max_sector_pct",
                 f"{sector} would be {exposure:.2f}% of equity after this order",
@@ -329,4 +335,10 @@ def check(
     return plan.model_copy(update={"violations": violations})
 
 
-__all__ = ["EPSILON_PCT", "check", "decisions_today", "post_trade"]
+__all__ = [
+    "EPSILON_PCT",
+    "check",
+    "decisions_today",
+    "post_trade",
+    "sector_exposure_pct",
+]

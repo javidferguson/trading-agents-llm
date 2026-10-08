@@ -217,6 +217,24 @@ gateway-session:  ## Prove the Gateway has a LIVE session. The open port does no
 	@# port says yes and something still does not work.
 	$(COMPOSE) --profile execute run --rm --build execute execute --check-session
 
+.PHONY: execute-all
+execute-all:  ## Review every pending proposal, then place them ONE AT A TIME.
+	@# The sweep's companion: `make decide-all`, `make review WANTED=1`, then
+	@# this. It shows the AGGREGATE effect of the whole set before anything is
+	@# sent -- which no sequence of single-order runs can, because each one
+	@# only knows about itself -- and then asks for each ticker separately.
+	@#
+	@# It is not `make execute` in a loop, and the difference is a correctness
+	@# one: each order is re-checked against the book AS IT IS AFTER THE
+	@# PREVIOUS FILL. Five of compliance's rules read the post-trade state, so
+	@# a loop handing every order the same pre-batch snapshot walks past
+	@# max_positions, min_cash_pct, max_gross_exposure_pct, max_sector_pct and
+	@# max_position_pct without any of them firing.
+	@#
+	@# Still human-initiated, still one typed ticker per order (§15.8, §9).
+	@# Rehearse with: EXEC_ARGS="--all --dry-run" make execute
+	$(COMPOSE) --profile execute run --rm --build execute execute --all
+
 .PHONY: execute-list
 execute-list:  ## Which proposals are pending, and which already executed
 	@# --build for the same reason as above: this reads receipts written by the

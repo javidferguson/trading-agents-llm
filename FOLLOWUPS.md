@@ -597,30 +597,53 @@ a `--keep-days N` so a week of history stays browsable.
 Deliberately not built yet: it deletes files, and the right retention policy is
 clearer after a few weeks of real sweeps than it is now.
 
-## A batch executor is possible now, and still deliberately absent
+## The batch executor, as built
 
-The prerequisite is done -- `execute` re-runs `rules.check` against the live
-book before the gate, so an order that was compliant when written and is not now
-gets refused rather than placed. That was the missing safety property, and it
-closes the specific hole where syncing the book made reconciliation pass without
-the limits ever being re-evaluated.
+`execute --all` exists. It reviews every actionable pending proposal in one
+screen, then walks them individually, each with its own typed ticker. What it
+adds over running `make execute --symbol X` N times is a **running book**: each
+order is re-checked against the account as it is after the previous fill.
 
-What is still missing is not safety but *design*: `execute --all` would be a loop
-placing multiple real orders, and the confirmation gate would have to become
-per-order or stop being a gate. "Type the ticker thirty times" is not a gate
-either -- it is a gate people learn to defeat. Options worth thinking about
-before building anything:
+That was not a convenience. Five of `rules.check`'s rules read
+`post_trade(portfolio, ...)` — `max_positions`, `min_cash_pct`,
+`max_gross_exposure_pct`, `max_sector_pct`, `max_position_pct` — and `_run`
+loaded the book once and never advanced it. A shell loop would have walked past
+all five. The manual `make sync-book` between orders was hiding it by accident.
 
-* one confirmation listing every order, approved as a batch, with the re-check
-  run per order against a running book and the whole batch refused if any order
-  fails
-* sequential with a per-order gate, which is honest but is thirty prompts
-* a "plan" artefact the human approves once, after which execution is
-  mechanical -- closest to how a real desk works, and the furthest from what
-  exists today
+Three decisions worth keeping, because each had a plausible alternative:
 
-Not urgent: executing one symbol at a time with `make sync-book` between is
-correct, and the re-check now makes it safe even when the book has moved.
+**The gate stayed per-order.** The temptation was one approval for the whole
+batch, and the objection to "type the ticker fifteen times" is real — it is a
+gate people learn to defeat. But one token standing for fifteen orders makes
+the ticker mean *a set* rather than *a trade*, and the ticker is the whole
+mechanism. What makes N prompts tolerable instead is that each one carries new
+information: the live limit price and the whatIf margin, neither of which
+exists until that order is priced. The batch review screen carries the
+portfolio-level decision, so the per-order prompt is only confirming this
+order at this price.
+
+**An ambiguous fill stops the batch.** `wait_for_terminal` waits on the parent
+only — the child stop is GTC and is supposed to stay working — and a timeout is
+not an error. The order may fill a second later; what the process cannot do is
+describe the book well enough to check the next order against it. Same rule as
+reconciliation's: a thing we cannot describe is a refusal, not a warning. The
+unreached proposals keep no receipt and stay pending.
+
+**It writes the book, and single-order `execute` still does not.** A batch that
+places five orders and leaves `data/portfolio.yaml` five orders stale is a trap
+for the next `decide`. What makes the write safe is that it reconciles first:
+unlike `--sync-book`, which overwrites unconditionally, this confirms the delta
+is the one the batch intended and refuses if it is not.
+
+Still open, and deliberately:
+
+* **Order priority.** Orders go in the sequence shown on the review screen
+  (newest proposal first), so when a cap binds the earlier ones take the
+  headroom. Sorting by conviction is defensible and is cleverness in the wrong
+  file until there is a reason for it.
+* **Stop cancel-and-replace** (below) is still unbuilt. Dedupe-by-symbol keeps
+  a single batch from creating the double-stop case, but adding to an existing
+  position across two days still leaves two stops.
 
 ## The 31 historical degraded runs are not being retro-fixed
 

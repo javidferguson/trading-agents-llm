@@ -84,6 +84,8 @@ class FakeIB:
         account_values: list[FakeAccountValue] | None = None,
         order_state: FakeOrderState | None = None,
         next_order_id: int = 101,
+        fills: bool = False,
+        fill_price: float | None = None,
     ) -> None:
         self._accounts = accounts if accounts is not None else ["DU1234567"]
         self._ticker = ticker or FakeTicker(bid=472.0, ask=472.3, last=472.15,
@@ -96,6 +98,16 @@ class FakeIB:
         ]
         self._order_state = order_state or FakeOrderState()
         self._next_order_id = next_order_id
+        #: Fill entry orders immediately on placeOrder, leaving STOP orders
+        #: working. Off by default so every pre-batch test sees the original
+        #: behaviour (an order that is placed and stays PreSubmitted).
+        #:
+        #: STOP orders are deliberately NOT filled: a protective stop is
+        #: supposed to sit there, and `wait_for_terminal` waiting on one would
+        #: hang a batch for the full timeout. Tests need that asymmetry to be
+        #: real rather than assumed.
+        self._fills = fills
+        self._fill_price = fill_price
 
         #: Every call, in order. The safety tests read this.
         self.calls: list[str] = []
@@ -137,6 +149,18 @@ class FakeIB:
             order.orderId = self._next_order_id
             self._next_order_id += 1
         trade = FakeTrade(contract=contract, order=order)
+        if self._fills and getattr(order, "orderType", "") != "STP":
+            quantity = float(order.totalQuantity)
+            trade.orderStatus = FakeOrderStatus(
+                status="Filled",
+                filled=quantity,
+                remaining=0.0,
+                avgFillPrice=(
+                    self._fill_price
+                    if self._fill_price is not None
+                    else float(getattr(order, "lmtPrice", 0.0) or 0.0)
+                ),
+            )
         self.placed.append((contract, order))
         return trade
 

@@ -65,6 +65,24 @@ DELAYED_MARKET_DATA = 3
 #: going to happen anyway outside market hours.
 QUOTE_TIMEOUT_S = 6.0
 
+#: Statuses from which an order will not move on its own. IB's own vocabulary;
+#: everything else (``PendingSubmit``, ``PreSubmitted``, ``Submitted``) means
+#: the order is still working.
+TERMINAL_STATUSES = frozenset({"Filled", "Cancelled", "ApiCancelled", "Inactive"})
+
+#: How long a batch waits for one entry order to stop moving before it refuses
+#: to size the next one.
+#:
+#: Only ``execute --all`` uses this. A single order does not need it: the human
+#: is watching, and the book is re-read from the broker next run. A batch has to
+#: know what filled before it can check the next order against the book, and
+#: "probably filled" is not an input a compliance check can use.
+#:
+#: 30s is long for a marketable limit on a liquid name and short enough that a
+#: stuck order does not strand the operator. Timing out is not an error -- see
+#: ``wait_for_terminal``.
+FILL_TIMEOUT_S = 30.0
+
 
 class NoQuoteError(RuntimeError):
     """No usable price for this contract, from any field.
@@ -310,6 +328,59 @@ async def preflight(ib: IB, contract: Stock, order: Order) -> Preflight:
     return Preflight.from_order_state(state)
 
 
+async def wait_for_terminal(
+    trade: Trade, *, timeout_s: float = FILL_TIMEOUT_S, poll_s: float = 0.25,
+) -> bool:
+    """Wait until ``trade`` stops moving. True if it did, False on timeout.
+
+    **Pass the PARENT, never the protective stop.** The child is a GTC
+    ``StopOrder`` whose whole job is to sit there working until the thesis
+    breaks; waiting for it to reach a terminal status would hang every batch
+    for ``timeout_s`` and then report a false timeout.
+
+    **A timeout is not an error, and this does not raise.** The order may well
+    fill a second later. What the caller cannot do is *size the next order*
+    against a book it cannot describe, so the batch stops and says why. The
+    distinction matters: raising here would make a still-working order look
+    like a failure, and the operator would go looking for a problem that is
+    not there.
+
+    ``ib_async`` updates ``trade.orderStatus`` in place from the event loop, so
+    polling it is reading live state rather than a snapshot.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while True:
+        status = trade.orderStatus.status
+        if status in TERMINAL_STATUSES:
+            return True
+        if asyncio.get_running_loop().time() >= deadline:
+            logger.warning(
+                "order %s is still %s after %.0fs (filled %s of %s)",
+                trade.order.orderId, status, timeout_s,
+                trade.orderStatus.filled, trade.order.totalQuantity,
+            )
+            return False
+        await asyncio.sleep(poll_s)
+
+
+def filled_quantity(trade: Trade) -> tuple[int, float]:
+    """Signed shares actually filled, and the average price paid.
+
+    **Signed from the order's own side, not from the plan**, so a caller cannot
+    advance a book in the wrong direction by passing the wrong sign. And it is
+    the *filled* quantity: a partial fill moves the book by what filled, and
+    treating it as the full order would make every later check in a batch wrong
+    in the one direction that matters.
+    """
+    status = trade.orderStatus
+    shares = int(status.filled or 0)
+    if shares == 0:
+        return 0, 0.0
+    side = -1 if trade.order.action.upper() == "SELL" else 1
+    price = float(status.avgFillPrice or 0.0)
+    return side * shares, price
+
+
 async def place(
     ib: IB,
     contract: Stock,
@@ -378,16 +449,20 @@ async def place(
 
 __all__ = [
     "DELAYED_MARKET_DATA",
+    "FILL_TIMEOUT_S",
+    "TERMINAL_STATUSES",
     "NoQuoteError",
     "Quote",
     "TICK",
     "build_orders",
     "connect",
     "contract_for",
+    "filled_quantity",
     "marketable_limit",
     "place",
     "preflight",
     "quote",
     "round_to_tick",
     "stop_price_for",
+    "wait_for_terminal",
 ]
