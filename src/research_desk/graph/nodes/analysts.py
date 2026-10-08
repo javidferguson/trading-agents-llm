@@ -21,7 +21,13 @@ from collections.abc import Awaitable, Callable
 from ...context import NodeContext
 from ...llm.structured import structured
 from ...metrics.render import has_facts_for, render_for_analyst
-from ...models.state import AnalystReport, DecisionState, NodeError, NodePatch
+from ...models.state import (
+    AnalystReport,
+    DecisionState,
+    ErrorSeverity,
+    NodeError,
+    NodePatch,
+)
 from ...prompts import load_prompt
 
 logger = logging.getLogger(__name__)
@@ -55,7 +61,10 @@ def make_analyst(kind: str) -> Callable[[DecisionState, NodeContext], Awaitable[
         if not has_facts_for(state.snapshot, kind):
             reason = f"no {kind} data was available for this symbol"
             logger.info("%s: skipping the model call -- %s", node, reason)
-            return _degraded(node, kind, reason)
+            # PARTIAL, and the only partial emit site in the codebase. An
+            # absent input narrows the decision; it does not void it. See
+            # NodeError.severity for the 31 runs that proved the difference.
+            return _degraded(node, kind, reason, severity="partial")
 
         budget = ctx.extras.get("budget")
         if budget is not None and (spent := budget.exhausted()):
@@ -92,15 +101,30 @@ def make_analyst(kind: str) -> Callable[[DecisionState, NodeContext], Awaitable[
     return analyst
 
 
-def _degraded(node: str, kind: str, reason: str) -> NodePatch:
+def _degraded(
+    node: str, kind: str, reason: str, *, severity: ErrorSeverity = "fatal",
+) -> NodePatch:
     """A missing analyst is recorded, never silently absent.
 
     Downstream has to be able to tell "this analyst had nothing to say" from
     "this analyst was never run" -- the researchers weight reports, and an
     absent one must not read as a neutral one.
+
+    **``severity`` is passed explicitly, and defaults to fatal**, because the
+    three callers mean three different things under one ``kind="no_data"``:
+
+    * an empty slice -- ``partial``. The input was absent.
+    * no snapshot at all -- fatal. There are no prices; ``prefetch`` has
+      already said so in its own error, and this agrees with it.
+    * **budget exhausted -- fatal.** §5 names budget exhaustion as a HOLD
+      trigger in the same breath as a node error, and it is one: the analyst
+      would have had data, and the run ran out of money instead. Nothing about
+      the symbol is missing, so treating it as absent evidence would hide a
+      machinery limit as a data gap.
     """
     return {
         "analyst_reports": {kind: AnalystReport.degraded(reason, kind=kind)},
-        "errors": [NodeError(node=node, kind="no_data", message=reason)],
+        "errors": [NodeError(node=node, kind="no_data", message=reason,
+                             severity=severity)],
         "notes": [f"{node}: degraded -- {reason}"],
     }

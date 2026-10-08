@@ -128,6 +128,25 @@ def test_a_degraded_run_says_so_loudly() -> None:
     assert "THIS RUN DEGRADED" in text
 
 
+def test_partial_coverage_is_named_at_the_gate() -> None:
+    """The severity split stopped these runs tripping the DEGRADED banner, which
+    was the only reason a human ever learned the news analyst was blind. The
+    fact is still owed to whoever is about to approve the order."""
+    text = render(decision=decision(absent_analysts=["news"]))
+    assert "PARTIAL COVERAGE" in text
+    assert "news" in text
+    # And it must not claim the run failed, because it did not.
+    assert "THIS RUN DEGRADED" not in text
+
+
+def test_a_degraded_run_is_not_softened_into_a_coverage_note() -> None:
+    """Both can be true at once -- a run can lose an analyst AND break. The
+    stronger statement is the one that must survive."""
+    text = render(decision=decision(degraded=True, absent_analysts=["news"]))
+    assert "THIS RUN DEGRADED" in text
+    assert "PARTIAL COVERAGE" not in text
+
+
 def test_a_buy_with_no_stop_says_the_risk_cap_assumed_one() -> None:
     """Stated rather than omitted. Sizing's ``cap_risk`` sized this position on
     the arithmetic that a stop bounds the loss; if there is no stop, the human

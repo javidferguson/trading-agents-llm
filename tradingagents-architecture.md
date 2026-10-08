@@ -363,6 +363,72 @@ schema-parse failure after one repair turn →
 `FinalDecision(action="HOLD", rationale="degraded: <reason>")`. Never fail
 toward a trade.
 
+**As built at Stage 7. One correction: "any node error" was too broad, and the
+journal says by how much.** The rule above was implemented literally —
+`degraded = bool(state.errors)` — and it was wrong, because the analyst layer
+records *"this analyst had nothing to read"* as a node error. Over the first 76
+runs:
+
+| | |
+|---|---|
+| runs flagged degraded | 32 |
+| …whose only problem was a missing analyst | **31** |
+| error kinds ever observed | `no_data` ×38, `vetoed` ×1 |
+
+There was never a real machinery failure. What happened 31 times is that a
+symbol had no GDELT history, so the news analyst reported honestly that it was
+blind, and a BUY the fund manager had approved was rewritten to a degraded HOLD.
+With 28 of 32 universe symbols having no news history, a full research sweep
+would have produced ~28 degraded HOLDs for a reason that has nothing to do with
+the symbol — which makes the sweep useless rather than cautious.
+
+It also contradicted the rest of the design, which handles absence carefully
+everywhere else: every unavailable metric states its reason,
+`AnalystReport.data_gaps` exists so an analyst can say what it could not see,
+`render_for_analyst` prints *"NOT AVAILABLE in your area — do not estimate
+them"*, and `prompts/fund_manager.md` already says *"A degraded analyst report
+is absent evidence, not neutral evidence. A proposal resting on one should have
+its conviction cut, not its stance flipped."* The reasoning layer was right. The
+final Python override was blunt.
+
+So `NodeError` gained a `severity`:
+
+* **`fatal`** — the machinery broke. §5 unchanged: the run fails to HOLD.
+* **`partial`** — an input was absent. The decision is narrower, not
+  untrustworthy.
+
+Three things make it safe rather than a loophole:
+
+*Severity is set at the emit site, because `kind` cannot carry it.* `prefetch`
+reports `kind="no_data"` when it cannot build a snapshot at all — no prices,
+genuinely fatal — and the analyst layer reports the same `kind` for an empty
+slice. Only the code raising it knows which it is. The default is **`fatal`**, so
+a future emit site that does not stop to think about this gets §5's behaviour;
+marking something `partial` is a deliberate act. There is exactly one partial
+site today (the empty-slice branch of `analysts.py:_degraded`), and budget
+exhaustion deliberately stays fatal even though it shares that function — §5
+names it, and it is a machinery limit, not a data gap.
+
+*A coverage floor, so a real collapse still voids the run.* `degraded` is now
+`any fatal error, or coverage below the floor`: **at least half the analysts
+that ran are usable, and market is usable when it ran.** Counted against the
+analysts *present* rather than against four, so `--slice` (1 of 1) needs no
+special case while a full graph collapsing to 1 of 4 still holds. Measured
+against all 76 runs, the floor passes every one of them — it adds no veto to
+anything that has actually happened, and catches the case that has not.
+
+*Absence stays visible, because the old behaviour was at least loud.* Dropping
+the DEGRADED banner would have traded a wrong signal for no signal, so
+`FinalDecision.absent_analysts` carries the gap across the §0 split (it is on
+the decision, not on `DecisionState`, because `proposal.json` is all `execute`
+ever sees), the confirmation gate prints a `PARTIAL COVERAGE` line naming the
+blind analysts, and `desk review` flags the run `partial:news`.
+
+*Nothing mechanical changes about sizing or conviction.* Partial coverage is
+recorded and left for §11's calibration plot to measure. Capping conviction on
+coverage now would bake in an unmeasured belief, and `conviction_w` was removed
+three commits earlier precisely to keep conviction a clean measurement.
+
 ---
 
 ## 6. Model routing

@@ -133,12 +133,32 @@ def test_outside_a_container_the_message_blames_docker_not_the_container(
     assert "cannot run inside a container" not in text
 
 
-def test_in_container_detection_is_false_on_this_host(guard) -> None:
-    """The suite runs on the host, so the detector must say so.
-
-    Guards against a detector that returns True everywhere, which would make
+def test_in_container_detection_is_false_with_no_container_markers(
+    guard, monkeypatch
+) -> None:
+    """Guards against a detector that returns True everywhere, which would make
     the container branch above fire for real users on their own machines.
+
+    **This used to assert ``in_container() is False`` against the real
+    environment**, on the reasoning that "the suite runs on the host". It does
+    not: ``make verify`` runs its test gate through ``$(RUN)``, deliberately, so
+    that a gate cannot report a context it did not use. The detector was then
+    correct and the test failed -- the same defect as a test reading
+    ``data/portfolio.yaml``, which is state rather than a fixture. The
+    environment is stubbed here so the test asserts the detector's logic from
+    either side of the container boundary.
     """
+    class FakePath:
+        def __init__(self, value: str) -> None:
+            self._value = value
+
+        def exists(self) -> bool:
+            return False  # no /.dockerenv
+
+        def read_text(self) -> str:
+            return "0::/user.slice/user-501.slice"  # a host cgroup
+
+    monkeypatch.setattr(guard, "Path", FakePath)
     assert guard.in_container() is False
 
 

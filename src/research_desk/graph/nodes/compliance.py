@@ -52,7 +52,8 @@ NODE = "compliance"
 
 
 def _promote(state: DecisionState, *, expires_at: datetime,
-             stop_pct: float | None, degraded: bool) -> FinalDecision:
+             stop_pct: float | None, degraded: bool,
+             absent_analysts: list[str]) -> FinalDecision:
     """The fund manager's verdict when there is one, the trader's otherwise.
 
     The ``--slice`` and ``--research`` graphs stop before the risk committee, so
@@ -62,6 +63,7 @@ def _promote(state: DecisionState, *, expires_at: datetime,
         return _final_from_verdict(
             state.risk_verdict, state.symbol,
             expires_at=expires_at, stop_loss_pct=stop_pct, degraded=degraded,
+            absent_analysts=absent_analysts,
         )
 
     proposal = state.trader_proposal or TraderProposal.degraded(
@@ -70,6 +72,7 @@ def _promote(state: DecisionState, *, expires_at: datetime,
     return FinalDecision.from_proposal(
         proposal, state.symbol,
         expires_at=expires_at, stop_loss_pct=stop_pct, degraded=degraded,
+        absent_analysts=absent_analysts,
     )
 
 
@@ -118,11 +121,19 @@ async def compliance(state: DecisionState, ctx: NodeContext) -> NodePatch:
 
     ttl_hours = float(intent.cadence.proposal_ttl_hours)
     expires_at = datetime.now() + timedelta(hours=ttl_hours)
-    degraded = bool(state.errors)
+
+    # NOT `bool(state.errors)`, which is what this was and what rewrote 31 of
+    # 32 degraded runs' BUYs to HOLD because a symbol had no GDELT history.
+    # A fatal error or a coverage collapse voids the decision; a single absent
+    # analyst narrows it, and is reported on the decision instead. See
+    # DecisionState.degraded_reason and NodeError.severity.
+    degraded = state.is_degraded()
+    absent = state.absent_analysts()
 
     decision = _promote(
         state, expires_at=expires_at,
         stop_pct=intent.risk.default_stop_pct, degraded=degraded,
+        absent_analysts=absent,
     )
     if degraded and decision.action != "HOLD":
         # Belt and braces, as in persist: a degraded run must not carry a trade
@@ -191,6 +202,12 @@ async def compliance(state: DecisionState, ctx: NodeContext) -> NodePatch:
     ]
     for violation in plan.violations:
         notes.append(f"{NODE}: {violation.render()}")
+    if absent and not degraded:
+        # Said once more, here, because this is the run that went ahead anyway.
+        notes.append(
+            f"{NODE}: partial coverage -- {', '.join(absent)} had no data;"
+            " the decision stands on the rest"
+        )
 
     return {
         "final_decision": decision,

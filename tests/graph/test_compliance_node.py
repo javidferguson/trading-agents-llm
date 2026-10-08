@@ -22,7 +22,13 @@ from research_desk.context import NodeContext
 from research_desk.graph.nodes.compliance import compliance
 from research_desk.intent.engine import load_portfolio
 from research_desk.models.market import MarketSnapshot
-from research_desk.models.state import DecisionState, NodeError, RiskVerdict, TraderProposal
+from research_desk.models.state import (
+    AnalystReport,
+    DecisionState,
+    NodeError,
+    RiskVerdict,
+    TraderProposal,
+)
 
 #: Derived from the shipped book rather than hardcoded, deliberately.
 #:
@@ -98,6 +104,14 @@ def verdict(action="BUY", weight=7.0, conviction=0.8, decision="approve") -> Ris
         rationale="The committee is satisfied with the risk on this position.",
         dissent="A liquidity shock would hit this name harder than the index.",
         invalidation="A close below the 200-day moving average would end this.",
+    )
+
+
+def analyst(kind: str) -> AnalystReport:
+    return AnalystReport(
+        kind=kind, stance="bullish", confidence=0.6,
+        summary="momentum has improved against the sector since August",
+        key_points=["price above the 200-day", "volume expanding", "sector lags"],
     )
 
 
@@ -261,6 +275,52 @@ async def test_a_degraded_run_cannot_carry_a_trade_into_sizing(tmp_path) -> None
     assert patch["order_plan"].quantity == 0
 
 
+async def test_an_absent_analyst_does_not_void_an_approved_buy(tmp_path) -> None:
+    """The bug this node had for 31 runs. A symbol with no GDELT history came
+    out as a degraded HOLD however good the rest of the analysis was.
+
+    The severity split is in ``NodeError``; what this asserts is that the node
+    reads it -- the line used to be ``degraded = bool(state.errors)``.
+    """
+    patch = await compliance(
+        state(
+            analyst_reports={
+                "market": analyst("market"),
+                "news": AnalystReport.degraded("no news data", kind="news"),
+                "positioning": analyst("positioning"),
+                "fundamentals": analyst("fundamentals"),
+            },
+            errors=[NodeError(node="news_analyst", kind="no_data",
+                              message="no news data was available",
+                              severity="partial")],
+        ),
+        ctx(tmp_path),
+    )
+    decision = patch["final_decision"]
+    assert decision.action == "BUY"
+    assert not decision.degraded
+    # And the gap is on the artefact `execute` reads, not only in the notes.
+    assert decision.absent_analysts == ["news"]
+    assert "partial coverage" in "\n".join(patch["notes"])
+
+
+async def test_coverage_collapsing_still_holds(tmp_path) -> None:
+    """Softening §5 was never the point. Three of four analysts absent is not
+    a narrower decision, it is nothing to decide from."""
+    patch = await compliance(
+        state(analyst_reports={
+            "market": analyst("market"),
+            "news": AnalystReport.degraded("no news data", kind="news"),
+            "positioning": AnalystReport.degraded("none", kind="positioning"),
+            "fundamentals": AnalystReport.degraded("none", kind="fundamentals"),
+        }),
+        ctx(tmp_path),
+    )
+    assert patch["final_decision"].action == "HOLD"
+    assert patch["final_decision"].degraded
+    assert patch["order_plan"].quantity == 0
+
+
 async def test_a_missing_proposal_produces_a_hold_not_a_crash(tmp_path) -> None:
     patch = await compliance(state(trader_proposal=None), ctx(tmp_path))
     assert patch["final_decision"] is None or \
@@ -344,6 +404,44 @@ async def test_proposal_json_carries_the_order_plan_and_the_book(tmp_path) -> No
     assert "caps_pct" in written["order_plan"]
     assert written["book"]["equity"] > 0
     assert written["book"]["source"] in {"seed", "cache", "ib"}
+
+
+async def test_an_absent_analyst_reaches_execute_as_an_actionable_buy(tmp_path) -> None:
+    """End to end over the §0 split, which is where the bug actually bit: the
+    only thing `execute` ever sees is this file, and for 31 runs it read HOLD.
+
+    Asserted on the written JSON rather than on the patch, because the carry
+    through ``FinalDecision`` is the part that could silently be dropped.
+    """
+    from research_desk.graph.nodes.persist import persist
+
+    errors = [NodeError(node="news_analyst", kind="no_data",
+                        message="no news data was available",
+                        severity="partial")]
+    reports = {
+        "market": analyst("market"),
+        "news": AnalystReport.degraded("no news data", kind="news"),
+        "positioning": analyst("positioning"),
+        "fundamentals": analyst("fundamentals"),
+    }
+    patch = await compliance(
+        state(analyst_reports=reports, errors=errors), ctx(tmp_path)
+    )
+    held = DecisionState(
+        run_id="t", symbol="TSM", as_of=AS_OF, errors=errors,
+        analyst_reports=reports,
+        final_decision=patch["final_decision"], order_plan=patch["order_plan"],
+        portfolio=patch["portfolio"],
+    )
+    await persist(held, ctx(tmp_path))
+
+    written = json.loads(
+        next((tmp_path / "proposals").glob("TSM_*.json")).read_text()
+    )
+    assert written["decision"]["action"] == "BUY"
+    assert written["decision"]["degraded"] is False
+    assert written["decision"]["absent_analysts"] == ["news"]
+    assert written["order_plan"]["quantity"] > 0
 
 
 # --------------------------------------------------------------------------- #

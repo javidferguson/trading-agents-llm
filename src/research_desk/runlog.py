@@ -194,6 +194,10 @@ def render_summary(state: DecisionState) -> str:
     flags = []
     if decision is not None and decision.degraded:
         flags.append("DEGRADED")
+    elif decision is not None and decision.absent_analysts:
+        # A sweep's whole job is to show where coverage is thin, and after the
+        # severity split these runs no longer carry a DEGRADED flag to say so.
+        flags.append("partial:" + ",".join(decision.absent_analysts))
     if plan is not None and plan.blocked:
         flags.append("VETOED:" + ",".join(v.rule for v in plan.blocking))
     elif plan is not None and plan.warnings:
@@ -327,7 +331,16 @@ def render_run(state: DecisionState, *, full: bool = False) -> str:
         out += [
             "",
             "DEGRADED -- this HOLD is a failure, not a judgement.",
-            f"  {state.degraded_reason()}",
+            # `or` because a proposal can be marked degraded by its own
+            # `parse_failed` with no NodeError behind it, and a bare "None" as
+            # the reason is worse than saying nothing specific.
+            f"  {state.degraded_reason() or 'the proposal would not parse'}",
+        ]
+    elif decision.absent_analysts:
+        out += [
+            "",
+            "PARTIAL COVERAGE -- this decision is narrower, not untrustworthy.",
+            f"  no data for: {', '.join(decision.absent_analysts)}",
         ]
 
     return "\n".join(out)

@@ -10,8 +10,10 @@ Two artefacts, two jobs, and §1 is explicit that they must not be merged:
   what `execute` reads, and the only thing it reads. One decision per file,
   named by run.
 
-Failure direction is HOLD (§5). If any node errored, or the trader degraded, the
-decision written here is a HOLD carrying the reason -- never a trade.
+Failure direction is HOLD (§5). If any node failed **fatally**, or the trader
+degraded, the decision written here is a HOLD carrying the reason -- never a
+trade. An analyst that merely had nothing to read is recorded in
+``absent_analysts`` and does not force a HOLD; see ``NodeError.severity``.
 
 **Stage 6 moved the promotion out of this node.** ``compliance`` (node 14) now
 promotes the verdict, sizes it and may veto it, so this node writes what that
@@ -55,7 +57,13 @@ async def persist(state: DecisionState, ctx: NodeContext) -> NodePatch:
     ttl_hours = float(cadence.get("proposal_ttl_hours", DEFAULT_TTL_HOURS))
 
     proposal = state.trader_proposal
-    degraded = bool(state.errors) or proposal is None or proposal.parse_failed
+    # `state.is_degraded()` rather than `bool(state.errors)`: an analyst with no
+    # data narrows the decision, it does not void it. The same test compliance
+    # applies -- shared on DecisionState, because this node answers the question
+    # independently for the `--slice` and `--research` shapes, which have no
+    # compliance node, and two copies of this rule would be two rules.
+    degraded = state.is_degraded() or proposal is None or proposal.parse_failed
+    absent = state.absent_analysts()
 
     if state.final_decision is not None:
         # The compliance node already promoted, sized and checked. Writing is
@@ -85,11 +93,13 @@ async def persist(state: DecisionState, ctx: NodeContext) -> NodePatch:
         decision = _final_from_verdict(
             state.risk_verdict, state.symbol,
             expires_at=expires_at, stop_loss_pct=stop_pct, degraded=degraded,
+            absent_analysts=absent,
         )
     else:
         decision = FinalDecision.from_proposal(
             proposal, state.symbol,
             expires_at=expires_at, stop_loss_pct=stop_pct, degraded=degraded,
+            absent_analysts=absent,
         )
 
     if degraded and decision.action != "HOLD":

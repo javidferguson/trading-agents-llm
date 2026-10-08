@@ -419,7 +419,23 @@ class FinalDecision(BaseModel):
 
     #: True when any node degraded. Carried so `execute` can see that a HOLD
     #: was a failure rather than a judgement.
+    #:
+    #: **Only a FATAL error sets this** -- see ``NodeError.severity``. A missing
+    #: analyst is reported in ``absent_analysts`` instead, because it narrows a
+    #: decision rather than voiding it.
     degraded: bool = False
+
+    #: Which analysts had nothing to read, by ``AnalystReport.kind``.
+    #:
+    #: This exists because the severity split traded a loud signal for a quiet
+    #: one. Before it, a symbol with no news history produced a run stamped
+    #: DEGRADED, so the gap was impossible to miss. Now the run is actionable --
+    #: which is correct -- and the gap would vanish from every summary unless it
+    #: were carried deliberately. So it is carried here, on the artefact
+    #: `execute` reads, rather than on ``DecisionState``, which never reaches
+    #: ``proposal.json``: the human approving the order is exactly who needs to
+    #: know the news analyst was blind.
+    absent_analysts: list[str] = Field(default_factory=list)
 
     @classmethod
     def from_proposal(
@@ -430,6 +446,7 @@ class FinalDecision(BaseModel):
         expires_at: datetime,
         stop_loss_pct: float | None = None,
         degraded: bool = False,
+        absent_analysts: list[str] | None = None,
     ) -> "FinalDecision":
         """Promote a trader proposal with no fund manager in between.
 
@@ -453,6 +470,7 @@ class FinalDecision(BaseModel):
             expires_at=expires_at,
             fund_manager_adjustment=None,
             degraded=degraded or proposal.parse_failed,
+            absent_analysts=list(absent_analysts or []),
         )
 
 
@@ -463,6 +481,7 @@ def _final_from_verdict(
     expires_at: datetime,
     stop_loss_pct: float | None = None,
     degraded: bool = False,
+    absent_analysts: list[str] | None = None,
 ) -> "FinalDecision":
     """Promote the fund manager's verdict. The Stage 5 replacement for the shim.
 
@@ -484,6 +503,7 @@ def _final_from_verdict(
         expires_at=expires_at,
         fund_manager_adjustment=verdict.adjustment or None,
         degraded=degraded or verdict.parse_failed,
+        absent_analysts=list(absent_analysts or []),
     )
 
 
@@ -517,17 +537,61 @@ class LLMCallRecord(BaseModel):
     at: datetime = Field(default_factory=datetime.now)
 
 
-class NodeError(BaseModel):
-    """A node that failed. Recorded rather than raised, so the run degrades.
+#: Whether an error voids the decision or merely narrows it.
+#:
+#: ``fatal``   -- the machinery broke. The decision is untrustworthy, so the run
+#:                fails to HOLD (§5, "never fail toward a trade").
+#: ``partial`` -- an INPUT was absent. The decision is narrower, not
+#:                untrustworthy, and the rest of the design already handles that
+#:                gracefully.
+ErrorSeverity = Literal["fatal", "partial"]
 
-    Failure direction is always HOLD (architecture §5) -- never fail toward a
-    trade.
+
+class NodeError(BaseModel):
+    """A node that failed, or an input that was missing. Recorded, never raised.
+
+    **The severity split is a correction to §5, measured.** §5 says *"Any node
+    error, budget exhaustion, or schema-parse failure after one repair turn ->
+    FinalDecision(action='HOLD')"*, and the code followed it literally: any
+    error at all voided the decision.
+
+    What §5 did not anticipate is that "an analyst had nothing to read" would be
+    recorded as a node error. Over the first 76 runs, **31 of the 32 degraded
+    runs had no problem other than a missing analyst** -- the news analyst with
+    no GDELT history, over and over -- and a BUY the fund manager had approved
+    was rewritten to a degraded HOLD each time. There was never a real
+    machinery failure.
+
+    That also contradicted everything around it. Unavailable metrics state their
+    reason, ``AnalystReport.data_gaps`` exists so an analyst can say what it
+    could not see, ``render_for_analyst`` tells each one "these are absent, not
+    zero -- do not estimate them", and ``fund_manager.md`` says in as many
+    words: *"A degraded analyst report is absent evidence, not neutral
+    evidence. A proposal resting on one should have its conviction cut, not its
+    stance flipped."* The reasoning layer was right; the final Python override
+    was blunt.
+
+    **Severity is set at the emit site, because ``kind`` cannot carry it.**
+    ``prefetch`` reports ``kind="no_data"`` when it cannot build a snapshot at
+    all -- no prices, nothing to reason from, genuinely fatal -- and the analyst
+    layer reports the same ``kind`` for an empty slice, which is not. Only the
+    code raising it knows which it is. Same pattern as ``Violation.severity`` in
+    ``intent/compliance.py``.
+
+    **The default is ``fatal`` on purpose.** A new error site that does not stop
+    to think about this fails safe, which is what §5 actually wants. Marking
+    something ``partial`` has to be a deliberate act.
     """
 
     node: str
     kind: str
     message: str
+    severity: ErrorSeverity = "fatal"
     at: datetime = Field(default_factory=datetime.now)
+
+    @property
+    def is_fatal(self) -> bool:
+        return self.severity == "fatal"
 
 
 class DecisionState(BaseModel):
@@ -625,11 +689,90 @@ class DecisionState(BaseModel):
     # --- arriving in later stages --------------------------------------------
     # Stage 9: memory_hits, regime
 
-    def degraded_reason(self) -> str | None:
-        """Why this run should fail toward HOLD, or ``None`` if it is healthy."""
-        if not self.errors:
+    # --- degradation: did the machinery break, or was an input missing? ------
+    #
+    # Four methods, and the reason they are here rather than in the compliance
+    # node is that TWO nodes have to answer the question independently.
+    # ``compliance`` answers it for the full graph; ``persist`` answers it for
+    # the ``--slice`` and ``--research`` shapes, which have no compliance node.
+    # Two copies of a rule this consequential would be two rules the first time
+    # one of them was edited.
+
+    @property
+    def fatal_errors(self) -> list[NodeError]:
+        """Errors that void the decision. See ``NodeError.severity``."""
+        return [e for e in self.errors if e.is_fatal]
+
+    def absent_analysts(self) -> list[str]:
+        """Analyst kinds that ran but had nothing usable to say.
+
+        Keyed on ``parse_failed``, which is what ``Degradable.degraded()`` sets
+        and therefore covers both "the slice was empty" and "the model's output
+        would not parse". Sorted so the field is stable across runs and diffable
+        in ``proposal.json``.
+        """
+        return sorted(k for k, r in self.analyst_reports.items() if r.parse_failed)
+
+    def coverage_collapsed(self) -> str | None:
+        """Why analyst coverage is too thin to decide on, or ``None``.
+
+        The floor that keeps the severity split honest. A single missing analyst
+        narrows a decision; losing most of them means there was nothing to
+        reason from, and that is a failure however it is labelled.
+
+        Two conditions, measured against the first 76 runs -- all of which
+        pass, so this adds no new veto to anything that has actually happened:
+
+        1. **At least half of those that ran are usable.** Counted against the
+           analysts *present*, not against four, so ``--slice`` (1 of 1) passes
+           with no special case while a full graph collapsing to 1 of 4 fails.
+        2. **Market is usable when it ran.** It is the only slice built from
+           prices, so the others are commentary on a number nobody has. Nearly
+           free: market only lacks data when ``prefetch`` already failed, which
+           is fatal on its own -- belt and braces rather than a new constraint.
+
+        **No analysts at all is not a collapse**, which looks wrong and is not.
+        ``make_analyst`` writes a report on every path it can return from; the
+        one path that writes none -- no router on the context -- raises
+        ``misconfigured``, which is fatal on its own. So an empty dict means the
+        *graph shape* has no analysts (the Stage 0 linear and fan-out harnesses),
+        not that a fan-out vanished. Degrading on it would fail runs for the
+        shape of their graph, and the vacuous-floor case it was meant to catch
+        is already caught one layer up, more specifically.
+        """
+        present = set(self.analyst_reports)
+        if not present:
             return None
-        return "; ".join(f"{e.node}: {e.kind}" for e in self.errors)
+
+        absent = set(self.absent_analysts())
+        usable = present - absent
+
+        if "market" in absent:
+            return "the market analyst had no data"
+        if len(usable) * 2 < len(present):
+            return (
+                f"only {len(usable)} of {len(present)} analysts had data"
+                f" ({', '.join(sorted(absent))} absent)"
+            )
+        return None
+
+    def degraded_reason(self) -> str | None:
+        """Why this run should fail toward HOLD, or ``None`` if it is healthy.
+
+        **Fatal errors only, plus a coverage collapse.** This string is written
+        into the HOLD rationale, so a partial cause must never appear in it: a
+        run that reads "degraded: news_analyst: no_data" while still producing
+        an actionable BUY is a contradiction a human cannot resolve. Absence is
+        reported through ``FinalDecision.absent_analysts`` instead.
+        """
+        reasons = [f"{e.node}: {e.kind}" for e in self.fatal_errors]
+        if (collapsed := self.coverage_collapsed()) is not None:
+            reasons.append(f"analyst coverage: {collapsed}")
+        return "; ".join(reasons) or None
+
+    def is_degraded(self) -> bool:
+        """Whether the decision is untrustworthy -- not merely narrower."""
+        return self.degraded_reason() is not None
 
 
 #: What a node returns: a partial-state patch, never a mutated state object.
@@ -639,6 +782,7 @@ NodePatch = dict[str, Any]
 
 __all__ = [
     "AnalystReport",
+    "ErrorSeverity",
     "DebateTranscript",
     "DebateTurn",
     "FinalDecision",

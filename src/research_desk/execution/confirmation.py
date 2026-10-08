@@ -288,6 +288,18 @@ def render_decision(
             "  >> THIS RUN DEGRADED. At least one node produced no usable",
             "     output, so this order rests on less than a full analysis. <<",
         ]
+    elif decision.absent_analysts:
+        # Not a warning about the order -- a statement about what was read
+        # before it. It takes the place of the DEGRADED banner this case used
+        # to trip: the run is actionable now, and the human approving it is
+        # still owed the fact that an analyst was blind.
+        lines += [
+            "",
+            f"  PARTIAL COVERAGE: {', '.join(decision.absent_analysts)}"
+            " had no data for this symbol.",
+            "  The decision stands on the remaining analysts. Absent evidence,",
+            "  not neutral evidence.",
+        ]
 
     lines.append("=" * RULE)
     return "\n".join(lines)

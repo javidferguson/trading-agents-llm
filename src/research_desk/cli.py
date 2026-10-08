@@ -481,7 +481,10 @@ async def _run_decide(
     if decision.degraded:
         print()
         print("DEGRADED -- this HOLD is a failure, not a judgement.")
-        print(f"  {state.degraded_reason()}")
+        # `or` because a proposal can be marked degraded by its own
+        # `parse_failed` with no NodeError behind it, and printing a bare
+        # "None" as the reason is worse than saying nothing specific.
+        print(f"  {state.degraded_reason() or 'the proposal would not parse'}")
         return 1
 
     if plan is not None and plan.blocked:

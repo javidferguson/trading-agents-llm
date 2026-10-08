@@ -239,6 +239,27 @@ def test_the_summary_line_distinguishes_vetoed_from_degraded() -> None:
     assert "DEGRADED" in degraded
 
 
+def test_partial_coverage_is_flagged_without_claiming_a_failure() -> None:
+    """A sweep exists to show where coverage is thin, and after the severity
+    split these runs no longer carry DEGRADED to say so."""
+    state = run(final_decision=decision("BUY").model_copy(
+        update={"absent_analysts": ["news"]}))
+    line = render_summary(state)
+    assert "partial:news" in line
+    assert "DEGRADED" not in line
+
+    text = render_run(state)
+    assert "PARTIAL COVERAGE" in text
+    assert "narrower, not untrustworthy" in text
+
+
+def test_a_degraded_run_outranks_a_coverage_note_in_the_summary() -> None:
+    line = render_summary(run(action="HOLD", final_decision=decision(
+        "HOLD", degraded=True).model_copy(update={"absent_analysts": ["news"]})))
+    assert "DEGRADED" in line
+    assert "partial:" not in line
+
+
 def test_a_warning_is_shown_without_claiming_a_block() -> None:
     plan = OrderPlan(
         symbol="TSM", as_of=AS_OF, action="BUY", quantity=11,

@@ -621,3 +621,26 @@ before building anything:
 
 Not urgent: executing one symbol at a time with `make sync-book` between is
 correct, and the re-check now makes it safe even when the book has moved.
+
+## The 31 historical degraded runs are not being retro-fixed
+
+`NodeError.severity` split "an input was absent" from "the machinery broke"
+(architecture §5, "As built at Stage 7"). Before it, 31 of the 32 degraded runs
+in the journal were degraded only because an analyst had no data, and each one
+rewrote an approved BUY to a HOLD.
+
+Those runs stay as they are. The JSONL is §1's source of truth for replay and
+audit — it records what the code *did*, not what today's code would do — and
+editing it so the HOLDs become BUYs would make every one of them a decision
+nobody ever made and no human was ever shown. Replay would then be a lie about
+the one thing it exists to prove.
+
+The practical consequence is that **any analysis spanning the split has to read
+`FinalDecision.absent_analysts` as well as `degraded`**, and that Stage 8's hit
+rate cannot be computed across the boundary without saying which side a run came
+from. The run ids are dated, so the boundary is findable; this commit is the
+line.
+
+Also: those 31 HOLDs are not just mislabelled, they are *missing decisions* —
+the fund manager's BUY was never acted on and never will be. They are usable as
+evidence about the pipeline, not as evidence about the strategy.
