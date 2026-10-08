@@ -177,11 +177,32 @@ execute:  ## THE STAGE 7 GATE: place an approved proposal. Needs a human and the
 	@# `compose run` not `$(RUN)`: the confirmation gate reads stdin, so the
 	@# execute service sets stdin_open/tty. A closed stdin DECLINES rather than
 	@# proceeding, which is why this must not be run detached.
-	$(COMPOSE) --profile execute run --rm execute execute $(EXEC_ARGS)
+	@#
+	@# --build IS NOT OPTIONAL HERE, and this is the one target where it is
+	@# worth the seconds.
+	@#
+	@# The `dev` service bind-mounts the WHOLE REPO at /app, so source edits are
+	@# live and nothing goes stale. `execute` deliberately mounts only data/,
+	@# logs/, config/ and prompts/ -- NOT src/ -- so the process that places
+	@# real orders runs built, reviewed code rather than whatever happens to be
+	@# in the working tree. That is a feature.
+	@#
+	@# The cost is that its image goes stale silently. Stage 7 exposed the loud
+	@# version: the `execute` console script did not exist in the image yet, so
+	@# the container died with "executable file not found in $$PATH". The
+	@# dangerous version is subtler -- change a sizing rule or a safety check in
+	@# broker.py and a stale image runs YESTERDAY'S order logic against today's
+	@# proposal, with no indication whatsoever. For the one process that moves
+	@# money, always-current beats fast.
+	@#
+	@# Layer caching makes this nearly free when nothing changed.
+	$(COMPOSE) --profile execute run --rm --build execute execute $(EXEC_ARGS)
 
 .PHONY: execute-list
 execute-list:  ## Which proposals are pending, and which already executed
-	$(COMPOSE) --profile execute run --rm execute execute --list
+	@# --build for the same reason as above: this reads receipts written by the
+	@# code it is about to run.
+	$(COMPOSE) --profile execute run --rm --build execute execute --list
 
 .PHONY: gateway-stop
 gateway-stop:  ## Stop this project's IB Gateway. Never touches ajj-ib-gateway.
