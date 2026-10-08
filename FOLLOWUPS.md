@@ -434,3 +434,82 @@ everything is buyable.
 
 `make portfolio-seed` still installs the demo book, which is useful for working
 on `decide` without a Gateway. Just expect `execute` to refuse it.
+
+## Langfuse traces nodes, not model calls
+
+**What works.** `obs/tracing.py:traced_node` wraps every node body at graph
+assembly time, so each node is one span. Verified 2026-10-08: 354 spans in
+project `desk`, continuous from 2026-08-28 (Stage 0) to the previous night's
+runs, covering all 17 node types -- `prefetch`, the four analysts, bull/bear/
+facilitator, `trader`, the risk trio, `fund_manager`, `compliance`, `persist`.
+
+**What is missing, and it is the thing Langfuse is actually for.** There are no
+**generations**: no prompt, no completion, no token counts, no model name, no
+cost, no per-attempt detail. `_summarise` deliberately sends only scalar fields
+and collection *lengths*, for a stated reason -- *"shipping all of it to the
+collector on every node makes traces unreadable and slow"* -- and that reasoning
+holds for the node INPUT. It is the wrong trade for the model call itself.
+
+So Langfuse answers "the bull researcher ran and took 30s" but not "what did it
+say", and it cannot answer "what did this cost" or "how many tokens" at all.
+
+**The data is not lost.** `LLMCallRecord` in the decision journal already carries
+everything a generation needs: `raw_response`, `thinking`, `prompt_tokens`,
+`completion_tokens`, `latency_ms`, `model`, `model_digest`, `usd`, `attempt`,
+`parse_failed`. `desk review --full` prints the summary of it. Nothing is
+unrecoverable; it is simply not in the place built for looking at it.
+
+**Why this matters before Stage 8 rather than after.** §11 wants a calibration
+plot and §12 wants the cost table re-derived. Both are computable from the JSONL,
+but the per-call view is also how you debug *why* a weak local model produced a
+bad report -- which is most of Stage 4-5's remaining work. Doing it by grepping
+JSONL when a UI exists for it is the kind of friction §4's third stopping rule
+warns about: *"if `decide` stops being fun to iterate on"*.
+
+**Sketch of the fix.** `llm/structured.py` already returns `LLMCallRecord`s, and
+`traced_node` already holds an open span when they are produced. Emit a child
+observation per record with `as_type="generation"`, mapping `prompt_tokens` /
+`completion_tokens` to Langfuse's usage fields and `model` to its model field so
+its own cost table applies. The repair turn should be its own generation
+(`attempt=2`), because a run where every call needed a repair is a different
+run and the trace should show that.
+
+Keep the existing node spans: the parent/child shape is what makes a 14-node
+run readable.
+
+## Langfuse: one API key pair, one project
+
+Measured, because it decides what is safe to change. `api_keys` has exactly one
+row, scoped to project `desk`, and `LANGFUSE_INIT_PROJECT_PUBLIC_KEY` /
+`SECRET_KEY` in `docker/docker-compose.langfuse.yml` are the **same variables
+the app reads** (`LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`).
+
+Consequences worth writing down:
+
+* **The `LANGFUSE_INIT_*` block is a bootstrap, not a project manager.** It
+  cannot give you two live projects. Pointing it at a new `PROJECT_ID` without
+  also issuing a new key pair tries to provision a project with keys already
+  bound to `desk`.
+* **Changing the project means changing where `decide` writes**, because the
+  app and the provisioner share the key variables. That is fine and even useful
+  for a clean project per experiment (Stage 8 A/B), but it is an either/or
+  rather than additive.
+* **A project created in the UI has no API key until you generate one there.**
+  That is why the hand-made `trading-llm-test-test` project was empty: nothing
+  could ever have written to it.
+
+**What breaks if the wrong variable changes** -- none of these destroy trace
+history, which lives in ClickHouse keyed on `project_id`:
+
+| Variable | What actually breaks |
+|---|---|
+| `LANGFUSE_SALT` | API keys are hashed with it, so the SDK stops authenticating until new keys are issued. History intact. |
+| `LANGFUSE_ENCRYPTION_KEY` | Secrets stored *inside* Langfuse (LLM keys pasted into the UI, integration creds) stop decrypting. History intact. |
+| `LANGFUSE_PUBLIC_KEY` / `SECRET_KEY` | New events go to whatever project the new pair belongs to. Old events stay where they were. |
+| `NEXTAUTH_SECRET` | Browser sessions only. Log in again. |
+
+**And the one that actually caused trouble:** `LANGFUSE_INIT_USER_EMAIL` and
+`LANGFUSE_INIT_USER_PASSWORD` were empty, so first boot provisioned the org,
+the project and the API key but **no user** -- an org nobody is a member of.
+Tracing worked perfectly and was invisible in the UI for six weeks. Setting
+those two and recreating `langfuse-web` is additive and safe.

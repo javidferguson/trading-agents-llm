@@ -166,6 +166,11 @@ services:
     profiles: [langfuse]
     environment:
       POSTGRES_USER: postgres
+      # Read ONLY by initdb, on an empty volume. After that the password lives
+      # in the database, so editing .env later changes what clients send and
+      # not what the server expects -- langfuse-web then crash-loops on P1000
+      # "Authentication failed", whose hint blames URL-encoding. See example.env
+      # for the ALTER USER rotation procedure.
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: postgres
       TZ: UTC
