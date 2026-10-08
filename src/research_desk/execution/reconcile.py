@@ -2,7 +2,7 @@
 
 ``execute`` is the **only** process that can see the real positions -- that is
 the §0 split working as designed -- and the share count on the proposal was
-computed from ``config/portfolio.yaml``. If the file disagrees with the account,
+computed from ``data/portfolio.yaml``. If the file disagrees with the account,
 the number is wrong, and approving it means approving arithmetic over a bad
 input.
 
@@ -13,7 +13,7 @@ per-symbol diff, a REJECTED banner, and one narrow question -- rewrite the book
 from the broker? -- followed by "re-run `desk decide`".
 
 Rewriting is also the thing Stage 6 promised and never delivered:
-``config/portfolio.yaml``'s own header says *"At Stage 7, `execute` overwrites
+the book's own header says *"At Stage 7, `execute` overwrites
 this file from the live paper account and `source:` becomes `ib`."* This is
 that.
 
@@ -257,7 +257,7 @@ async def book_from_ib(
 ) -> PortfolioSnapshot:
     """Build a ``PortfolioSnapshot`` from the account. ``source="ib"``.
 
-    This is what ``config/portfolio.yaml``'s header has promised since Stage 6.
+    This is what ``data/portfolio.yaml``'s header has promised since Stage 6.
 
     **Marks come from the broker's average cost, not from a quote.** A position
     needs a ``last_price`` and fetching 15 live quotes to write a file would be

@@ -254,7 +254,7 @@ def test_a_warning_is_shown_without_claiming_a_block() -> None:
 def test_the_book_is_rendered_as_it_was_not_as_it_is() -> None:
     """A replay must show the weights the decision was actually made against.
 
-    config/portfolio.yaml is overwritten on every re-mark, so the book is
+    data/portfolio.yaml is overwritten on every re-mark, so the book is
     recorded in the run rather than referenced.
     """
     book = PortfolioSnapshot(

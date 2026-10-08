@@ -141,7 +141,7 @@ def _write(state: DecisionState, decision: FinalDecision, ctx: NodeContext) -> d
         body["order_plan"] = state.order_plan.model_dump(mode="json")
 
     # Not the whole book -- the two facts that make the plan auditable without
-    # reopening config/portfolio.yaml, which is overwritten on every re-mark.
+    # reopening data/portfolio.yaml, which is overwritten on every re-mark.
     if state.portfolio is not None:
         body["book"] = {
             "as_of": state.portfolio.as_of.isoformat(),

@@ -39,7 +39,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from ..config import CONFIG_DIR, load_yaml
+from ..config import CONFIG_DIR, REPO_ROOT, load_yaml
 from ..models.intent import PortfolioIntent, Theme
 from ..models.portfolio import PortfolioSnapshot
 
@@ -66,9 +66,25 @@ BAND_FRACTION = 0.25
 #: target exceeds its own band, so the next widening fails loudly here instead.
 BAND_FLOOR_PCT = 0.5
 
-#: The file the book lives in. Not in ``CONFIG_FILES``, and not in
-#: ``config_hash`` -- see ``load_portfolio``.
+#: The file the book lives in, and the directory matters.
+#:
+#: **``data/``, not ``config/``, and that is the second half of a lesson.** The
+#: book was committed through Stage 6 and then gitignored, because it is state
+#: rather than configuration. It kept living in ``config/`` anyway, and Stage 7
+#: showed why that was wrong: the ``execute`` service mounts ``config`` as
+#: READ-ONLY, deliberately, so the process that places orders can never rewrite
+#: ``portfolio-intent.yaml`` and relax its own risk limits. Correct -- and it
+#: also made it impossible for ``execute`` to write the book it is supposed to
+#: own, which surfaced as `OSError: Read-only file system` the first time a
+#: real fill needed recording.
+#:
+#: ``config/`` is policy that Python enforces and ``execute`` must not touch.
+#: ``data/`` is state: gitignored, mounted read-write, and already home to the
+#: journal and the proposals. The book belongs with those.
 PORTFOLIO_FILE = "portfolio.yaml"
+
+#: Where state lives. Separate from ``CONFIG_DIR`` on purpose -- see above.
+DATA_DIR = REPO_ROOT / "data"
 
 
 def load_intent(*, config_dir: Path | None = None) -> PortfolioIntent:
@@ -78,23 +94,22 @@ def load_intent(*, config_dir: Path | None = None) -> PortfolioIntent:
     )
 
 
-def portfolio_path(config_dir: Path | None = None) -> Path:
-    return (config_dir or CONFIG_DIR) / PORTFOLIO_FILE
+def portfolio_path(data_dir: Path | None = None) -> Path:
+    """Where the book lives. ``data/``, not ``config/`` -- see PORTFOLIO_FILE."""
+    return (data_dir or DATA_DIR) / PORTFOLIO_FILE
 
 
-def load_portfolio(*, config_dir: Path | None = None) -> PortfolioSnapshot:
-    """Read ``config/portfolio.yaml``.
+def load_portfolio(*, data_dir: Path | None = None) -> PortfolioSnapshot:
+    """Read ``data/portfolio.yaml``.
 
     **Why this is not one of the four config files, and not in
-    ``config_hash``.** It lives in ``config/`` because it has to be committed
-    for the Stage 6 gate to be reproducible from a clone, but it is *state*,
-    not configuration: it changes every time the book is marked. Folding it
-    into ``config_hash`` would change the hash daily and make the Stage 8
-    "are these two runs comparable" check answer no to every pair. What goes
-    into ``DecisionState`` instead is the book's ``as_of`` and equity, which is
-    what actually needs to be replayable.
+    ``config_hash``.** It is *state*, not configuration: it changes every time
+    the book is marked or a fill lands. Folding it into ``config_hash`` would
+    change the hash daily and make the Stage 8 "are these two runs comparable"
+    check answer no to every pair. What goes into ``DecisionState`` instead is
+    the whole book, so a replay sees the weights the decision was made against.
     """
-    return PortfolioSnapshot.load(portfolio_path(config_dir))
+    return PortfolioSnapshot.load(portfolio_path(data_dir))
 
 
 def sector_map(*, config_dir: Path | None = None) -> dict[str, str]:
@@ -441,6 +456,7 @@ __all__ = [
     "candidates",
     "compute_gaps",
     "load_intent",
+    "DATA_DIR",
     "load_portfolio",
     "portfolio_path",
     "sector_map",

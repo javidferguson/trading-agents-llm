@@ -51,7 +51,7 @@ def _run(decision: FinalDecision, *, dollar_adv: float | None = 2e9,
     """The whole Stage 6 path: load, size, check. Nothing else.
 
     ``portfolio`` is the SEEDED book, passed in by the caller. It is not read
-    from config/portfolio.yaml: that file is state the broker owns from Stage 7
+    from data/portfolio.yaml: that file is state the broker owns from Stage 7
     on, and a gate asserting against it would break every time the account
     moved. See tests/intent/conftest.py.
     """

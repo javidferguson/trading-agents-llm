@@ -121,7 +121,7 @@ report.
   blackout minus at-max-positions, computed before any model runs. `--earnings`
   also prints every symbol's next-report estimate.
 - `make portfolio-seed` / `make portfolio-refresh` — the only two things that
-  write `config/portfolio.yaml`. Both read the bars cache and **cannot fetch**,
+  write `data/portfolio.yaml`. Both read the bars cache and **cannot fetch**,
   so they run with the Gateway down. Do not hand-edit the file.
 - `make execute` / `execute --list` — **the Stage 7 gate.** Reads a
   `proposal.json`, reconciles the book against the broker, prices a marketable
@@ -170,7 +170,7 @@ other.
    `tests/execution/test_broker.py` asserts the call *sequence*, so a check
    moved after the order fails the build.
 2. **A mismatch between the book and the account is a refusal, not a warning.**
-   The share count was computed from `config/portfolio.yaml`, so if the file is
+   The share count was computed from `data/portfolio.yaml`, so if the file is
    wrong the number is wrong and there is nothing safe to approve. You get the
    per-symbol diff and an offer to rewrite the book from the broker.
 3. **Approval requires typing the ticker**, a closed stdin declines, and an

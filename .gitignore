@@ -257,4 +257,4 @@ data/
 #
 # To get one:  make portfolio-seed     (a demo book from the bars cache)
 #              execute                 (writes the real one from the broker)
-config/portfolio.yaml
+# (now data/portfolio.yaml, already covered by the data/ rule above)

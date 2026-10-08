@@ -1,4 +1,4 @@
-"""Generate or re-mark ``config/portfolio.yaml`` from the bars cache. No IB.
+"""Generate or re-mark ``data/portfolio.yaml`` from the bars cache. No IB.
 
 Two jobs, one file:
 
@@ -30,7 +30,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from research_desk.models.portfolio import PortfolioSnapshot, Position  # noqa: E402
 
 CACHE_DIR = REPO_ROOT / "data" / "cache" / "ib"
-OUT_PATH = REPO_ROOT / "config" / "portfolio.yaml"
+OUT_PATH = REPO_ROOT / "data" / "portfolio.yaml"
 
 #: Cash, chosen so equity lands on a round $250,000 with the seeded shares at
 #: the closes below. Recomputed exactly in ``seed()``; this is only the target.

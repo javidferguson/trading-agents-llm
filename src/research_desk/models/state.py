@@ -606,7 +606,7 @@ class DecisionState(BaseModel):
     #: ``weight_pct`` rather than a bare dict -- ``desk review`` tripped over
     #: exactly that on its first run.
     #:
-    #: Recorded in full rather than as a reference to ``config/portfolio.yaml``,
+    #: Recorded in full rather than as a reference to ``data/portfolio.yaml``,
     #: because that file is overwritten every time the book is re-marked and a
     #: replay must see the weights the decision was actually made against.
     portfolio: PortfolioSnapshot | None = None

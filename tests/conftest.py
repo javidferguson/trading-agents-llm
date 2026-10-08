@@ -1,4 +1,4 @@
-"""A deterministic book for the Stage 6 tests. **Not ``config/portfolio.yaml``.**
+"""A deterministic book for the Stage 6 tests. **Not ``data/portfolio.yaml``.**
 
 That file is **state**, not a fixture. It holds whatever the account holds, and
 at Stage 7 ``execute`` overwrites it from the broker -- which is exactly what its

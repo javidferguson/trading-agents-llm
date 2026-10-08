@@ -1,6 +1,6 @@
 """Book vs broker. **A mismatch is a refusal, not a warning.**
 
-The share count on a proposal was computed from ``config/portfolio.yaml``. If
+The share count on a proposal was computed from ``data/portfolio.yaml``. If
 the file disagrees with the account, the number is wrong, and approving it means
 approving arithmetic over a bad input. So the order gate is never drawn.
 
@@ -123,7 +123,7 @@ def test_the_rejection_names_every_mismatch_and_the_fix() -> None:
         book(NVDA=105, QQQ=7),
         {"NVDA": holding("NVDA", 90), "BRK.B": holding("BRK.B", 5)},
     )
-    text = reconcile.render_rejection(result, "config/portfolio.yaml")
+    text = reconcile.render_rejection(result, "data/portfolio.yaml")
 
     assert "REJECTED" in text
     assert "NO ORDER WAS SHOWN" in text
@@ -131,7 +131,7 @@ def test_the_rejection_names_every_mismatch_and_the_fix() -> None:
         assert symbol in text
     # And it must say what to do, not only that something is wrong.
     assert "desk decide" in text
-    assert "config/portfolio.yaml" in text
+    assert "data/portfolio.yaml" in text
 
 
 def test_the_rejection_explains_why_approval_is_not_offered() -> None:
@@ -186,7 +186,7 @@ async def test_account_values_are_parsed_as_floats() -> None:
 
 
 async def test_the_written_book_is_marked_as_coming_from_ib() -> None:
-    """``config/portfolio.yaml``'s own header has promised this since Stage 6:
+    """``data/portfolio.yaml``'s own header has promised this since Stage 6:
     *"At Stage 7, execute overwrites this file from the live paper account and
     source: becomes ib."*"""
     ib = FakeIB(positions=[

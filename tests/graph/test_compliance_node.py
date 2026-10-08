@@ -26,7 +26,7 @@ from research_desk.models.state import DecisionState, NodeError, RiskVerdict, Tr
 
 #: Derived from the shipped book rather than hardcoded, deliberately.
 #:
-#: These tests exercise the node against the REAL config/portfolio.yaml -- some
+#: These tests exercise the node against the REAL data/portfolio.yaml -- some
 #: of them read its marks directly -- so they must share its decision date. A
 #: fixed date went stale the moment the book was re-marked, and compliance then
 #: blocked every order with "the marks are 1 day(s) in the FUTURE -- look-ahead
@@ -65,7 +65,7 @@ def ctx(tmp_path) -> NodeContext:
 
 @pytest.fixture(autouse=True)
 def _book(monkeypatch, seeded_book):
-    """Give the node the SEEDED book, not ``config/portfolio.yaml``.
+    """Give the node the SEEDED book, not ``data/portfolio.yaml``.
 
     The node calls ``load_portfolio()`` itself, so the fixture has to be
     injected there. Without this the tests assert against the live account:
@@ -273,7 +273,7 @@ async def test_an_unreadable_book_produces_a_hold_not_a_crash(tmp_path, monkeypa
     import research_desk.graph.nodes.compliance as node
 
     def boom(**kwargs):
-        raise FileNotFoundError("config/portfolio.yaml does not exist")
+        raise FileNotFoundError("data/portfolio.yaml does not exist")
 
     monkeypatch.setattr(node, "load_portfolio", boom)
     patch = await compliance(state(), ctx(tmp_path))

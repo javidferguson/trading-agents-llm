@@ -157,7 +157,7 @@ def test_a_missing_file_is_an_error_not_an_empty_book(tmp_path) -> None:
 
 
 def test_the_shipped_book_loads_and_is_internally_consistent() -> None:
-    """``config/portfolio.yaml`` must always parse and self-agree.
+    """``data/portfolio.yaml`` must always parse and self-agree.
 
     Asserts the INVARIANTS, not a share count. The file is state: it holds
     whatever the account holds, and from Stage 7 ``execute`` overwrites it from

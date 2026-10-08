@@ -261,6 +261,134 @@ def _select(args: argparse.Namespace, directory: Path) -> Path:
     return fresh[0]
 
 
+async def _check_session(args: argparse.Namespace) -> int:
+    """Prove the Gateway has a LIVE API session, not merely an open port.
+
+    **The port is not evidence and §14 says why.** The image runs socat relaying
+    4004 -> 4002, and socat listens from container start regardless of whether
+    the Gateway behind it ever logged in -- so a TCP probe reports healthy while
+    the Gateway sits on the login screen. `make check-gateway` and `desk doctor`
+    both do a bare connect, deliberately, so that `decide` keeps no ib_async in
+    its dependency tree. This is the honest check, and it lives here because
+    this is the process allowed to import ib_async.
+
+    It matters in a specific, non-obvious way: logging into IB's web portal with
+    the same credentials can evict the Gateway's session -- one username, one
+    session -- and nothing about the port will change when it does.
+    """
+    from .broker import connect
+    from .reconcile import account_values, holdings_from_ib
+
+    settings = load_settings()
+
+    try:
+        host, port = resolve_ib_endpoint(settings)
+    except ConfigError as exc:
+        print(f"  no Gateway endpoint answered TCP: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        ib, accounts = await connect(
+            host=host, port=port, client_id=settings.ib_client_id,
+            mode=settings.mode,
+        )
+    except Exception as exc:  # noqa: BLE001 -- a CLI verdict, not a traceback
+        print(f"  PORT OPEN AT {host}:{port} BUT NO API SESSION", file=sys.stderr)
+        print(f"    {type(exc).__name__}: {exc}", file=sys.stderr)
+        print("    The Gateway is not logged in, or its session was evicted --"
+              " logging", file=sys.stderr)
+        print("    into IB's web portal with the same credentials does exactly"
+              " that.", file=sys.stderr)
+        print("    Fix: make gateway-stop && make gateway-start, then watch"
+              " `make gateway-logs`.", file=sys.stderr)
+        return 1
+
+    try:
+        holdings = await holdings_from_ib(ib)
+        values = await account_values(ib)
+        print(f"  ok   live API session on {host}:{port}")
+        print(f"  ok   account(s): {', '.join(accounts)}")
+        print(f"       {len(holdings)} position(s), "
+              f"NetLiquidation {values.get('NetLiquidation') or 0:,.2f}, "
+              f"cash {values.get('TotalCashValue') or 0:,.2f}")
+        for symbol, holding in sorted(holdings.items()):
+            print(f"         {symbol:8} {holding.quantity:>10,.0f} "
+                  f"@ avg {holding.avg_cost:,.2f}")
+        return 0
+    finally:
+        ib.disconnect()
+
+
+async def _sync_book(args: argparse.Namespace) -> int:
+    """Overwrite ``data/portfolio.yaml`` from the broker. The missing command.
+
+    `decide` cannot do this -- it has no IB connection and must not grow one
+    (§0) -- and ``make portfolio-refresh`` cannot either: it re-prices positions
+    the book ALREADY LISTS, from the bars cache, and never talks to IB. So after
+    a fill there was no command that could tell the book a new position exists.
+    Reconciliation would eventually catch it on the next `execute` and offer the
+    rewrite, but that is a circuitous route to something you want directly.
+
+    Shows the diff first and confirms, because it overwrites a file. Quantities
+    and cash come from the broker and are authoritative; marks are each
+    position's average cost, so follow it with ``make portfolio-refresh`` to
+    mark to market from the bars cache.
+    """
+    from .broker import connect
+    from .confirmation import confirm_rewrite
+    from .reconcile import (
+        account_values,
+        book_from_ib,
+        compare,
+        holdings_from_ib,
+        render,
+    )
+    from ..intent.engine import load_portfolio, portfolio_path
+
+    settings = load_settings()
+
+    try:
+        host, port = resolve_ib_endpoint(settings)
+    except ConfigError as exc:
+        raise ProposalError(str(exc)) from exc
+
+    ib, accounts = await connect(
+        host=host, port=port, client_id=settings.ib_client_id, mode=settings.mode,
+    )
+    try:
+        holdings = await holdings_from_ib(ib)
+        values = await account_values(ib)
+
+        try:
+            current = load_portfolio()
+            stale_after = current.stale_after_days
+            print(render(compare(
+                current, holdings,
+                broker_equity=values.get("NetLiquidation"),
+                broker_cash=values.get("TotalCashValue"),
+                broker_account=", ".join(accounts),
+            )))
+        except FileNotFoundError:
+            stale_after = None
+            print(f"No book yet. The broker reports {len(holdings)} position(s).")
+
+        if args.yes or confirm_rewrite(portfolio_path()):
+            fresh = await book_from_ib(ib, stale_after_days=stale_after)
+            _write_book(fresh, portfolio_path())
+            print(f"\nWrote {portfolio_path()}")
+            print(f"  {fresh.position_count} position(s), cash {fresh.cash:,.2f}, "
+                  f"equity {fresh.equity:,.2f}, source=ib")
+            print()
+            print("Marks are each position's average cost. Mark them to market:")
+            print("    make portfolio-refresh")
+            return 0
+
+        print("\nLeft the book alone.")
+        return 1
+    finally:
+        ib.disconnect()
+
+
 async def _run(args: argparse.Namespace) -> int:
     from .broker import (
         NoQuoteError,
@@ -433,8 +561,14 @@ async def _run(args: argparse.Namespace) -> int:
         )
         print(f"\nPlaced {len(trades)} order(s). "
               f"`make gateway-logs` and the trade journal have the detail.")
-        print("The book is now out of date -- run `make portfolio-refresh` "
-              "once the fill settles.")
+        print()
+        print("The book no longer matches the account. Once the fill settles:")
+        print("    make sync-book          # quantities and cash, FROM THE BROKER")
+        print("    make portfolio-refresh  # then mark those positions to market")
+        print()
+        print("`portfolio-refresh` alone cannot do this -- it re-prices")
+        print("positions the book already lists, from the bars cache, and never")
+        print("talks to IB. It has no way to discover a position you just opened.")
         return 0
 
     finally:
@@ -449,7 +583,7 @@ def _provider_symbols(universe: dict, symbol: str) -> dict[str, str] | None:
 
 
 def _write_book(snapshot: Any, path: Path) -> None:
-    """Overwrite config/portfolio.yaml, keeping its explanatory header.
+    """Overwrite data/portfolio.yaml, keeping its explanatory header.
 
     The header says why the file exists, that it must not be hand-edited, and
     which commands maintain it. Writing bare YAML over it would delete the only
@@ -484,6 +618,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--list", action="store_true",
                         help="same as the `list` subcommand")
+    parser.add_argument("--sync-book", action="store_true",
+                        help="overwrite data/portfolio.yaml from the broker. "
+                             "Run this after a fill -- portfolio-refresh cannot, "
+                             "it never talks to IB.")
+    parser.add_argument("--check-session", action="store_true",
+                        help="prove the Gateway has a LIVE API session. The open "
+                             "port does not: socat answers it regardless.")
+    parser.add_argument("--yes", action="store_true",
+                        help="skip the confirmation on --sync-book only. Never "
+                             "affects the order gate.")
     parser.add_argument("--symbol", default=None, help="newest proposal for this symbol")
     parser.add_argument("--run-id", default=None, help="run id, or any part of one")
     parser.add_argument("--dry-run", action="store_true",
@@ -502,6 +646,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_list(args)
 
     try:
+        if args.check_session:
+            return asyncio.run(_check_session(args))
+        if args.sync_book:
+            return asyncio.run(_sync_book(args))
         return asyncio.run(_run(args))
     except ProposalError as exc:
         print(f"\nREFUSED: {exc}", file=sys.stderr)

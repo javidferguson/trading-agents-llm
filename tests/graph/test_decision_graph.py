@@ -75,7 +75,7 @@ class FakeRegistry:
 def fixture_book():
     """A book marked on this test's own ``AS_OF``, not the shipped one.
 
-    **These tests must not read config/portfolio.yaml, and the reason is a bug
+    **These tests must not read data/portfolio.yaml, and the reason is a bug
     they caught.** They hardcode ``AS_OF`` in the past; the shipped book is
     re-marked whenever `make portfolio-refresh` runs. The day the book moved to
     2026-10-07 while AS_OF stayed 2026-10-06, compliance correctly blocked every

@@ -411,7 +411,7 @@ state the desk does not currently track, and is a real piece of work rather than
 another flag. Until it exists, adding to a held position leaves a stop ladder
 rather than a single protective level.
 
-### `config/portfolio.yaml` is no longer committed
+### The book: not committed, and now in `data/` rather than `config/`
 
 It is state, and from Stage 7 the broker owns it. It held an account balance in
 version control, and the one reason it was committed -- "so the Stage 6 gate is
@@ -513,3 +513,65 @@ history, which lives in ClickHouse keyed on `project_id`:
 the project and the API key but **no user** -- an org nobody is a member of.
 Tracing worked perfectly and was invisible in the UI for six weeks. Setting
 those two and recreating `langfuse-web` is additive and safe.
+
+## The book moved to `data/`, and the read-only mount is why
+
+Stage 7's first real fill could not be recorded:
+
+    OSError: [Errno 30] Read-only file system: '/app/config/portfolio.yaml'
+
+`execute` mounts `../config:/app/config:**ro**`, and that is **correct and
+should stay**: the process that places orders must never be able to rewrite
+`portfolio-intent.yaml` and relax its own risk limits. If it could, the two-key
+design collapses -- the whole point is that Python's veto is not negotiable by
+the thing being vetoed.
+
+So the mount was right and the book was in the wrong directory. `config/` is
+policy that Python enforces and `execute` must not touch. `data/` is state:
+gitignored, mounted read-write, and already home to the journal, the proposals
+and the receipts. The book belongs with those, and `intent/engine.py`'s
+`portfolio_path()` is the single place that decides.
+
+This is the same lesson as the day before, one level deeper. Then: the book
+should not be *committed*, because it is state rather than configuration. Now:
+it should not be *in config/* either, for exactly the same reason. The first fix
+addressed the symptom and left the cause.
+
+## `portfolio-refresh` cannot see a new position, and the advice said otherwise
+
+`--refresh` re-prices positions the book **already lists**, from the bars cache,
+and never talks to IB -- the script says so twice ("reads the cache directly and
+never constructs a provider, so it cannot fetch"). After a fill the book still
+said zero positions, and refresh had no way to discover otherwise.
+
+`execute` nevertheless printed *"The book is now out of date -- run `make
+portfolio-refresh` once the fill settles"*, which pointed at the one command
+that could not do it. Fixed, and the gap it was papering over is now a real
+command:
+
+    make sync-book          # quantities and cash, FROM THE BROKER
+    make portfolio-refresh  # then mark those positions to market
+
+They compose deliberately: `sync-book` is authoritative about *what you hold*,
+`portfolio-refresh` about *what it is worth*. Marks from `sync-book` alone are
+each position's average cost, because fetching fifteen live quotes to write a
+file would be slow, rate-limited, and no more accurate than the next refresh.
+
+## `make check-gateway` was overstating what it proved
+
+It reported "desk-ib-gateway reachable" on the strength of a TCP connect to
+4012. §14 already documented why that is not evidence: the image runs socat
+relaying 4004 -> 4002, and **socat listens from container start whether or not
+the Gateway ever logged in**. So the probe says healthy while the Gateway sits
+on the login screen.
+
+This is not theoretical. One IB username supports one session, so logging into
+IB's web portal with the same credentials can evict the Gateway's -- and nothing
+about the port changes when it does. The symptom is a web UI offering to "log
+out of the other session" while every local check still looks green.
+
+`check-gateway` now says what it actually tested ("port answers (socat)") and
+names the deeper check. `make gateway-session` does a real `managedAccounts()`
+round-trip and prints the account, the positions and NetLiquidation. It lives in
+`execute` because that is the only process permitted to import `ib_async`, which
+is also why `desk doctor` keeps its bare TCP connect.

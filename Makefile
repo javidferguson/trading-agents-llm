@@ -149,9 +149,12 @@ check-gateway:  ## Is our Gateway up? And is the ORB engine's conflicting?
 	@# HOST_RUN comment at the top. `|| true` stays because this target is a
 	@# report -- it prints the conflict rather than failing on it.
 	@$(HOST_RUN) python scripts/check_gateway_exclusive.py || true
+	@# "port answers" is NOT "session alive": socat listens from container
+	@# start regardless of whether the Gateway logged in (§14). Say what was
+	@# actually proved and name the check that proves the rest.
 	@nc -z -G 3 127.0.0.1 $${IB_HOST_PORT:-4012} 2>/dev/null \
-		&& echo "ok   desk-ib-gateway reachable on 127.0.0.1:$${IB_HOST_PORT:-4012}" \
-		|| echo "warn desk-ib-gateway not running. \`make gateway-start\`. Not needed until Stage 7."
+		&& echo "ok   port 127.0.0.1:$${IB_HOST_PORT:-4012} answers (socat). For a LIVE session: make gateway-session" \
+		|| echo "warn desk-ib-gateway not running. \`make gateway-start\`."
 
 # --------------------------------------------------------------------------- #
 # IB Gateway -- OURS. Never run it alongside the ORB+GEX engine's.
@@ -197,6 +200,22 @@ execute:  ## THE STAGE 7 GATE: place an approved proposal. Needs a human and the
 	@#
 	@# Layer caching makes this nearly free when nothing changed.
 	$(COMPOSE) --profile execute run --rm --build execute execute $(EXEC_ARGS)
+
+.PHONY: sync-book
+sync-book:  ## Overwrite data/portfolio.yaml FROM THE BROKER. Run after a fill.
+	@# `portfolio-refresh` cannot do this: it re-prices positions the book
+	@# already lists, from the bars cache, and never talks to IB. Only the
+	@# execute process can read the account, so this lives there.
+	$(COMPOSE) --profile execute run --rm --build execute execute --sync-book
+
+.PHONY: gateway-session
+gateway-session:  ## Prove the Gateway has a LIVE session. The open port does not.
+	@# §14: socat relays 4004 -> 4002 and listens from container start whether
+	@# or not the Gateway ever logged in, so `check-gateway`'s TCP probe reports
+	@# healthy while it sits on the login screen. This does a real
+	@# managedAccounts() round-trip. Slower, because it builds; use it when the
+	@# port says yes and something still does not work.
+	$(COMPOSE) --profile execute run --rm --build execute execute --check-session
 
 .PHONY: execute-list
 execute-list:  ## Which proposals are pending, and which already executed
@@ -266,7 +285,7 @@ candidates:  ## Channel 1: today's tradeable set, computed before any model runs
 	$(RUN) desk candidates --earnings
 
 .PHONY: portfolio-seed
-portfolio-seed:  ## Rebuild config/portfolio.yaml from the bars cache. Reads the cache; never fetches.
+portfolio-seed:  ## Rebuild data/portfolio.yaml from the bars cache. Reads the cache; never fetches.
 	$(RUN) python scripts/seed_portfolio.py --seed
 
 .PHONY: portfolio-refresh

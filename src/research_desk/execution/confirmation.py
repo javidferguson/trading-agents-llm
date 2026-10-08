@@ -372,7 +372,7 @@ REWRITE_WORD = "REWRITE"
 
 
 def confirm_rewrite(path: Any) -> bool:
-    """Ask before overwriting ``config/portfolio.yaml`` from the broker.
+    """Ask before overwriting ``data/portfolio.yaml`` from the broker.
 
     Its own narrow gate rather than a flag on the order prompt. The order gate
     was declined by this point -- the book disagreed with the account -- and

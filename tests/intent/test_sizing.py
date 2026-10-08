@@ -121,7 +121,7 @@ def test_the_live_tsm_decision_sizes_to_the_approved_weight(seeded_book) -> None
     from research_desk.intent.engine import load_intent
 
     real_intent = load_intent()
-    # The SEEDED book, not config/portfolio.yaml: that file is state the broker
+    # The SEEDED book, not data/portfolio.yaml: that file is state the broker
     # owns from Stage 7 on. See tests/intent/conftest.py.
     real_book = seeded_book
     drift = compute_gaps(real_intent, real_book, as_of=real_book.as_of)

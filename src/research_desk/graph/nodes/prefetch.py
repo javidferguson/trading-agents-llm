@@ -13,7 +13,7 @@ node cannot disagree about what the book held. Note what that does *not* mean
 through ``render_for_analyst`` which cannot see it. Intent still enters at the
 trader (§8), and ``tests/test_intent_blindness.py`` holds that line.
 
-A missing or malformed ``config/portfolio.yaml`` is recorded and the run
+A missing or malformed ``data/portfolio.yaml`` is recorded and the run
 continues to a HOLD: the compliance node needs the book and will refuse
 without it, which is the correct place for that refusal to be visible.
 """

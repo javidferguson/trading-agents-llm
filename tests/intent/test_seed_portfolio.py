@@ -1,6 +1,6 @@
 """``scripts/seed_portfolio.py`` -- the two commands that maintain the book.
 
-The user never hand-edits ``config/portfolio.yaml``; these two commands do, and
+The user never hand-edits ``data/portfolio.yaml``; these two commands do, and
 neither may touch IB. The property worth a test is the one that is easy to get
 backwards: **a refresh must not reset the staleness clock.**
 """
