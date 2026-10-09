@@ -133,11 +133,16 @@ def test_the_live_tsm_decision_sizes_to_the_approved_weight(seeded_book) -> None
         as_of=real_book.as_of, reference_price=held.last_price,
     )
     assert result.binding_cap == "requested"
-    # 12 rather than the 11 first recorded here: the 2026-10-07 widening
-    # re-marked the book and re-seeded it, so TSM's starting weight and price
-    # both moved. The INVARIANT under test is unchanged and is what matters --
-    # the approved 4.5% binds, rather than 4.5 x 0.65 = 2.93% ordering +3.
-    assert result.plan.quantity == 12
+    # DERIVED, not hardcoded. This read `== 11`, then `== 12`, and `make bars`
+    # on 2026-10-09 moved TSM's close again and made it 13. Every one of those
+    # edits was the test chasing a re-marked book while the property under test
+    # never changed: the approved 4.5% binds, rather than 4.5 x 0.65 = 2.93%.
+    # So assert the arithmetic instead of its output on one particular day.
+    expected = int(
+        (real_book.equity * 4.5 / 100.0 - held.quantity * held.last_price)
+        // held.last_price
+    )
+    assert result.plan.quantity == pytest.approx(expected, abs=1)
     assert result.caps_pct["requested"] == pytest.approx(4.5)
     # The term that used to bind no longer exists.
     assert "conviction_w" not in result.caps_pct
