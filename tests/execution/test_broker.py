@@ -23,7 +23,15 @@ from research_desk.models.modes import RunMode
 from research_desk.models.orders import OrderPlan
 from research_desk.models.state import FinalDecision
 
-from .conftest import FakeContract, FakeIB, FakeTicker
+from .conftest import (
+    FakeContract,
+    FakeContractDetails,
+    FakeIB,
+    FakeOrderStatus,
+    FakeSession,
+    FakeTicker,
+    FakeTrade,
+)
 
 AS_OF = date(2026, 10, 7)
 
@@ -228,11 +236,62 @@ def test_a_buy_gets_a_stop_at_the_decisions_distance() -> None:
     assert stop == pytest.approx(472.62 * 0.92, abs=0.01)
 
 
-def test_the_stop_is_measured_from_the_limit_not_the_stale_reference() -> None:
-    """So the distance the human sees is the distance they get."""
+def test_the_stop_scales_with_its_anchor() -> None:
     near = broker.stop_price_for(decision(), plan(), 500.0)
     far = broker.stop_price_for(decision(), plan(), 400.0)
     assert near > far
+
+
+def test_the_stop_is_anchored_on_the_fresh_quote() -> None:
+    """**Three candidate prices, and only one of them is right.**
+
+    This test was ``..._from_the_limit_not_the_stale_reference``, and it was
+    half right. The hazard it named is real: ``plan.reference_price`` is the
+    DECIDE-time price and can be hours old -- on MRVL it was the prior close,
+    284.68, against a market near 269.
+
+    What it missed is that the limit is not the safe alternative. The limit is
+    displaced from the market by ``limit_offset_bps`` on purpose, so anchoring
+    there drags the stop along with the displacement. At the old 10 bps that
+    was a 0.09% error and invisible; at the 100 bps this book now runs it turns
+    the 8% stop ``cap_risk`` sized on into 7.1%.
+
+    So the anchor is the FRESH quote's reference: current, and undisplaced.
+    """
+    stop_pct = 8.0
+    quote_reference = 269.20       # what the market is now
+    stale_reference = 284.68       # what `decide` sized against, hours ago
+    limit = quote_reference * 1.01  # 100 bps through the spread
+
+    anchored = broker.stop_price_for(
+        decision(stop_loss_pct=stop_pct), plan(), quote_reference
+    )
+
+    # 8% below where the stock actually is, which is what sizing assumed.
+    distance_pct = 100.0 * (quote_reference - anchored) / quote_reference
+    assert distance_pct == pytest.approx(stop_pct, abs=0.05)
+
+    # And materially different from both wrong anchors, so this is not a
+    # distinction without a difference.
+    assert anchored < broker.stop_price_for(decision(), plan(), limit)
+    assert anchored < broker.stop_price_for(decision(), plan(), stale_reference)
+
+
+def test_a_wide_offset_no_longer_tightens_the_stop() -> None:
+    """The regression that made the anchor change necessary, as arithmetic.
+
+    Same market, same 8% stop, two offsets. The stop distance from the fill
+    must not depend on how far through the spread the limit reached.
+    """
+    market_price = 269.20
+    for offset_bps in (10, 100, 500):
+        limit = market_price * (1 + offset_bps / 10_000.0)
+        stop = broker.stop_price_for(decision(), plan(), market_price)
+        distance = 100.0 * (market_price - stop) / market_price
+        assert distance == pytest.approx(8.0, abs=0.05), (
+            f"at {offset_bps} bps the stop moved to {distance:.2f}% "
+            f"(limit was {limit:.2f})"
+        )
 
 
 def test_the_parent_is_held_until_the_child_exists() -> None:
@@ -401,3 +460,186 @@ async def test_both_legs_are_journaled_with_their_roles(tmp_path) -> None:
     assert all(e["run_id"] == "run-1" for e in submitted)
     # And the status that came back, not only what we sent.
     assert any(e["event"] == "order_status" for e in events)
+
+
+# --------------------------------------------------------------------------- #
+# Cancelling a bracket that never filled
+# --------------------------------------------------------------------------- #
+
+
+async def test_the_child_is_cancelled_before_the_parent(tmp_path) -> None:
+    """**Order matters, and not for tidiness.**
+
+    Cancelling the parent first leaves the protective stop alone in the account
+    for however long the second call takes -- a resting SELL STOP against a
+    position that was never opened. Child first means the account passes
+    through "no orders" rather than "a naked stop".
+    """
+    from research_desk.execution.journal import Journal
+
+    ib = FakeIB()
+    parent, child = broker.build_orders(plan(), 472.62, 434.81)
+    trades = await broker.place(
+        ib, FakeContract(), parent, child,
+        journal=Journal(tmp_path), run_id="r", settle_s=0,
+    )
+
+    ok = await broker.cancel(
+        ib, trades, journal=Journal(tmp_path), run_id="r", symbol="TSM",
+    )
+    assert ok
+    # Two cancels, child's order id first.
+    assert ib.cancelled == [child.orderId, parent.orderId]
+
+
+async def test_a_cancel_is_journaled_under_its_own_event(tmp_path) -> None:
+    """Not a third ``order_submitted`` role. A test asserts that event carries
+    exactly ``entry`` and ``protective_stop``, and it is right to -- a cancel
+    is a different thing that happened, not another submission."""
+    import json
+
+    from research_desk.execution.journal import Journal
+
+    ib = FakeIB()
+    journal = Journal(tmp_path)
+    parent, child = broker.build_orders(plan(), 472.62, 434.81)
+    trades = await broker.place(
+        ib, FakeContract(), parent, child,
+        journal=journal, run_id="r", settle_s=0,
+    )
+    await broker.cancel(ib, trades, journal=journal, run_id="r", symbol="TSM")
+
+    events = [
+        json.loads(line)
+        for line in next(tmp_path.glob("trades_*.jsonl")).read_text().splitlines()
+        if line.strip()
+    ]
+    assert [e["event"] for e in events].count("order_cancelled") == 2
+    roles = {e.get("role") for e in events if e["event"] == "order_submitted"}
+    assert roles == {"entry", "protective_stop"}
+
+
+async def test_a_cancel_that_the_broker_refuses_is_reported_not_raised(
+    tmp_path, monkeypatch
+) -> None:
+    """A cancel is already the recovery path. Raising here would leave the
+    caller with no way to say what is still outstanding."""
+    from research_desk.execution.journal import Journal
+
+    ib = FakeIB()
+    parent, _ = broker.build_orders(plan(), 472.62, None)
+    trades = await broker.place(
+        ib, FakeContract(), parent, None,
+        journal=Journal(tmp_path), run_id="r", settle_s=0,
+    )
+
+    def boom(order, manualCancelOrderTime=""):  # noqa: ANN001, N803
+        raise RuntimeError("IB said no")
+
+    monkeypatch.setattr(ib, "cancelOrder", boom)
+    assert await broker.cancel(
+        ib, trades, journal=Journal(tmp_path), run_id="r", symbol="TSM",
+    ) is False
+
+
+# --------------------------------------------------------------------------- #
+# Waiting for a cancel is NOT waiting for a fill
+# --------------------------------------------------------------------------- #
+
+
+async def test_pending_cancel_counts_as_acknowledged() -> None:
+    """``ib_async.cancelOrder`` sets a working order to ``PendingCancel``, and
+    that status is deliberately absent from ``TERMINAL_STATUSES`` because it
+    moves on its own. Reusing the fill wait would report a cancel that worked
+    as a timeout."""
+    assert "PendingCancel" in broker.CANCEL_ACKNOWLEDGED
+    assert "PendingCancel" not in broker.TERMINAL_STATUSES
+
+    trade = FakeTrade(contract=None, order=_order(),
+                      orderStatus=FakeOrderStatus(status="PendingCancel"))
+    assert await broker.wait_for_cancel(trade, timeout_s=0.2) is True
+    assert await broker.wait_for_terminal(trade, timeout_s=0.2, poll_s=0.05) is False
+
+
+async def test_a_cancel_that_is_never_acknowledged_times_out_without_raising() -> None:
+    trade = FakeTrade(contract=None, order=_order(),
+                      orderStatus=FakeOrderStatus(status="Submitted"))
+    assert await broker.wait_for_cancel(
+        trade, timeout_s=0.2, poll_s=0.05
+    ) is False
+
+
+def _order(order_id: int = 101):
+    class Order:
+        orderId = order_id
+        totalQuantity = 12
+        orderType = "LMT"
+        action = "BUY"
+    return Order()
+
+
+# --------------------------------------------------------------------------- #
+# The market session
+# --------------------------------------------------------------------------- #
+
+
+async def test_the_session_is_open_inside_a_liquid_window() -> None:
+    from datetime import datetime as dt
+
+    from research_desk.execution.bars import EXCHANGE_TZ
+
+    now = dt.now(EXCHANGE_TZ)
+    ib = FakeIB(contract_details=[FakeContractDetails(sessions=[
+        FakeSession(start=now - timedelta(hours=1), end=now + timedelta(hours=1)),
+    ])])
+    session = await broker.market_session(ib, FakeContract())
+    assert session.is_open is True
+    assert session.warning is None
+
+
+async def test_a_closed_session_names_the_next_open() -> None:
+    from datetime import datetime as dt
+
+    from research_desk.execution.bars import EXCHANGE_TZ
+
+    now = dt.now(EXCHANGE_TZ)
+    nxt = now + timedelta(hours=17)
+    ib = FakeIB(contract_details=[FakeContractDetails(sessions=[
+        FakeSession(start=now - timedelta(hours=8), end=now - timedelta(hours=1)),
+        FakeSession(start=nxt, end=nxt + timedelta(hours=6)),
+    ])])
+    session = await broker.market_session(ib, FakeContract())
+    assert session.is_open is False
+    assert "CLOSED" in session.warning
+    assert "outsideRth" in session.warning, "say WHY it will not fill"
+    assert "Next session opens" in session.warning
+
+
+@pytest.mark.parametrize(
+    ("label", "details"),
+    [
+        ("no details", []),
+        ("no sessions", [FakeContractDetails(sessions=[])]),
+        ("unparseable hours", [FakeContractDetails(raises=True)]),
+    ],
+)
+async def test_an_unknown_session_says_nothing_rather_than_guessing(
+    label: str, details: list
+) -> None:
+    """**Unknown is not closed.** This only ever produces a warning line, so a
+    gate that cried wolf whenever IB was terse would get ignored -- and an
+    ignored warning is worse than no warning."""
+    session = await broker.market_session(
+        FakeIB(contract_details=details), FakeContract()
+    )
+    assert session.is_open is None, label
+    assert session.warning is None, label
+
+
+async def test_a_broker_that_will_not_answer_does_not_break_the_order() -> None:
+    """``contract_details=None`` makes the call raise, which is what a Gateway
+    that is up but unhappy looks like. A session check that can stop an order
+    being placed would be a worse defect than the one it reports."""
+    session = await broker.market_session(FakeIB(), FakeContract())
+    assert session.is_open is None
+    assert session.warning is None

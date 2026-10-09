@@ -1176,9 +1176,75 @@ violation message does not blame the wrong one.
 - **Marketable `LimitOrder`, never `MarketOrder`.** With delayed data you are
   looking at a 15-minute-old price.
 
+> **As built at Stage 7, and the delayed quote is the whole story.** "Marketable"
+> was implemented as the quote plus **10 bps**, which is the number you use when
+> you can see the current price. This desk cannot: the limit is computed from a
+> quote that is fifteen minutes old, and 0.1% is routinely less than a liquid
+> name moves in fifteen minutes.
+>
+> Measured on 2026-10-09. A three-order batch: HON and V filled instantly, and
+> MRVL — sized against the prior close of 284.68, gapped down ~5% overnight and
+> still moving — went out at 269.47 and never filled, because the real market
+> was above it. The batch then stalled on the fill wait, which is the symptom
+> everyone notices and not the cause.
+>
+> So `limit_offset_bps` moved into `portfolio-intent.yaml` under `execution:`,
+> bounded `0..500`, and is **read at execute time** rather than baked into the
+> proposal — it is an execution parameter, and a change to it should apply to
+> proposals already written rather than requiring a re-decide.
+> `FinalDecision.limit_offset_bps` survives as the decide-time record for the
+> journal, and the confirmation screen is handed the offset *actually used*,
+> because those two numbers can now differ and the approval screen is the one
+> place that must not print the wrong one. This book runs **100 bps**.
+>
+> **A wide limit is cheaper than it reads.** It is a ceiling, not the price you
+> pay: in that same batch HON's 207.60 limit filled at 207.40 and V's 380.97 at
+> 380.00. What it buys is the ability to cross a market that moved while the
+> quote aged.
+>
+> **But it broke the protective stop, which is the part worth remembering.**
+> `stop_price_for` anchored the stop on the *limit*. That was right at 10 bps
+> and wrong at 100: the limit is displaced from the market on purpose, so the
+> stop was dragged up with it and an 8% stop landed 7.1% below the fill —
+> while `sizing`'s `cap_risk` had sized the position on the arithmetic that 8%
+> bounds the loss. It does not make the position riskier (it loses slightly
+> less when stopped); it gets shaken out on noise the thesis was sized to ride.
+> The stop is now anchored on the **fresh quote's reference** — current, and
+> undisplaced. Note there are *three* candidate prices here and only one is
+> right: not the decide-time `plan.reference_price` (284.68, hours old), not
+> the limit, but the quote the order is being priced from right now.
+
 **Confirmation** requires typing the **ticker symbol**, not `y`. A yes/no prompt
 is answered by muscle memory. Show the dissent, the invalidation condition, and
 the whatIf numbers. There is deliberately no config flag to disable the gate.
+
+> **Two more narrow gates, as built.** Each is its own word, never the ticker,
+> because one muscle-memory answer must not be able to do two different things:
+>
+> * **`CANCEL`** — an entry order that did not reach a terminal status within
+>   `FILL_TIMEOUT_S`. Before this the batch printed "STOPPED" and exited, which
+>   read as though nothing were outstanding; MRVL order 53 was left working
+>   with a protective stop attached, so a fill after the process exited would
+>   have armed a stop against a position the book had never heard of. A closed
+>   stdin **leaves the order working** — the opposite default from the order
+>   gate, and deliberately: there, doing nothing is safe; here the order exists
+>   and a human already approved it, so cancelling unattended would be the
+>   system reversing a decision on its own.
+> * **`REVIEW`** — the batch review screen (§15.8's note on `execute --all`).
+>
+> A **partial** fill is never offered a cancel. The stop child is sized for the
+> full quantity, so pulling the parent remainder leaves a stop that would
+> oversell what was bought; fixing that properly is cancel-and-replace, which
+> FOLLOWUPS records as real work rather than something to improvise inside a
+> cancel helper.
+>
+> The market-closed case **warns rather than refuses**. A DAY limit placed at
+> 16:29 cannot fill — that was the other stalled batch — and the session is read
+> from IB's own `ContractDetails.liquidHours`, which already accounts for
+> holidays and half-days, rather than a hardcoded 09:30–16:00 this repo has no
+> calendar for. Unknown is not closed: anything IB will not answer produces no
+> warning at all, because a warning that fires on every run is one that gets
+> read past.
 
 ---
 

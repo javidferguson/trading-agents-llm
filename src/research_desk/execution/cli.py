@@ -570,6 +570,11 @@ class OrderOutcome:
     filled: int = 0
     avg_price: float = 0.0
     stop_batch: bool = False
+    #: Record-only, for the closing summary. The Trade objects deliberately do
+    #: NOT travel out of `_execute_one`: the cancel decision is made where the
+    #: stall is detected, so nothing downstream needs a handle on a live order.
+    order_id: int | None = None
+    cancelled: bool = False
 
 
 async def _execute_one(
@@ -586,6 +591,7 @@ async def _execute_one(
     args: argparse.Namespace,
     universe: dict,
     accounts: list[str],
+    session: Any = None,
     prior_in_batch: int = 0,
 ) -> OrderOutcome:
     """Price, re-check, gate and place ONE order against ``book``.
@@ -607,6 +613,7 @@ async def _execute_one(
         FILL_TIMEOUT_S,
         NoQuoteError,
         build_orders,
+        cancel,
         contract_for,
         filled_quantity,
         marketable_limit,
@@ -616,6 +623,7 @@ async def _execute_one(
         stop_price_for,
         wait_for_terminal,
     )
+    from .confirmation import confirm_cancel, render_unsettled
     from ..intent import compliance as rules
     from ..intent.engine import sector_map
 
@@ -633,8 +641,19 @@ async def _execute_one(
         _receipt(path, dry_run=args.dry_run, outcome="no_quote", reason=str(exc))
         return OrderOutcome(path, decision.symbol, "no_quote", reason=str(exc))
 
-    limit_price = marketable_limit(market, plan.action, decision.limit_offset_bps)
-    stop = stop_price_for(decision, plan, limit_price)
+    # The offset comes from CONFIG, not from the proposal.
+    #
+    # `decision.limit_offset_bps` is the decide-time record and stays in the
+    # journal; pricing reads `intent.execution.limit_offset_bps`, so a change
+    # to portfolio-intent.yaml applies to proposals already written rather than
+    # needing a re-decide. The gate is handed the value actually used, because
+    # the two can differ and the approval screen must not print the other one.
+    offset_bps = intent.execution.limit_offset_bps
+    limit_price = marketable_limit(market, plan.action, offset_bps)
+    # Anchored on the FRESH QUOTE, not the limit. A wide offset displaces the
+    # limit from the market on purpose, and anchoring the stop there drags it
+    # along -- turning the 8% that `cap_risk` sized on into ~7.1% at 100 bps.
+    stop = stop_price_for(decision, plan, market.reference)
     parent, child = build_orders(plan, limit_price, stop)
 
     report = await preflight(ib, contract, parent)
@@ -721,6 +740,8 @@ async def _execute_one(
         decision, plan,
         limit_price=limit_price, stop_price=stop,
         preflight=report, quote_source=market.source,
+        offset_bps=offset_bps,
+        session_warning=session.warning if session is not None else None,
     )
 
     if not approved:
@@ -745,6 +766,12 @@ async def _execute_one(
         path, dry_run=args.dry_run, outcome="placed",
         limit_price=limit_price, stop_price=stop,
         accounts=accounts,
+        # The offset ACTUALLY used, which is config's and not the proposal's.
+        # Recorded here as well as in the second write because a single-order
+        # run never reaches the second one, and a receipt that does not say
+        # which offset priced the limit cannot be audited against the config
+        # that has since changed.
+        offset_bps_used=offset_bps,
         orders=[
             {
                 "order_id": t.order.orderId,
@@ -777,20 +804,86 @@ async def _execute_one(
     # number about the one thing that just stopped their batch.
     settled = await wait_for_terminal(trades[0], timeout_s=FILL_TIMEOUT_S)
     shares, price = filled_quantity(trades[0])
+    order_id = trades[0].order.orderId
 
-    if not settled:
+    def _settled(**extra: Any) -> OrderOutcome:
+        """The receipt, enriched, and the outcome. Written a SECOND time.
+
+        The first write happened immediately after `place`, and that one is
+        what makes the double-submission guard exist if this process dies
+        during the wait -- which is exactly the failure that guard is for. So
+        this does not move it; it adds what only became known afterwards.
+        MRVL's receipt said `status: Submitted, filled: 0.0`, accurate at
+        placement and reading like a final state.
+
+        `outcome` stays "placed" on purpose. It is what `execute --list` keys
+        on and what the batch tests assert; the settlement detail belongs in
+        fields beside it, not in a different verdict.
+        """
+        _receipt(
+            path, dry_run=args.dry_run, outcome="placed",
+            limit_price=limit_price, stop_price=stop, accounts=accounts,
+            offset_bps_used=offset_bps,
+            settled=settled,
+            status=trades[0].orderStatus.status,
+            filled=shares,
+            avg_fill_price=price,
+            orders=[
+                {
+                    "order_id": t.order.orderId,
+                    "action": t.order.action,
+                    "quantity": t.order.totalQuantity,
+                    "type": t.order.orderType,
+                    "status": t.orderStatus.status,
+                    "filled": t.orderStatus.filled,
+                    "avg_fill_price": t.orderStatus.avgFillPrice,
+                }
+                for t in trades
+            ],
+            **extra,
+        )
         return OrderOutcome(
             path, decision.symbol, "placed", filled=shares, avg_price=price,
-            reason=(
-                f"still {trades[0].orderStatus.status} after "
-                f"{int(FILL_TIMEOUT_S)}s"
-            ),
-            stop_batch=True,
+            order_id=order_id, **{
+                k: v for k, v in extra.items()
+                if k in {"cancelled", "reason", "stop_batch"}
+            },
         )
 
-    return OrderOutcome(
-        path, decision.symbol, "placed", filled=shares, avg_price=price,
-    )
+    if settled:
+        return _settled()
+
+    # --- it did not settle --------------------------------------------------
+    print(render_unsettled(
+        decision.symbol, order_id=order_id, action=plan.action,
+        ordered=plan.quantity, filled=abs(shares), limit_price=limit_price,
+        status=trades[0].orderStatus.status, stop_price=stop,
+        timeout_s=FILL_TIMEOUT_S,
+    ))
+    reason = f"still {trades[0].orderStatus.status} after {int(FILL_TIMEOUT_S)}s"
+
+    # A PARTIAL fill is not offered a cancel, and the reason is not caution.
+    # The stop child is sized for the FULL quantity, so pulling the parent
+    # remainder leaves a stop that would oversell what was actually bought.
+    # Fixing that is cancel-and-replace, which FOLLOWUPS records as real work;
+    # half-building it here would be worse than saying so.
+    if shares:
+        print(f"  PARTIALLY FILLED ({abs(shares)} of {abs(plan.quantity)}), so "
+              "no cancel is offered:")
+        print("  the attached stop covers the full order and pulling the rest")
+        print("  would leave it oversized. Handle this one in the IB UI.")
+        return _settled(reason=reason, stop_batch=True)
+
+    cancelled = False
+    if not args.dry_run and confirm_cancel(decision.symbol, order_id):
+        cancelled = await cancel(
+            ib, trades, journal=journal, run_id=run_id, symbol=decision.symbol,
+        )
+        print(f"  cancelled {len(trades)} order(s) for {decision.symbol}."
+              if cancelled else
+              "  the cancel was not acknowledged -- check the IB UI.")
+
+    return _settled(reason=reason, stop_batch=True, cancelled=cancelled)
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -844,11 +937,13 @@ async def _run(args: argparse.Namespace) -> int:
         if not matched:
             return 2
 
+        universe = load_yaml("universe.yaml")
         outcome = await _execute_one(
             ib=ib, path=path, decision=decision, plan=plan, body=body,
             book=book, intent=intent, journal=journal,
             gate=RejectAllGate() if args.dry_run else CLIConfirmationGate(),
-            args=args, universe=load_yaml("universe.yaml"), accounts=accounts,
+            args=args, universe=universe, accounts=accounts,
+            session=await _session_once(ib, universe, decision.symbol),
         )
 
         if outcome.outcome == "no_quote":
@@ -937,12 +1032,24 @@ async def _run_all(args: argparse.Namespace) -> int:
         if not matched:
             return 2
 
+        universe = load_yaml("universe.yaml")
+        # Asked once for the whole batch, BEFORE the review screen. Every US
+        # equity shares one session, so this is one call rather than N -- and
+        # putting it ahead of the review means a closed market is visible
+        # before you decide to walk through fifteen orders, rather than on the
+        # first gate after you already have.
+        session = await _session_once(ib, universe, selected[0][1].symbol)
+
         rows, projection = _project_batch(selected, book, intent)
+        if session is not None and session.warning:
+            print()
+            print(f"  >> {session.warning}")
+            print("     Orders can still be placed -- they will rest until the")
+            print("     market reopens -- but nothing will fill today.")
         if not confirm_batch_review(rows, projection):
             print("\nNothing was placed.")
             return 0
 
-        universe = load_yaml("universe.yaml")
         gate = RejectAllGate() if args.dry_run else CLIConfirmationGate()
         outcomes: list[OrderOutcome] = []
         placed_symbols: set[str] = set()
@@ -959,6 +1066,7 @@ async def _run_all(args: argparse.Namespace) -> int:
                 body=load_proposal(path)[2],
                 book=book, intent=intent, journal=journal, gate=gate,
                 args=args, universe=universe, accounts=accounts,
+                session=session,
                 prior_in_batch=len(placed_symbols),
             )
             outcomes.append(outcome)
@@ -1019,6 +1127,29 @@ async def _run_all(args: argparse.Namespace) -> int:
 
     finally:
         ib.disconnect()
+
+
+async def _session_once(ib: Any, universe: dict, symbol: str) -> Any:
+    """The exchange session, asked once and reused.
+
+    Every US equity shares one regular session, so asking per order in a batch
+    is the same question fifteen times over a network call. Named
+    ``_session_once`` rather than anything containing "check" on purpose: the
+    source-order test in ``tests/execution/test_execute_cli.py`` keys calls by
+    attribute name and already owns ``"check"`` for ``rules.check``.
+
+    Returns ``None`` on any trouble. This only ever produces a warning line, so
+    an absent answer must stay silent rather than invent one.
+    """
+    from .broker import contract_for, market_session
+
+    try:
+        contract = contract_for(symbol, _provider_symbols(universe, symbol))
+        await ib.qualifyContractsAsync(contract)
+        return await market_session(ib, contract)
+    except Exception as exc:  # noqa: BLE001 -- a warning must never block an order
+        logger.debug("could not determine the market session: %s", exc)
+        return None
 
 
 async def _reconcile(

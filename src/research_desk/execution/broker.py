@@ -38,13 +38,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 
 from ib_async import IB, LimitOrder, Order, Stock, StopOrder, Trade
 
 from ..models.modes import RunMode
 from ..models.orders import OrderPlan
 from ..models.state import FinalDecision
-from .bars import EXCHANGE_TZ, ib_ticker  # noqa: F401  (EXCHANGE_TZ re-exported)
+from .bars import EXCHANGE_TZ, ib_ticker
 from .confirmation import Preflight
 from .journal import Journal
 from .safety import assert_can_trade, assert_paper_account
@@ -82,6 +83,22 @@ TERMINAL_STATUSES = frozenset({"Filled", "Cancelled", "ApiCancelled", "Inactive"
 #: stuck order does not strand the operator. Timing out is not an error -- see
 #: ``wait_for_terminal``.
 FILL_TIMEOUT_S = 30.0
+
+#: Statuses that mean IB has accepted a cancel request.
+#:
+#: **``PendingCancel`` belongs here and NOT in ``TERMINAL_STATUSES``.**
+#: ``ib_async.cancelOrder`` sets a working order to ``PendingCancel``, which
+#: will move on its own to ``Cancelled`` -- so it is not terminal by that set's
+#: definition, and waiting for a terminal status after a cancel would time out
+#: on a cancel that worked. A held parent (``PendingSubmit`` with
+#: ``transmit=False``) goes straight to ``Cancelled``.
+CANCEL_ACKNOWLEDGED = frozenset(
+    {"PendingCancel", "Cancelled", "ApiCancelled", "Inactive"}
+)
+
+#: How long to wait for IB to acknowledge a cancel. Short: the request either
+#: lands or it does not, and there is no fill to wait on.
+CANCEL_TIMEOUT_S = 10.0
 
 
 class NoQuoteError(RuntimeError):
@@ -255,17 +272,34 @@ def marketable_limit(quote: Quote, action: str, offset_bps: int) -> float:
 
 
 def stop_price_for(
-    decision: FinalDecision, plan: OrderPlan, limit_price: float
+    decision: FinalDecision, plan: OrderPlan, anchor_price: float
 ) -> float | None:
     """The protective stop for a BUY, or ``None``.
 
-    Measured from the limit the order will actually go out at rather than from
-    the stale reference price sizing used, so the distance the human sees is
-    the distance they get.
+    **``anchor_price`` is the FRESH QUOTE's reference, not the limit and not
+    the decide-time price.** There are three candidate prices here and only one
+    is right; the other two were each wrong in a different way.
+
+    *Not the decide-time ``plan.reference_price``.* That is what sizing used and
+    it can be hours old -- on MRVL it was the prior close, 284.68, against a
+    market near 269. Anchoring there puts the stop 5% away from where it was
+    meant to be.
+
+    *Not the limit either, which is what this used to do.* The limit is
+    deliberately displaced from the market by ``limit_offset_bps``, so anchoring
+    on it drags the stop along with the displacement. At 10 bps that was a 0.09%
+    error and invisible. At the 100 bps this book runs, an 8% stop lands 7.1%
+    below the fill -- and ``sizing``'s ``cap_risk`` sized the position on the
+    arithmetic that 8% bounds the loss. The position does not become riskier
+    (it loses slightly less when stopped); it gets shaken out on noise the
+    thesis was sized to ride through. Widening the offset is exactly what made
+    the old anchor wrong, which is why the two changes shipped together.
+
+    So: the fresh quote's reference -- current, and undisplaced.
     """
     if plan.quantity <= 0 or not decision.stop_loss_pct:
         return None
-    stop = limit_price * (1 - decision.stop_loss_pct / 100.0)
+    stop = anchor_price * (1 - decision.stop_loss_pct / 100.0)
     return round_to_tick(stop) if stop > 0 else None
 
 
@@ -381,6 +415,169 @@ def filled_quantity(trade: Trade) -> tuple[int, float]:
     return side * shares, price
 
 
+@dataclass(frozen=True)
+class Session:
+    """Whether the exchange is in its regular session, and what it says.
+
+    Built from IB's own ``ContractDetails.liquidHours`` rather than a hardcoded
+    09:30-16:00, because that string already accounts for holidays and
+    half-days and this repo has no trading calendar. Checked: there is no
+    market-hours knowledge anywhere in the codebase -- ``EXCHANGE_TZ`` is a bare
+    timezone and ``useRTH=True`` on the bars request only asks IB to filter what
+    it returns.
+
+    ``is_open=None`` means IB did not say. Unknown is not closed, and this is
+    only ever a warning, so an absent answer stays silent rather than crying
+    wolf.
+    """
+
+    is_open: bool | None
+    now: datetime | None = None
+    opens_at: datetime | None = None
+    closes_at: datetime | None = None
+    note: str = ""
+
+    @property
+    def warning(self) -> str | None:
+        """One line for the confirmation screen, or ``None`` when all is well."""
+        if self.is_open is not False:
+            return None
+        when = f" (now {self.now:%H:%M %Z})" if self.now else ""
+        nxt = (
+            f" Next session opens {self.opens_at:%a %d %b %H:%M %Z}."
+            if self.opens_at else ""
+        )
+        return (
+            f"THE REGULAR SESSION IS CLOSED{when}. This order is "
+            f"outsideRth=False, so it will not fill until the market reopens."
+            + nxt
+        )
+
+
+async def market_session(ib: IB, contract: Stock) -> Session:
+    """Is the exchange in its regular session right now?
+
+    One IB call, and the caller is expected to reuse the answer: every US
+    equity shares one session, so asking per order in a batch is the same
+    question fifteen times.
+
+    **Never raises.** A session check that can break order placement would be a
+    worse defect than the one it reports, so anything unexpected -- no contract
+    details, an empty hours string, a timezone IB spells in a way
+    ``zoneinfo`` does not know -- comes back as ``is_open=None`` and says
+    nothing at the gate.
+    """
+    try:
+        details = await ib.reqContractDetailsAsync(contract)
+    except Exception as exc:  # noqa: BLE001 -- a warning must not break an order
+        logger.debug("could not read contract details for the session: %s", exc)
+        return Session(is_open=None, note=f"contract details unavailable: {exc}")
+
+    if not details:
+        return Session(is_open=None, note="IB returned no contract details")
+
+    detail = details[0]
+    try:
+        sessions = detail.liquidSessions()
+    except Exception as exc:  # noqa: BLE001 -- ib_async raises on odd tz strings
+        logger.debug("could not parse liquidHours: %s", exc)
+        return Session(is_open=None, note=f"unparseable liquidHours: {exc}")
+
+    if not sessions:
+        return Session(is_open=None, note="IB reported no liquid sessions")
+
+    now = datetime.now(EXCHANGE_TZ)
+    for window in sessions:
+        if window.start <= now <= window.end:
+            return Session(is_open=True, now=now,
+                           opens_at=window.start, closes_at=window.end)
+
+    upcoming = [w.start for w in sessions if w.start > now]
+    return Session(
+        is_open=False, now=now,
+        opens_at=min(upcoming) if upcoming else None,
+    )
+
+
+async def wait_for_cancel(
+    trade: Trade, *, timeout_s: float = CANCEL_TIMEOUT_S, poll_s: float = 0.25,
+) -> bool:
+    """Wait for IB to acknowledge a cancel. True if it did.
+
+    **A separate function from ``wait_for_terminal``, not a parameter on it**,
+    for two independent reasons:
+
+    * ``PendingCancel`` is an acknowledged cancel but is deliberately not a
+      terminal status -- see ``CANCEL_ACKNOWLEDGED``. Reusing the fill wait
+      would report a successful cancel as a timeout.
+    * ``tests/execution/test_batch.py`` asserts ``_execute_one`` contains
+      exactly one ``wait_for_terminal`` call, on ``trades[0]``. That assertion
+      is right -- the GTC stop must never be waited on -- so the cancel path
+      needs its own name rather than a second call it would have to excuse.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while True:
+        if trade.orderStatus.status in CANCEL_ACKNOWLEDGED:
+            return True
+        if asyncio.get_running_loop().time() >= deadline:
+            logger.warning(
+                "order %s is still %s %.0fs after a cancel request",
+                trade.order.orderId, trade.orderStatus.status, timeout_s,
+            )
+            return False
+        await asyncio.sleep(poll_s)
+
+
+async def cancel(
+    ib: IB,
+    trades: list[Trade],
+    *,
+    journal: Journal,
+    run_id: str,
+    symbol: str,
+) -> bool:
+    """Cancel a bracket that never filled. **Child first, then the parent.**
+
+    The order matters. Cancelling the parent first leaves the protective stop
+    alone in the account for however long the second call takes -- a resting
+    SELL STOP against a position that was never opened. Child first means the
+    account passes through "no orders" rather than "a naked stop".
+
+    **Only for an unfilled bracket.** The caller checks that; this does not
+    second-guess it, but the reason is worth stating where the cancel lives: the
+    stop is sized for the full quantity, so cancelling the parent remainder of a
+    PARTIAL fill leaves a stop that would oversell. Fixing that is
+    cancel-and-replace, which ``FOLLOWUPS.md`` records as real work rather than
+    something to half-build inside a cancel helper.
+
+    Journals ``order_cancelled`` -- a new event name on purpose. The
+    ``order_submitted`` events carry exactly two roles, ``entry`` and
+    ``protective_stop``, and a test asserts that set; a cancel is a different
+    thing that happened, not a third submission.
+    """
+    acknowledged = True
+    for trade in reversed(trades):  # child first
+        try:
+            ib.cancelOrder(trade.order)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("could not cancel order %s: %s",
+                           trade.order.orderId, exc)
+            acknowledged = False
+            continue
+        settled = await wait_for_cancel(trade)
+        acknowledged = acknowledged and settled
+        journal.write(
+            "order_cancelled", run_id=run_id, symbol=symbol,
+            order_id=trade.order.orderId, order_type=trade.order.orderType,
+            status=trade.orderStatus.status, acknowledged=settled,
+        )
+        logger.info(
+            "cancelled %s order %s: %s",
+            symbol, trade.order.orderId, trade.orderStatus.status,
+        )
+    return acknowledged
+
+
 async def place(
     ib: IB,
     contract: Stock,
@@ -448,21 +645,27 @@ async def place(
 
 
 __all__ = [
+    "CANCEL_ACKNOWLEDGED",
+    "CANCEL_TIMEOUT_S",
     "DELAYED_MARKET_DATA",
     "FILL_TIMEOUT_S",
     "TERMINAL_STATUSES",
     "NoQuoteError",
     "Quote",
+    "Session",
     "TICK",
     "build_orders",
+    "cancel",
     "connect",
     "contract_for",
     "filled_quantity",
+    "market_session",
     "marketable_limit",
     "place",
     "preflight",
     "quote",
     "round_to_tick",
     "stop_price_for",
+    "wait_for_cancel",
     "wait_for_terminal",
 ]

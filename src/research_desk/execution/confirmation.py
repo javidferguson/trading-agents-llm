@@ -139,6 +139,8 @@ class ConfirmationGate(Protocol):
         stop_price: float | None = None,
         preflight: Preflight | None = None,
         quote_source: str | None = None,
+        offset_bps: int | None = None,
+        session_warning: str | None = None,
     ) -> bool:
         ...
 
@@ -208,14 +210,31 @@ def render_decision(
     stop_price: float | None = None,
     preflight: Preflight | None = None,
     quote_source: str | None = None,
+    offset_bps: int | None = None,
+    session_warning: str | None = None,
     now: datetime | None = None,
 ) -> str:
-    """Format the order for human review. Raises if the proposal has expired."""
+    """Format the order for human review. Raises if the proposal has expired.
+
+    ``offset_bps`` is the offset **actually used to price this order**, and it
+    is a parameter rather than being read off ``decision`` because those two
+    numbers can now differ. ``limit_offset_bps`` moved into
+    ``portfolio-intent.yaml`` and is read at execute time, so
+    ``FinalDecision.limit_offset_bps`` is the decide-time record -- a proposal
+    written yesterday still says 10 while the order goes out at 100. Rendering
+    the stale one would print a number that is not what is being sent, on the
+    one screen whose entire job is to show what is being sent.
+    """
     assert_not_expired(decision, now=now)
 
     side = "BUY" if plan.quantity > 0 else "SELL"
     shares = abs(plan.quantity)
     notional = shares * limit_price
+    # Falls back to the proposal's value only when the caller does not say,
+    # which keeps older call sites honest rather than silently printing 0.
+    bps = decision.limit_offset_bps if offset_bps is None else offset_bps
+    # Signed the way it is applied: a SELL reaches DOWN through the spread.
+    reach = f"{'+' if side == 'BUY' else '-'}{bps} bps"
 
     lines = [
         "=" * RULE,
@@ -223,9 +242,15 @@ def render_decision(
         "=" * RULE,
         f"  Action       : {side} {shares} share(s) of {decision.symbol}",
         f"  Order type   : marketable LIMIT at {limit_price:,.2f}"
-        f"  (+{decision.limit_offset_bps} bps)",
+        f"  ({reach})",
         f"  Notional     : {notional:,.2f} USD",
     ]
+
+    if session_warning:
+        # High up, not buried below the rationale: it changes whether this
+        # order can do anything at all, which is more basic than whether it is
+        # a good idea.
+        lines.append(f"  >> {session_warning}")
 
     if stop_price is not None:
         lines.append(
@@ -318,10 +343,13 @@ class CLIConfirmationGate:
         stop_price: float | None = None,
         preflight: Preflight | None = None,
         quote_source: str | None = None,
+        offset_bps: int | None = None,
+        session_warning: str | None = None,
     ) -> bool:
         print(render_decision(
             decision, plan, limit_price=limit_price, stop_price=stop_price,
             preflight=preflight, quote_source=quote_source,
+            offset_bps=offset_bps, session_warning=session_warning,
         ))
 
         expected = decision.symbol.upper()
@@ -367,10 +395,13 @@ class RejectAllGate:
         stop_price: float | None = None,
         preflight: Preflight | None = None,
         quote_source: str | None = None,
+        offset_bps: int | None = None,
+        session_warning: str | None = None,
     ) -> bool:
         print(render_decision(
             decision, plan, limit_price=limit_price, stop_price=stop_price,
             preflight=preflight, quote_source=quote_source,
+            offset_bps=offset_bps, session_warning=session_warning,
         ))
         print("\nDRY RUN -- declining automatically. Nothing was sent.")
         logger.info("RejectAllGate: declining %s", decision.symbol)
@@ -545,6 +576,97 @@ def confirm_batch_review(rows: Sequence[BatchRow], projection: BatchProjection) 
     return False
 
 
+# --------------------------------------------------------------------------- #
+# An order that did not settle. Its own narrow gate.
+# --------------------------------------------------------------------------- #
+
+#: What has to be typed to pull a working order. Its own word for the same
+#: reason ``REWRITE_WORD`` and ``REVIEW_WORD`` are theirs: the ticker approves
+#: an order, and nothing should let one muscle-memory answer both place a trade
+#: and retract one.
+CANCEL_WORD = "CANCEL"
+
+
+def render_unsettled(
+    symbol: str,
+    *,
+    order_id: int,
+    action: str,
+    ordered: int,
+    filled: int,
+    limit_price: float,
+    status: str,
+    stop_price: float | None = None,
+    timeout_s: float = 0.0,
+) -> str:
+    """What is still outstanding after the fill wait gave up.
+
+    This exists because the batch used to print "STOPPED" and exit, which read
+    as though nothing were outstanding. On 2026-10-09 MRVL order 53 was left
+    working with a protective stop attached to it -- so if it filled after the
+    process was gone, a stop would arm against a position the book had never
+    heard of. Saying so is the minimum; offering to pull it is the point.
+    """
+    lines = [
+        "",
+        "=" * RULE,
+        f"ORDER {order_id} IS STILL WORKING -- {symbol}",
+        "=" * RULE,
+        f"  {symbol:<6} {action} {ordered:+d} @ LMT {limit_price:,.2f}"
+        f"   filled {filled} of {abs(ordered)}",
+        f"  Status: {status}"
+        + (f", unchanged for {timeout_s:.0f}s" if timeout_s else ""),
+    ]
+    if stop_price is not None:
+        lines += [
+            "",
+            f"  A protective stop at {stop_price:,.2f} is attached. If this",
+            "  entry fills after this run exits, that stop arms against a",
+            "  position the book does not know about.",
+        ]
+    lines += [
+        "",
+        "  It is a DAY order, so it works until it fills or the session ends.",
+        "  Leaving it is a legitimate choice -- it may simply be about to fill.",
+        "=" * RULE,
+    ]
+    return "\n".join(lines)
+
+
+def confirm_cancel(symbol: str, order_id: int) -> bool:
+    """Ask whether to pull a working order and its stop.
+
+    A narrow gate of its own, like ``confirm_rewrite``. What is being approved
+    is a **retraction**, not a trade, and the two should not share a word.
+
+    A closed stdin **leaves the order working** -- the opposite default from
+    the order gate, and deliberately so. The order gate declines because doing
+    nothing is the safe outcome when nobody is watching. Here the order already
+    exists and was already approved by a human; cancelling it unattended would
+    be the system reversing a decision on its own.
+    """
+    prompt = (
+        f"\nType {CANCEL_WORD} to pull order {order_id} ({symbol}) and its "
+        "stop, or anything else to leave it working: "
+    )
+    try:
+        answer = input(prompt).strip().upper()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        logger.warning(
+            "No interactive input available; leaving order %s working.", order_id
+        )
+        return False
+
+    if answer == CANCEL_WORD:
+        logger.info("Cancel approved for %s order %s", symbol, order_id)
+        return True
+    logger.info(
+        "Cancel declined for %s order %s (entered %r)", symbol, order_id, answer
+    )
+    return False
+
+
 #: What has to be typed to overwrite the book from the broker. A different word
 #: from the ticker on purpose: it is a different action with a different
 #: consequence, and reusing the ticker would let one muscle-memory answer do
@@ -578,6 +700,7 @@ def confirm_rewrite(path: Any) -> bool:
 
 
 __all__ = [
+    "CANCEL_WORD",
     "BatchProjection",
     "BatchRow",
     "CLIConfirmationGate",
@@ -591,7 +714,9 @@ __all__ = [
     "StaleBookError",
     "assert_not_expired",
     "confirm_batch_review",
+    "confirm_cancel",
     "confirm_rewrite",
     "render_batch",
     "render_decision",
+    "render_unsettled",
 ]

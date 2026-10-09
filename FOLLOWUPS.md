@@ -645,6 +645,61 @@ Still open, and deliberately:
   a single batch from creating the double-stop case, but adding to an existing
   position across two days still leaves two stops.
 
+## The batch stall, and what it turned out to be about
+
+`FILL_TIMEOUT_S` fired twice in the first two days of real trading. The 30s
+wait was the symptom and never the cause.
+
+**2026-10-09.** HON and V filled instantly; MRVL did not. It was sized against
+the prior close of 284.68, gapped down ~5%, and the limit went out at the
+delayed quote plus 10 bps — 269.47 — while the real market was above it.
+**2026-10-08.** SOXX was placed at 16:29, after the close, where a DAY limit
+cannot fill at all.
+
+Fixed by `limit_offset_bps` moving into `portfolio-intent.yaml` (100 bps, read
+at execute time), the stop re-anchoring on the fresh quote, a `CANCEL` prompt
+for an order that did not settle, and a market-closed warning at the gate. See
+architecture §9's "as built" notes for the reasoning on each.
+
+What is still open:
+
+* **`FILL_TIMEOUT_S` is not configurable.** 30s is a constant in `broker.py`.
+  It should rarely fire now; if it turns out to fire on slow-but-fine fills,
+  that is the knob, and it belongs beside `limit_offset_bps` rather than in
+  code.
+* **Stop cancel-and-replace is still unbuilt**, and the partial-fill path is
+  where it now shows. A partial fill is deliberately not offered a cancel
+  because the stop is sized for the full order; the operator is told to handle
+  it in the IB UI. That is honest but it is a manual step in the middle of an
+  otherwise automated batch, and it is the strongest argument yet for building
+  the real thing.
+* **The session check costs one `reqContractDetailsAsync` per batch.** Fine.
+  But it is asked about the *first* symbol in the batch and reused for all of
+  them, which is correct only because every US equity shares one session. If a
+  non-US listing ever enters the universe that assumption breaks silently —
+  the warning would simply be about the wrong exchange.
+
+## `.dockerignore`, and the pattern-depth trap
+
+There was no `.dockerignore`, so every `--build` sent ~400 MB: `data/` (229 MB),
+`.venv/` (91 MB), and `.claude/` (72 MB, which contains a *complete second copy
+of the repo* under `worktrees/`). Five `execute` targets pass `--build`, so this
+was paid several times a session. Now ~1.7 MB.
+
+Two things recorded because they are easy to get wrong later:
+
+**Docker matches `.dockerignore` patterns against the entire relative path, not
+a bare name at any depth like `.gitignore` does.** A plain `__pycache__/` line
+excludes only the one at the repo root — `src/research_desk/__pycache__`,
+`tests/__pycache__` and `scripts/__pycache__` all exist and all land inside a
+`COPY`. The patterns need `**/`.
+
+**Three things must never be excluded**, and two fail with an error that does
+not name the cause: `tests/` is explicitly COPYed and is what enforces the §0
+split; `README.md` and `LICENSE` are referenced by `pyproject.toml` metadata and
+`uv sync` builds this project itself. That last one is why the doc exclusions
+are listed one file at a time instead of a `*.md` glob.
+
 ## The 31 historical degraded runs are not being retro-fixed
 
 `NodeError.severity` split "an input was absent" from "the machinery broke"

@@ -46,6 +46,37 @@ class FakeTrade:
 
 
 @dataclass
+class FakeSession:
+    """One window from ``ContractDetails.liquidSessions()``."""
+
+    start: Any
+    end: Any
+
+
+@dataclass
+class FakeContractDetails:
+    """What ``reqContractDetailsAsync`` returns, for the session check.
+
+    ``liquidSessions()`` is a METHOD on the real ``ContractDetails`` (ib_async
+    parses ``liquidHours`` + ``timeZoneId`` into tz-aware windows), so the fake
+    implements the method rather than the raw string. Tests that want the
+    parsing itself exercised should go at ib_async, not at this.
+    """
+
+    sessions: list[FakeSession] = field(default_factory=list)
+    timeZoneId: str = "US/Eastern"
+    liquidHours: str = ""
+    raises: bool = False
+
+    def liquidSessions(self) -> list[FakeSession]:
+        if self.raises:
+            # The real one raises when timeZoneId is something zoneinfo does
+            # not know, which is a shape `market_session` must survive.
+            raise ValueError("unknown timezone")
+        return list(self.sessions)
+
+
+@dataclass
 class FakePosition:
     contract: FakeContract
     position: float
@@ -86,6 +117,7 @@ class FakeIB:
         next_order_id: int = 101,
         fills: bool = False,
         fill_price: float | None = None,
+        contract_details: list | None = None,
     ) -> None:
         self._accounts = accounts if accounts is not None else ["DU1234567"]
         self._ticker = ticker or FakeTicker(bid=472.0, ask=472.3, last=472.15,
@@ -108,10 +140,17 @@ class FakeIB:
         #: real rather than assumed.
         self._fills = fills
         self._fill_price = fill_price
+        #: None means "the method is unavailable", which is how `market_session`
+        #: behaves against a Gateway that will not answer -- distinct from an
+        #: empty list, which means "answered, and knows of no sessions".
+        self._contract_details = contract_details
 
         #: Every call, in order. The safety tests read this.
         self.calls: list[str] = []
         self.placed: list[tuple[Any, Any]] = []
+        #: orderId -> FakeTrade, so a cancel can look up what it is cancelling.
+        self.trades: dict[int, FakeTrade] = {}
+        self.cancelled: list[int] = []
         self.disconnected = False
         self.market_data_type: int | None = None
 
@@ -149,6 +188,9 @@ class FakeIB:
             order.orderId = self._next_order_id
             self._next_order_id += 1
         trade = FakeTrade(contract=contract, order=order)
+        # Kept, keyed by orderId, so cancelOrder can find the trade it has to
+        # mutate. Before the cancel work this object was built and dropped.
+        self.trades[order.orderId] = trade
         if self._fills and getattr(order, "orderType", "") != "STP":
             quantity = float(order.totalQuantity)
             trade.orderStatus = FakeOrderStatus(
@@ -163,6 +205,38 @@ class FakeIB:
             )
         self.placed.append((contract, order))
         return trade
+
+    def cancelOrder(self, order, manualCancelOrderTime: str = ""):  # noqa: ANN001, N803
+        """Mirror ib_async's STATUS semantics, which are not what you'd guess.
+
+        A working order goes to **PendingCancel**, not ``Cancelled`` -- it is a
+        request, and IB confirms it separately. A parent still being HELD
+        (``PendingSubmit`` with ``transmit=False``, which is how a bracket's
+        entry sits until its child arrives) short-circuits straight to
+        ``Cancelled`` because it was never live.
+
+        Getting this wrong in the fake would hide the real bug it exists to
+        catch: ``wait_for_terminal`` does not accept ``PendingCancel``, so code
+        that reused it after a cancel would report a successful cancel as a
+        timeout.
+        """
+        self.calls.append("cancelOrder")
+        self.cancelled.append(order.orderId)
+        trade = self.trades.get(order.orderId)
+        if trade is None:
+            return None
+        held = (
+            trade.orderStatus.status == "PendingSubmit"
+            and not getattr(order, "transmit", True)
+        )
+        trade.orderStatus.status = "Cancelled" if held else "PendingCancel"
+        return trade
+
+    async def reqContractDetailsAsync(self, contract):  # noqa: ANN001
+        self.calls.append("reqContractDetails")
+        if self._contract_details is None:
+            raise RuntimeError("contract details unavailable")
+        return list(self._contract_details)
 
     def positions(self) -> list[FakePosition]:
         self.calls.append("positions")

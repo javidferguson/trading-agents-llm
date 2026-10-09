@@ -334,3 +334,25 @@ def test_a_missing_field_does_not_raise() -> None:
     report = conf.Preflight.from_order_state(Sparse())
     assert report.is_empty
     assert report.init_margin_change is None
+
+
+def test_a_closed_market_warns_at_the_gate_and_does_not_refuse() -> None:
+    """**Warn, not refuse** -- so pre-staging an order for the next open stays
+    possible. Yesterday's stall was SOXX placed at 16:29, which could not fill;
+    the point is that the human sees that before typing the ticker, not that
+    the system decides for them."""
+    text = render(session_warning=(
+        "THE REGULAR SESSION IS CLOSED (now 16:29 EDT). This order is "
+        "outsideRth=False, so it will not fill until the market reopens."
+    ))
+    assert "SESSION IS CLOSED" in text
+    assert "outsideRth" in text
+    # Still a reviewable order, not a rejection.
+    assert "REVIEW BEFORE APPROVING" in text
+    assert "REJECTED" not in text
+
+
+def test_an_open_market_adds_nothing() -> None:
+    """An unknown or open session says nothing. A warning that appears on every
+    run is a warning that gets read past."""
+    assert "SESSION" not in render(session_warning=None)

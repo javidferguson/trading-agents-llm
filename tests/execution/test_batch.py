@@ -840,3 +840,304 @@ async def test_the_book_is_not_written_when_the_account_disagrees(
     assert "does NOT match" in out
     assert "make sync-book" in out
     assert not (batch_env["tmp"] / "portfolio.yaml").exists()
+
+
+# --------------------------------------------------------------------------- #
+# The offset comes from CONFIG, not from the proposal
+# --------------------------------------------------------------------------- #
+
+
+def test_the_offset_is_read_from_config_not_the_proposal() -> None:
+    """Structural, because the alternative is a live broker.
+
+    ``limit_offset_bps`` moved into ``portfolio-intent.yaml`` and is read at
+    execute time, so a proposal written yesterday says 10 while the order goes
+    out at whatever config says now. Reading ``decision.limit_offset_bps`` for
+    PRICING would silently revert the change.
+    """
+    import ast
+
+    src = Path(cli.__file__)
+    tree = ast.parse(src.read_text(), filename=str(src))
+    node = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and n.name == "_execute_one"
+    )
+
+    # Over the AST, not the text: the comment above the change explains why the
+    # proposal's value is NOT read, and a substring check would forbid saying so.
+    def reads(dotted: str) -> bool:
+        attr, obj = dotted.rsplit(".", 1)[::-1]
+        return any(
+            isinstance(n, ast.Attribute)
+            and n.attr == attr
+            and ast.unparse(n.value) == obj
+            for n in ast.walk(node)
+        )
+
+    assert reads("intent.execution.limit_offset_bps")
+    assert not reads("decision.limit_offset_bps"), (
+        "pricing must not read the proposal's decide-time offset"
+    )
+
+
+def test_the_gate_is_shown_the_offset_actually_used() -> None:
+    """**The one way this change could lie to the operator.**
+
+    The approval screen's whole job is to show what is being sent. Rendering
+    ``decision.limit_offset_bps`` while pricing from config would print 10 on
+    an order going out at 100.
+    """
+    from research_desk.execution import confirmation as conf
+
+    decision = _decision("TSM").model_copy(update={"limit_offset_bps": 10})
+    plan = OrderPlan(
+        symbol="TSM", as_of=AS_OF, action="BUY", quantity=12,
+        reference_price=472.15, estimated_notional=5665.8,
+    )
+    text = conf.render_decision(
+        decision, plan, limit_price=476.87, offset_bps=100,
+    )
+    assert "100 bps" in text
+    assert "10 bps" not in text
+
+
+def test_a_sell_offset_reads_as_reaching_down() -> None:
+    """``marketable_limit`` SUBTRACTS the offset on a SELL. The screen said
+    ``+10 bps`` for both sides, which described the wrong direction."""
+    from research_desk.execution import confirmation as conf
+
+    decision = _decision("TSM").model_copy(update={"action": "SELL"})
+    plan = OrderPlan(
+        symbol="TSM", as_of=AS_OF, action="SELL", quantity=-12,
+        reference_price=472.15, estimated_notional=5665.8,
+    )
+    text = conf.render_decision(
+        decision, plan, limit_price=467.43, offset_bps=100,
+    )
+    assert "-100 bps" in text
+
+
+def test_the_configured_offset_is_bounded() -> None:
+    """The one genuinely dangerous number in portfolio-intent.yaml: it decides
+    how far an order will chase a price. Everything else there caps exposure."""
+    import pydantic
+
+    from research_desk.models.intent import Execution
+
+    assert Execution().limit_offset_bps == 10, "the default stays conservative"
+    for bad in (-1, 501):
+        with pytest.raises(pydantic.ValidationError):
+            Execution(limit_offset_bps=bad)
+
+
+def test_the_shipped_config_actually_carries_the_field() -> None:
+    """Every model in intent.py uses Pydantic's default ``extra='ignore'``, so
+    a YAML key with no matching field is silently dropped. That makes "the
+    config says 100" and "the code reads 100" two different claims."""
+    from research_desk.config import load_yaml
+    from research_desk.intent.engine import load_intent
+
+    raw = (load_yaml("portfolio-intent.yaml").get("execution") or {})
+    assert "limit_offset_bps" in raw, "not set in the shipped config"
+    assert load_intent().execution.limit_offset_bps == raw["limit_offset_bps"]
+
+
+# --------------------------------------------------------------------------- #
+# An order that did not settle
+# --------------------------------------------------------------------------- #
+
+
+def test_the_cancel_prompt_needs_its_own_word(monkeypatch) -> None:
+    """Not the ticker. The ticker places an order; this retracts one, and no
+    single muscle-memory answer should do both."""
+    from research_desk.execution import confirmation as conf
+
+    assert conf.CANCEL_WORD not in {"y", "TSM"}
+    monkeypatch.setattr("builtins.input", lambda prompt="": "CANCEL")
+    assert conf.confirm_cancel("TSM", 53) is True
+
+    monkeypatch.setattr("builtins.input", lambda prompt="": "TSM")
+    assert conf.confirm_cancel("TSM", 53) is False
+
+
+@pytest.mark.parametrize("boom", [EOFError, KeyboardInterrupt])
+def test_a_closed_stdin_leaves_the_order_working(monkeypatch, boom) -> None:
+    """**The opposite default from the order gate, deliberately.**
+
+    The order gate declines on a closed stdin because doing nothing is the safe
+    outcome when nobody is watching. Here the order already exists and a human
+    already approved it; cancelling unattended would be the system reversing a
+    decision on its own.
+    """
+    from research_desk.execution import confirmation as conf
+
+    def raise_it(prompt=""):
+        raise boom()
+
+    monkeypatch.setattr("builtins.input", raise_it)
+    assert conf.confirm_cancel("TSM", 53) is False
+
+
+def test_the_unsettled_screen_names_the_attached_stop() -> None:
+    """The reason this screen exists. The batch used to print "STOPPED" and
+    exit, reading as though nothing were outstanding -- while MRVL order 53 sat
+    working with a stop that would arm against a position the book had never
+    heard of."""
+    from research_desk.execution.confirmation import render_unsettled
+
+    text = render_unsettled(
+        "MRVL", order_id=53, action="BUY", ordered=105, filled=0,
+        limit_price=269.47, status="Submitted", stop_price=247.91,
+        timeout_s=30.0,
+    )
+    assert "ORDER 53 IS STILL WORKING" in text
+    assert "247.91" in text
+    assert "position the book does not know about" in text
+    # And it must not imply the order is doomed -- it may be about to fill.
+    assert "Leaving it is a legitimate choice" in text
+
+
+async def test_a_stalled_order_offers_the_cancel_and_takes_it(
+    batch_env, monkeypatch, capsys
+) -> None:
+    """End to end: the stall, the prompt, both legs cancelled."""
+    free = batch_env["free"]
+    big = batch_env["book"].model_copy(update={
+        "positions": batch_env["book"].positions[:2]
+    })
+    from research_desk.intent import engine
+    monkeypatch.setattr(engine, "load_portfolio", lambda **kw: big)
+    ib = batch_env["ib"]
+    ib._positions = [p for p in ib._positions if p.contract.symbol in big.symbols]
+    ib._fills = False          # placed, never fills
+
+    write_proposal(batch_env["proposals"], free[0], run_id="r1", quantity=2)
+    write_proposal(batch_env["proposals"], free[1], run_id="r2", quantity=2)
+
+    def typed(prompt: str = "") -> str:
+        if "REVIEW" in prompt:
+            return "REVIEW"
+        if "CANCEL" in prompt:
+            return "CANCEL"
+        return prompt.split("Type ", 1)[1].split(" to place", 1)[0]
+
+    monkeypatch.setattr("builtins.input", typed)
+    assert await cli._run_all(args()) == 0
+    out = capsys.readouterr().out
+
+    assert "IS STILL WORKING" in out
+    assert "cancelled" in out
+    # Both legs: entry and its stop.
+    assert len(ib.cancelled) == 2
+    # The batch still stopped, and the untouched proposal is still pending.
+    assert "STOPPED" in out
+    assert len(cli._select_all(batch_env["proposals"])) == 1
+
+
+async def test_declining_the_cancel_leaves_the_order_alone(
+    batch_env, monkeypatch, capsys
+) -> None:
+    free = batch_env["free"]
+    big = batch_env["book"].model_copy(update={
+        "positions": batch_env["book"].positions[:2]
+    })
+    from research_desk.intent import engine
+    monkeypatch.setattr(engine, "load_portfolio", lambda **kw: big)
+    ib = batch_env["ib"]
+    ib._positions = [p for p in ib._positions if p.contract.symbol in big.symbols]
+    ib._fills = False
+
+    write_proposal(batch_env["proposals"], free[0], run_id="r1", quantity=2)
+
+    def typed(prompt: str = "") -> str:
+        if "REVIEW" in prompt:
+            return "REVIEW"
+        if "CANCEL" in prompt:
+            return "no"
+        return prompt.split("Type ", 1)[1].split(" to place", 1)[0]
+
+    monkeypatch.setattr("builtins.input", typed)
+    await cli._run_all(args())
+
+    assert ib.cancelled == []
+    receipt = next(batch_env["proposals"].glob("*.result.json"))
+    body = json.loads(receipt.read_text())
+    assert body["outcome"] == "placed"
+    assert body["cancelled"] is False
+
+
+async def test_a_partial_fill_is_not_offered_a_cancel(
+    batch_env, monkeypatch, capsys
+) -> None:
+    """**Not caution -- correctness.**
+
+    The stop child is sized for the FULL quantity, so pulling the parent
+    remainder leaves a stop that would oversell what was actually bought.
+    Fixing that is cancel-and-replace, which FOLLOWUPS records as real work.
+    """
+    free = batch_env["free"]
+    big = batch_env["book"].model_copy(update={
+        "positions": batch_env["book"].positions[:2]
+    })
+    from research_desk.intent import engine
+    monkeypatch.setattr(engine, "load_portfolio", lambda **kw: big)
+
+    ib = batch_env["ib"]
+    ib._positions = [p for p in ib._positions if p.contract.symbol in big.symbols]
+    ib._fills = False
+    write_proposal(batch_env["proposals"], free[0], run_id="r1", quantity=10)
+
+    original = ib.placeOrder
+
+    def partially_fill(contract, order):
+        trade = original(contract, order)
+        if getattr(order, "orderType", "") != "STP":
+            trade.orderStatus.status = "Submitted"
+            trade.orderStatus.filled = 4.0
+            trade.orderStatus.remaining = 6.0
+            trade.orderStatus.avgFillPrice = 100.0
+        return trade
+
+    monkeypatch.setattr(ib, "placeOrder", partially_fill)
+    answer_each_gate(monkeypatch)
+    await cli._run_all(args())
+    out = capsys.readouterr().out
+
+    assert "PARTIALLY FILLED" in out
+    assert "no cancel is offered" in out
+    assert ib.cancelled == [], "a partial fill must not be cancelled"
+    # And the running book moved by what filled, not by what was ordered.
+    receipt = json.loads(
+        next(batch_env["proposals"].glob("*.result.json")).read_text()
+    )
+    assert receipt["filled"] == 4
+
+
+async def test_the_receipt_records_what_settled(batch_env, monkeypatch) -> None:
+    """MRVL's receipt said ``status: Submitted, filled: 0.0`` -- accurate at
+    placement, and reading like a final state. ``outcome`` stays "placed"
+    because that is what ``execute --list`` keys on."""
+    free = batch_env["free"]
+    big = batch_env["book"].model_copy(update={
+        "positions": batch_env["book"].positions[:2]
+    })
+    from research_desk.intent import engine
+    monkeypatch.setattr(engine, "load_portfolio", lambda **kw: big)
+    ib = batch_env["ib"]
+    ib._positions = [p for p in ib._positions if p.contract.symbol in big.symbols]
+
+    write_proposal(batch_env["proposals"], free[0], run_id="r1", quantity=2,
+                   price=100.0)
+    answer_each_gate(monkeypatch)
+    await cli._run_all(args())
+
+    body = json.loads(
+        next(batch_env["proposals"].glob("*.result.json")).read_text()
+    )
+    assert body["outcome"] == "placed"
+    assert body["settled"] is True
+    assert body["status"] == "Filled"
+    assert body["filled"] == 2
+    assert body["offset_bps_used"] == 100
