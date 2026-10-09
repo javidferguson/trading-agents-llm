@@ -3,7 +3,7 @@
 Stage 6 sizing needs two numbers the rest of the design does not have: how much
 equity there is, and how much of it is already in the symbol under
 consideration. The exit gate requires **zero IB contact**, so this comes from
-``config/portfolio.yaml`` and never from a socket.
+``data/portfolio.yaml`` and never from a socket.
 
 Three rules, and each one exists because the alternative is a silently wrong
 position size.
@@ -242,7 +242,7 @@ class PortfolioSnapshot(BaseModel):
 
     @classmethod
     def load(cls, path: Path) -> "PortfolioSnapshot":
-        """Read ``config/portfolio.yaml``.
+        """Read ``data/portfolio.yaml``.
 
         Raises ``FileNotFoundError`` rather than defaulting to an empty book: a
         missing file sized as all-cash would propose a full-size opening trade

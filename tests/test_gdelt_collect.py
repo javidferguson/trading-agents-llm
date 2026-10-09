@@ -479,28 +479,124 @@ def test_interval_is_configurable_from_the_cli(monkeypatch) -> None:
         gdelt.REQUEST_INTERVAL_S = original
 
 
-def test_a_sustained_block_says_to_stop_rather_than_retry(monkeypatch, no_waiting) -> None:
-    """Measured behaviour: an IP in the penalty box stays 429 well past 150s.
+def test_a_429_before_any_success_fails_immediately(monkeypatch, no_waiting) -> None:
+    """**A pre-existing block must not be retried at all.**
 
-    When that happens the useful advice is the opposite of "try again" -- more
-    requests from a throttled IP plausibly extend the block.
+    Observed 2026-10-08: `make gdelt` was refused on request 1 of 32. A 429
+    before this process has had anything accepted cannot have been caused by our
+    own pacing, so the backoff cannot clear it -- and each retry is one more
+    request from an IP already being punished for requests.
+
+    The old behaviour burned the full backoff first, which is three requests
+    where zero were useful. That is how a block gets extended, and the script's
+    own comment warned about it while the code did it anyway.
     """
+    monkeypatch.setattr(gdelt, "_succeeded_once", False)
     monkeypatch.setattr(gdelt.urllib.error, "HTTPError", _FakeHTTPError)
-    monkeypatch.setattr(
-        gdelt.urllib.request,
-        "urlopen",
-        lambda *a, **k: (_ for _ in ()).throw(
-            _FakeHTTPError(429, THROTTLE_BODY, "Too Many Requests")
-        ),
-    )
+
+    calls = []
+
+    def refuse(*a, **k):
+        calls.append(1)
+        raise _FakeHTTPError(429, THROTTLE_BODY, "Too Many Requests")
+
+    monkeypatch.setattr(gdelt.urllib.request, "urlopen", refuse)
 
     with pytest.raises(gdelt.GdeltError) as caught:
         gdelt._get({"mode": "artlist"})
 
+    assert len(calls) == 1, (
+        f"retried a pre-existing block {len(calls)} times; each one may extend it"
+    )
+
+    message = str(caught.value)
+    assert "ALREADY blocked" in message
+    assert "Not retrying" in message
+    # The advice has to be the advice that works: these last hours.
+    assert "hours, not minutes" in message
+    assert "different network" in message
+    # And it must say the cost is bounded, or the reader panics about the
+    # 3-month window.
+    assert "depth at the far end" in message
+
+
+def test_a_429_after_a_success_does_use_the_backoff(monkeypatch, no_waiting) -> None:
+    """The other half: mid-run, a 429 IS plausibly our own burst.
+
+    One accepted request proves the IP is not blocked, so a later 429 is the
+    momentary case the short backoff exists for -- and giving up immediately
+    there would abandon a collection run over one hiccup.
+    """
+    monkeypatch.setattr(gdelt, "_succeeded_once", True)
+    monkeypatch.setattr(gdelt.urllib.error, "HTTPError", _FakeHTTPError)
+
+    calls = []
+
+    def refuse(*a, **k):
+        calls.append(1)
+        raise _FakeHTTPError(429, THROTTLE_BODY, "Too Many Requests")
+
+    monkeypatch.setattr(gdelt.urllib.request, "urlopen", refuse)
+
+    with pytest.raises(gdelt.GdeltError) as caught:
+        gdelt._get({"mode": "artlist"})
+
+    assert len(calls) == len(gdelt.RETRY_BACKOFF_S) + 1, "should exhaust the backoff"
+
     message = str(caught.value)
     assert "SUSTAINED" in message
-    assert "Wait ~15 minutes" in message
     assert "may extend it" in message
+    # Corrected from "~15 minutes", which was measured wrong by ~18 hours.
+    assert "several HOURS" in message
+
+
+def test_one_accepted_request_flips_the_flag(monkeypatch, no_waiting) -> None:
+    """Guard the distinction above: the flag must actually be set on success,
+    or every mid-run 429 is treated as a pre-existing block and a collection
+    run dies on its first hiccup."""
+    monkeypatch.setattr(gdelt, "_succeeded_once", False)
+
+    class Ok:
+        def read(self):
+            return b"{}"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(gdelt.urllib.request, "urlopen", lambda *a, **k: Ok())
+
+    gdelt._get({"mode": "artlist"})
+    assert gdelt._succeeded_once is True
+
+
+def test_the_request_interval_keeps_a_margin_over_the_published_limit() -> None:
+    """**Pacing exactly at a threshold means breaching it regularly.**
+
+    GDELT's 429 body says "one request every 5 seconds", and `_throttle` gates
+    on request START times -- so at 5.0 the server receives requests 5.00s apart
+    with network jitter on top, and some arrivals land under the line. A block
+    then costs hours, measured, while the margin costs ~2 minutes on a 32-symbol
+    run.
+    """
+    # Read the committed default from the source, not the module global: an
+    # autouse fixture zeroes REQUEST_INTERVAL_S so the suite does not sleep,
+    # and asserting on the live value would pass vacuously.
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1]
+           / "scripts" / "gdelt_collect.py").read_text()
+    match = re.search(r"^REQUEST_INTERVAL_S = ([\d.]+)$", src, re.MULTILINE)
+    assert match, "REQUEST_INTERVAL_S is no longer a module-level literal"
+
+    default = float(match.group(1))
+    assert default > 5.0, (
+        f"the committed default is {default}, at or below GDELT's published "
+        "limit, which leaves no room for jitter"
+    )
 
 
 def test_backoff_is_short_on_purpose() -> None:

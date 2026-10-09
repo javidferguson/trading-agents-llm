@@ -420,6 +420,31 @@ having fired twice** — once after connect, once immediately before
 Client Portal first. `endDateTime` must be timezone-aware. Both are already
 documented in §14 and both will still cost an hour.
 
+> **Built.** `execution/confirmation.py` carried from the ORB engine with the
+> renderer rewritten for equities, plus `broker.py`, `reconcile.py` and the
+> `execute` entry point. Verified against the live paper account up to the gate;
+> the one human-placed trade is the only step left, because it is the step that
+> cannot be automated by design.
+>
+> The gate test asserts the **sequence** of calls, not a count: a
+> `assert_paper_account` moved to after `placeOrder` would be an audit rather
+> than a check, and a count-based test would not notice. It also asserts nothing
+> runs between the second check and the order.
+>
+> Three things the plan did not anticipate, all found by running it:
+>
+> * **A book/account mismatch has to refuse before prompting.** The share count
+>   came from `config/portfolio.yaml`; if that file is wrong the number is wrong,
+>   so there is nothing safe to approve. Shown as a per-symbol diff with an offer
+>   to rewrite the book from the broker.
+> * **A dry run must write no receipt.** It wrote one, which marked the proposal
+>   consumed and made the next real `execute` refuse it. A rehearsal that changes
+>   what the next command does is not a rehearsal.
+> * **`config/portfolio.yaml` cannot be both a committed fixture and the
+>   broker's file.** The first real `execute` run proved it by turning twelve
+>   Stage 6 tests red. The book is now gitignored state; the fixture is the seed
+>   recipe plus the bars cache.
+
 ### Stage 8 — Evaluation · L
 
 Replay harness, baselines B0–B4, scoring, calibration plot.

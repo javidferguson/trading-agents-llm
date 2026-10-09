@@ -1,4 +1,4 @@
-"""Generate or re-mark ``config/portfolio.yaml`` from the bars cache. No IB.
+"""Generate or re-mark ``data/portfolio.yaml`` from the bars cache. No IB.
 
 Two jobs, one file:
 
@@ -30,7 +30,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from research_desk.models.portfolio import PortfolioSnapshot, Position  # noqa: E402
 
 CACHE_DIR = REPO_ROOT / "data" / "cache" / "ib"
-OUT_PATH = REPO_ROOT / "config" / "portfolio.yaml"
+OUT_PATH = REPO_ROOT / "data" / "portfolio.yaml"
 
 #: Cash, chosen so equity lands on a round $250,000 with the seeded shares at
 #: the closes below. Recomputed exactly in ``seed()``; this is only the target.
@@ -41,39 +41,54 @@ TARGET_EQUITY = 250_000.0
 COST_BASIS_LOOKBACK_BARS = 120
 
 #: The seeded book, designed so the drift table and every compliance rule have
-#: something real to bite on. Deliberately *not* a tidy book:
+#: something real to bite on. Deliberately *not* a tidy book.
+#:
+#: Regrown from 8 to 15 positions on 2026-10-07 when max_positions went 8 -> 15
+#: alongside the universe widening. The properties below are the point; the
+#: share counts are just whatever prices them at those weights on the day.
 #:
 #:   * NVDA and MSFT sit AT max_position_pct (10%), so an add to either is
-#:     blocked by the position cap and nothing else.
-#:   * TSM is well UNDER its drift target, so there is one symbol where a BUY
-#:     actually sizes. Without it the gate never exercises sizing's happy path:
-#:     a concentrated book is above its equal-weight per-symbol targets almost
+#:     blocked by the position cap and nothing else. MSFT is 4x its 2.5% target,
+#:     NVDA 2x its 5.00% one.
+#:   * TSM is well UNDER its 5.00% target at ~2%, so there is one symbol where a
+#:     BUY actually sizes. Without it the gate never exercises sizing's happy
+#:     path: a concentrated book sits above its per-symbol targets almost
 #:     everywhere, and `cap_intent` then refuses every add.
-#:   * AI infrastructure is ~17pp UNDERWEIGHT against a 35% target, and its
-#:     three unheld exemplars (AMZN, GOOGL, MRVL) are the obvious way to close
-#:     it -- which max_positions then refuses, because:
-#:   * there are exactly 8 positions against a max_positions of 8. Adding to a
-#:     held symbol is allowed; opening a new one is not.
-#:   * Defensive / uncorrelated is ~5pp OVERWEIGHT against 12.5%, so there is a
-#:     trim in the table as well as a buy.
+#:   * THREE themes are over target (Cash-generative megacap, Health care,
+#:     Defensive) and FOUR are under (both AI sleeves, Core index, Industrials),
+#:     so the table shows trims and adds rather than one direction.
+#:   * there are exactly 15 positions against a max_positions of 15. Adding to a
+#:     held symbol is allowed; opening a new one is not -- which is what makes
+#:     the two AI underweights uncloseable and the decision interesting.
+#:   * Industrials & energy transition is held at ZERO against a 3% target, so
+#:     at least one theme is entirely absent from the book. That is the case
+#:     where the trader has to choose between freeing a slot and doing nothing.
 #:
-#: That combination is what makes "close this gap or don't" a real choice rather
-#: than a formality: the book cannot close its largest gap without freeing a
-#: slot, and the honest answers are "add to TSM", "trim the defensive sleeve",
-#: or "hold". It is the shape the Stage 6 exit gate reads.
+#: Gross lands near 64% of equity with ~36% cash -- comfortably inside the 90%
+#: effective gross cap that the 10% cash floor implies, and leaving room for the
+#: buying-power clamp to be reachable rather than already breached.
 SEED_BOOK: dict[str, int] = {
-    # AI infrastructure -- underweight, and two of its three holdings are the
-    # ones at the cap.
-    "NVDA": 104,
+    # AI semiconductors -- underweight as a theme, and holding both capped names
+    "NVDA": 105,
     "AVGO": 40,
-    "TSM": 12,
-    # Cash-generative megacap -- mildly underweight.
+    "AMD": 19,
+    "TSM": 11,
+    # AI platforms & applications -- underweight
+    "GOOGL": 36,
+    "AMZN": 39,
+    "META": 14,
+    # Cash-generative megacap -- overweight, and MSFT is at the cap
     "MSFT": 47,
-    "AAPL": 60,
-    # Defensive / uncorrelated -- overweight.
-    "XOM": 120,
-    "UNH": 40,
-    "JPM": 25,
+    "AAPL": 22,
+    # Health care -- overweight
+    "LLY": 6,
+    "UNH": 20,
+    "JNJ": 19,
+    # Defensive / uncorrelated -- overweight
+    "XOM": 46,
+    "JPM": 15,
+    # Core index -- underweight
+    "QQQ": 7,
 }
 
 

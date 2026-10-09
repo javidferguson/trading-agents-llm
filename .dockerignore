@@ -1,0 +1,85 @@
+# Build context for docker/Dockerfile. The context is the REPO ROOT -- every
+# service in docker-compose.yml declares `context: ..` from docker/ -- so this
+# file lives here rather than in docker/, and one copy governs all three images.
+#
+# WHY IT EXISTS: without it the context was ~400 MB and Docker read all of it on
+# every build. Five `execute` targets in the Makefile pass --build (it is not
+# optional there -- the execute service does not mount src/, so a stale image
+# would run yesterday's order logic against today's proposal), so this cost was
+# paid several times per trading session.
+#
+# The Dockerfile COPYs exactly seven paths:
+#     pyproject.toml uv.lock README.md LICENSE
+#     src/ config/ prompts/ scripts/ tests/
+# Anything not under those is dead weight in the context. Anything that IS
+# cannot be excluded -- see the three warnings at the bottom.
+
+# --- the big ones ---------------------------------------------------------- #
+# Runtime state, mounted at ../data:/app/data. Never copied. The bars and GDELT
+# caches live here and are the bulk of it.
+data/
+# The host virtualenv. The image builds its own at /opt/venv.
+.venv/
+# Agent session state -- and it contains a COMPLETE SECOND COPY of the repo
+# under worktrees/, including its own src/research_desk. Nothing copies it and
+# a stale duplicate tree has no business in a build layer.
+.claude/
+.git/
+.gitignore
+# Mounted at ../logs:/app/logs.
+logs/
+
+# --- caches and editor droppings ------------------------------------------- #
+# NOTE THE `**/`. Docker matches these patterns against the ENTIRE relative
+# path, unlike .gitignore which matches a bare name at any depth. A plain
+# `__pycache__/` here would exclude only the one at the repo root and ship
+# src/research_desk/__pycache__, tests/__pycache__ and scripts/__pycache__ --
+# all three of which exist and all three of which land inside a COPY.
+**/__pycache__
+**/*.py[cod]
+**/.DS_Store
+**/.ipynb_checkpoints
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.idea
+.vscode
+
+# --- secrets --------------------------------------------------------------- #
+# Not copied, but a file of live credentials has no reason to be readable by a
+# build at all. example.env is the committed template and stays.
+.env
+.env.*
+!example.env
+
+# --- documentation --------------------------------------------------------- #
+# EXCLUDED BY NAME, NEVER BY *.md GLOB. See the README warning below.
+tradingagents-architecture.md
+tradingagents-migration-plan.md
+FOLLOWUPS.md
+CLAUDE.md
+docs/
+
+# --------------------------------------------------------------------------- #
+# DO NOT ADD THESE. Each one breaks the build, and two of the three fail with
+# an error that does not name the cause.
+#
+#   tests/        -- `COPY tests/ ./tests/` is explicit. Excluding it fails the
+#                    build outright. It is also load-bearing: the `dev` image
+#                    runs the suite in-container, and tests/test_layering.py is
+#                    what enforces the §0 split by asserting ib_async is absent
+#                    from `decide`'s dependency tree.
+#
+#   README.md     -- pyproject.toml has `readme = "README.md"`, and uv sync
+#                    builds this project itself, so hatchling reads it. This is
+#                    why the doc exclusions above are listed one by one: a
+#                    `*.md` line would take README.md with it.
+#
+#   LICENSE       -- pyproject.toml has `license = { file = "LICENSE" }`. The
+#                    Dockerfile already carries a comment about this one: the
+#                    build fails with "License file does not exist", which does
+#                    not obviously point at a missing file in the context.
+#
+#   uv.lock       -- `uv sync --frozen` refuses to resolve without it.
+#   pyproject.toml
+# --------------------------------------------------------------------------- #

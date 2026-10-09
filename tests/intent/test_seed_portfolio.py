@@ -1,6 +1,6 @@
 """``scripts/seed_portfolio.py`` -- the two commands that maintain the book.
 
-The user never hand-edits ``config/portfolio.yaml``; these two commands do, and
+The user never hand-edits ``data/portfolio.yaml``; these two commands do, and
 neither may touch IB. The property worth a test is the one that is easy to get
 backwards: **a refresh must not reset the staleness clock.**
 """
@@ -97,20 +97,30 @@ def test_the_seed_book_is_at_max_positions_by_design(seeder) -> None:
     assert len(seeder.SEED_BOOK) == load_intent().risk.max_positions
 
 
-def test_the_seed_prices_only_real_cached_closes(seeder) -> None:
-    """Every number in the committed book traces to a bar on disk, so the
-    weights are arithmetic over real data rather than figures chosen to look
-    tidy."""
-    from research_desk.intent.engine import load_portfolio
+def test_the_seed_prices_only_real_cached_closes(seeded_book, seeder) -> None:
+    """Every number the SEED produces traces to a bar on disk, so the weights
+    are arithmetic over real data rather than figures chosen to look tidy.
 
+    **Reads the seed, not ``load_portfolio()``, and that is the whole fix.**
+    This asserted the property of "the committed book" while loading
+    ``data/portfolio.yaml``, which stopped being the committed book at Stage 7:
+    ``execute --sync-book`` now writes it from the broker with ``source: ib``
+    and marks at **average cost**, which by design do not match any cached
+    close. The first real trading session broke it -- AMD at an average cost of
+    645.86 against a newest close of 613.87 -- and the failure message said
+    "re-run `make portfolio-refresh`", which is advice from before the broker
+    owned that file.
+
+    Fourth time this project has been bitten by a test reading state instead of
+    a fixture. The seed recipe is the fixture; the file is state.
+    """
     cache = seeder._cached_bars()
-    pf = load_portfolio()
-    for held in pf.positions:
+    for held in seeded_book.positions:
         bars = cache.get(held.symbol)
-        assert bars, f"{held.symbol} is in the book with no cached bars"
+        assert bars, f"{held.symbol} is in the seed with no cached bars"
         assert held.last_price == pytest.approx(float(bars[-1]["close"])), (
-            f"{held.symbol}'s mark does not match the newest cached close -- "
-            "re-run `make portfolio-refresh`"
+            f"{held.symbol}'s seeded mark does not match the newest cached "
+            "close, so the seed is not pricing from the cache"
         )
 
 

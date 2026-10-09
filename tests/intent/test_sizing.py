@@ -108,7 +108,7 @@ def test_conviction_has_no_effect_on_the_share_count(conviction: float) -> None:
     assert result.binding_cap == "requested"
 
 
-def test_the_live_tsm_decision_sizes_to_the_approved_weight() -> None:
+def test_the_live_tsm_decision_sizes_to_the_approved_weight(seeded_book) -> None:
     """Pinned to the run that produced this change, against the real book.
 
     The first live Stage 6 run: the drift table offered TSM 5.83%, the trader
@@ -118,10 +118,12 @@ def test_the_live_tsm_decision_sizes_to_the_approved_weight() -> None:
     applied twice, once as a judgement and once by the formula. It is +11 now,
     and the approved 4.5% is honoured.
     """
-    from research_desk.intent.engine import load_intent, load_portfolio
+    from research_desk.intent.engine import load_intent
 
     real_intent = load_intent()
-    real_book = load_portfolio()
+    # The SEEDED book, not data/portfolio.yaml: that file is state the broker
+    # owns from Stage 7 on. See tests/intent/conftest.py.
+    real_book = seeded_book
     drift = compute_gaps(real_intent, real_book, as_of=real_book.as_of)
     held = real_book.get("TSM")
 
@@ -131,10 +133,22 @@ def test_the_live_tsm_decision_sizes_to_the_approved_weight() -> None:
         as_of=real_book.as_of, reference_price=held.last_price,
     )
     assert result.binding_cap == "requested"
-    assert result.plan.quantity == 11
+    # DERIVED, not hardcoded. This read `== 11`, then `== 12`, and `make bars`
+    # on 2026-10-09 moved TSM's close again and made it 13. Every one of those
+    # edits was the test chasing a re-marked book while the property under test
+    # never changed: the approved 4.5% binds, rather than 4.5 x 0.65 = 2.93%.
+    # So assert the arithmetic instead of its output on one particular day.
+    expected = int(
+        (real_book.equity * 4.5 / 100.0 - held.quantity * held.last_price)
+        // held.last_price
+    )
+    assert result.plan.quantity == pytest.approx(expected, abs=1)
     assert result.caps_pct["requested"] == pytest.approx(4.5)
     # The term that used to bind no longer exists.
     assert "conviction_w" not in result.caps_pct
+    # And the conviction-scaled target would still be materially smaller, which
+    # is the whole point of the fix.
+    assert result.target_weight_pct > 4.5 * 0.65
 
 
 def test_cap_position_binds_when_the_request_exceeds_the_ceiling() -> None:

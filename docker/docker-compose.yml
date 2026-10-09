@@ -130,6 +130,19 @@ services:
     # decline rather than proceed. `docker compose run --rm execute ...`.
     stdin_open: true
     tty: true
+    # NOTE THE ASYMMETRY WITH `dev`, AND IT IS DELIBERATE.
+    #
+    # `dev` bind-mounts the whole repo at /app, so source edits take
+    # effect with no rebuild. This service mounts only data/, logs/,
+    # config/ and prompts/ -- NOT src/ -- so the process that places
+    # real orders runs built code rather than whatever happens to be
+    # in the working tree.
+    #
+    # The cost is that the image goes stale SILENTLY, so `make
+    # execute` passes --build. Do not optimise that away: a stale
+    # image runs an old broker.py against a current proposal and says
+    # nothing. Stage 7 only caught it because the entry point was
+    # missing outright and the container refused to start.
     environment:
       IB_HOST: ${IB_HOST:-desk-ib-gateway}
       # 4004 is socat-paper INSIDE the gateway container (see ib-gateway below).

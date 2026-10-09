@@ -31,7 +31,7 @@ Two processes that communicate through a file, never a shared event loop:
 | **4** | Analysts + research debate | **done** |
 | **5** | Risk debate + fund manager | **done** (local judge; hosted deferred) |
 | **6** | Intent, sizing, compliance | **done** (earnings blackout warns on an estimate — see gaps) |
-| 7 | Execution + confirmation gate | not started |
+| **7** | Execution + confirmation gate | **done** (one paper trade still to be placed by hand — see gaps) |
 | 8 | Evaluation, B0–B4, the go/no-go | not started |
 | 9 | Memory + reflection | not started |
 
@@ -109,6 +109,18 @@ report.
   written to `data/proposals/`. `SYMBOL=NVDA make decide` for another name.
   Since Stage 6 the output also carries the `OrderPlan` — the share count, the
   four caps and which one bound, and any compliance violation.
+- `make decide-many SYMBOLS="TSM AMD"` / `make decide-all` — a **research
+  sweep**: `desk decide` once per symbol, independently, in one container.
+  `decide-all` is the whole 31-symbol universe at ~100s each, so **~50
+  minutes**. Safe because each run reads the book and never writes it. Past the
+  third actionable symbol the cadence limit vetoes the rest to HOLD — that is
+  the limit working, and `desk review --wanted` shows what the pipeline
+  actually decided.
+- `make review` — read past runs out of the decision journal: the decision, the
+  order plan, the debate, the violations. `SYMBOL=TSM make review`, or
+  `desk review --last 10` for a listing and `--full` for every analyst and the
+  raw model calls. The journal is the source of truth for replay (§1), and this
+  is what reads it.
 - `make portfolio` — the Stage 6 exit gate: the book and the drift table, with
   **no model and no broker**. Exits non-zero if the marks are stale, because
   sizing against last week's weights is how a position gets doubled.
@@ -116,8 +128,13 @@ report.
   blackout minus at-max-positions, computed before any model runs. `--earnings`
   also prints every symbol's next-report estimate.
 - `make portfolio-seed` / `make portfolio-refresh` — the only two things that
-  write `config/portfolio.yaml`. Both read the bars cache and **cannot fetch**,
+  write `data/portfolio.yaml`. Both read the bars cache and **cannot fetch**,
   so they run with the Gateway down. Do not hand-edit the file.
+- `make execute` / `execute --list` — **the Stage 7 gate.** Reads a
+  `proposal.json`, reconciles the book against the broker, prices a marketable
+  limit, runs `whatIfOrder`, shows you the dissent and the invalidation, and
+  places nothing until you type the ticker. `execute --dry-run` walks the whole
+  path and declines. **Never scheduled** (§15.8).
 - `make test-stage6` — the other half of the Stage 6 gate: an `OrderPlan`
   produced with zero IB contact (asserted by making every socket connection
   fail), and a deliberately non-compliant decision blocked regardless of what
@@ -137,6 +154,53 @@ hidden: the test resolved Ollama with the bare `Settings()` default of
 inside `dev`. Tests that reach a real service use `load_settings()`; the
 offline ones keep `Settings()` deliberately, so a local `.env` cannot change a
 result.
+
+## The two processes, and why they share nothing but files
+
+```
+[ desk decide ]                          [ execute ]
+ agents, LLM, free data                   human gate + ib_async
+ no IB connection                         no model, ever
+ no ib_async in its import tree    -->    proposal.json    -->    one order
+```
+
+`decide` has never held a broker connection and `execute` has never called a
+model. That is what keeps the dangerous half small enough to read in one
+sitting, and `tests/test_layering.py` fails the build if either leaks into the
+other.
+
+**Three safety properties, each enforced rather than intended:**
+
+1. `assert_paper_account()` fires **twice** — once after connect, once
+   immediately *before* `placeOrder`. The second catches a reconnect that
+   landed on a different account; the port number is not a guarantee.
+   `tests/execution/test_broker.py` asserts the call *sequence*, so a check
+   moved after the order fails the build.
+2. **A mismatch between the book and the account is a refusal, not a warning.**
+   The share count was computed from `data/portfolio.yaml`, so if the file is
+   wrong the number is wrong and there is nothing safe to approve. You get the
+   per-symbol diff and an offer to rewrite the book from the broker.
+3. **Approval requires typing the ticker**, a closed stdin declines, and an
+   expired proposal refuses before a prompt is drawn. There is no flag that
+   turns any of it off.
+4. **Compliance is re-run at execute time**, against the book as it is then.
+   The share count was sized at *decide* time, and reconciliation only proves
+   the book matches the broker — not that the order still passes the vetoes.
+   Those have the same answer only when nothing changed in between, which
+   batching and "decided this morning, executed after lunch" both break.
+
+## Where a decision's artifacts land
+
+Three places, answering different questions:
+
+| Question | Where |
+|---|---|
+| What did it decide, and what order? | `data/proposals/*.json` — ~2KB, pretty-printed, just open one |
+| Why? What did each agent say? | **Langfuse at http://localhost:3000** — per-node spans with the real prompt and response. Start here. |
+| Everything, replayably | `data/journal/decisions_YYYYMMDD.jsonl` — the full `DecisionState` per run, including `llm_calls[].raw_response` |
+
+The journal is ~50KB per run, so `desk review` exists to read it rather than
+`cat`. `proposal.json` is what `execute` consumes and the only thing it reads.
 
 ## Never run both IB Gateways at once
 

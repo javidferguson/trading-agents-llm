@@ -72,8 +72,37 @@ class FakeRegistry:
         raise AssertionError("snapshot is stubbed at a higher level")
 
 
+def fixture_book():
+    """A book marked on this test's own ``AS_OF``, not the shipped one.
+
+    **These tests must not read data/portfolio.yaml, and the reason is a bug
+    they caught.** They hardcode ``AS_OF`` in the past; the shipped book is
+    re-marked whenever `make portfolio-refresh` runs. The day the book moved to
+    2026-10-07 while AS_OF stayed 2026-10-06, compliance correctly blocked every
+    order with "the marks are 1 day(s) in the FUTURE -- look-ahead bias, not
+    freshness" and three wiring tests went red for a reason that had nothing to
+    do with wiring.
+
+    The guard was right. The tests were wrong to depend on a file that moves, so
+    they get their own two-position book instead. Anything asserting against the
+    *real* book belongs in tests/intent/, where that coupling is the point.
+    """
+    from research_desk.models.portfolio import PortfolioSnapshot, Position
+
+    return PortfolioSnapshot(
+        as_of=AS_OF, cash=60_000.0, source="seed",
+        positions=[
+            Position(symbol="MSFT", quantity=20, avg_cost=400.0,
+                     last_price=500.0, marked_on=AS_OF),
+            Position(symbol="NVDA", quantity=50, avg_cost=200.0,
+                     last_price=240.0, marked_on=AS_OF),
+        ],
+    )
+
+
 async def run_graph(tmp_path, *, replies=None, snapshot=None, registry_error=None):
     """Drive the graph with prefetch stubbed, so no network is touched."""
+    import research_desk.graph.nodes.compliance as compliance_module
     import research_desk.graph.nodes.prefetch as prefetch_module
     from research_desk.providers.base import ProviderError
 
@@ -92,7 +121,9 @@ async def run_graph(tmp_path, *, replies=None, snapshot=None, registry_error=Non
                 "notes": ["prefetch: stubbed"]}
 
     original = prefetch_module.prefetch
+    original_book = compliance_module.load_portfolio
     prefetch_module.prefetch = fake_prefetch
+    compliance_module.load_portfolio = lambda **kw: fixture_book()
     try:
         graph = build_decision_graph(ctx)
         result = await graph.ainvoke(DecisionState(
@@ -100,6 +131,7 @@ async def run_graph(tmp_path, *, replies=None, snapshot=None, registry_error=Non
         ))
     finally:
         prefetch_module.prefetch = original
+        compliance_module.load_portfolio = original_book
 
     return DecisionState.model_validate(result), settings, router
 

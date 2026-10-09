@@ -17,8 +17,8 @@
 # before it reads the 10-K evaporates the entire value of the bear researcher.
 # Intent enters at the Trader node and no earlier.
 #
-# Read by intent/engine.py at Stage 6. Only `execution.require_confirmation` is
-# read today -- config.py refuses to load if it is set to false.
+# Read by intent/engine.py at Stage 6. `require_confirmation` is also checked
+# independently by config.py, which refuses to load the file if it is false.
 
 execution:
   # There is deliberately no way to turn this off. The value below is the only
@@ -29,6 +29,31 @@ execution:
   # Approval requires typing the ticker symbol, not "y". A yes/no prompt is
   # answered by muscle memory; a symbol has to be read first.
   confirm_by: ticker
+  # How far through the spread a marketable limit reaches, in basis points.
+  #
+  # 100 bps = 1%, and that is deliberate rather than sloppy. The default of 10
+  # assumes you can see the current price; this desk prices off a FIFTEEN
+  # MINUTE DELAYED quote, where 0.1% is routinely not marketable at all.
+  #
+  # Measured: on 2026-10-09 MRVL was sized against the prior close of 284.68,
+  # gapped down ~5%, and the limit went out at 269.47 (the delayed quote plus
+  # 10 bps). It never filled -- the real market was above it -- and the batch
+  # stalled on the fill wait. HON and V, which had not gapped, filled instantly
+  # in the same batch.
+  #
+  # A wider limit is cheaper than it looks. It is a CEILING, not the price you
+  # pay: IB routes to the best available price, so in that same batch HON's
+  # 207.60 limit filled at 207.40 and V's 380.97 filled at 380.00. What it buys
+  # is the ability to cross a market that moved while the quote was aging. What
+  # it costs is real only on a fast or illiquid name -- and the human sees the
+  # limit price before approving, max_adv_participation_pct caps the size, and
+  # the protective stop is anchored on the quote rather than this limit so the
+  # widening cannot quietly tighten the stop.
+  #
+  # Read at EXECUTE time, so a change here applies to proposals already
+  # written. FinalDecision.limit_offset_bps still records what `decide`
+  # intended, for the journal.
+  limit_offset_bps: 100
 
 objective:
   horizon_days: 60
@@ -47,7 +72,13 @@ risk:
   max_sector_pct: 65.0
   min_cash_pct: 10.0
   max_gross_exposure_pct: 95.0
-  max_positions: 8
+  # 8 -> 15 on 2026-10-07, when the tradeable universe went from 14 symbols to
+  # 31. Raising it is what keeps the theme budget reachable: at 8 slots and
+  # per-symbol targets of 1-5%, the book could reach ~30% gross against 87% of
+  # theme targets, so the drift table would have read "everything underweight,
+  # forever". See the reachability note under `themes:` -- 15 is a deliberate
+  # compromise between that and keeping the book concentrated.
+  max_positions: 15
   min_trade_usd: 500              # reject dust
   max_order_shares: 2000
   # ADV participation is a compliance check, not a nicety: a fill you cannot
@@ -61,36 +92,108 @@ universe:
   # Drawn from config/universe.yaml. Listing it separately keeps "what we may
   # trade" distinct from "what we collect sentiment for" -- the second should be
   # wider, because its cost rises with delay and the first's does not.
+  # 31 symbols as of 2026-10-07. config/universe.yaml collects 32 -- the extra
+  # is SPY, which is the benchmark and is deliberately not tradeable.
   include: [AAPL, MSFT, NVDA, AVGO, AMZN, GOOGL, META, JPM, XOM, UNH, JNJ,
-            MRVL, TSM, BRK.B]
+            MRVL, TSM, BRK.B,
+            V, MA, PLTR, AMD, FSLR, LLY, TEM, HON, CAT, SPCX,
+            QQQ, ONEQ, VOO, IVV, SOXX, SMH, AIQ]
   exclude: []
   allow_shorts: false             # long-only for now; §9 sizing assumes it
 
+# THEME TARGETS ARE TOTALS ACROSS THE THEME, NOT PER-SYMBOL TARGETS.
+# compute_gaps() divides a theme's target by its exemplar count to get each
+# symbol's target, then caps that at max_position_pct. This cost a round of bad
+# decisions at Stage 3 -- four of ten proposals read a theme total as the
+# symbol's own target -- which is why render_intent() now spells the division
+# out for the model.
+#
+# TWO CONSEQUENCES OF THE 2026-10-07 WIDENING, BOTH DELIBERATE.
+#
+# 1. PER-SYMBOL TARGETS FELL. 31 symbols share the same budget that 14 shared
+#    before, so NVDA's target went from 5.83% to 5.00% and the tail themes land
+#    at 1.00%. That also forced BAND_FLOOR_PCT down from 1.0 to 0.5 in
+#    intent/engine.py: at a 1.0pp floor an unheld symbol with a 1.00% target has
+#    a gap that is not GREATER than its band, so it reads "in band" forever and
+#    the trader never sees it.
+#
+# 2. THE 87% TOTAL IS NOT FULLY REACHABLE AT 15 SLOTS, and that is a choice
+#    rather than an oversight. The two AI themes alone are 13 exemplars at full
+#    weight -- 61% of equity and 13 of the 15 slots -- so the five tail themes
+#    compete for the remaining two. Making all of it reachable would need
+#    max_positions near 25, which stops the book being concentrated. The low
+#    conviction values on the tail themes (0.3-0.5) encode that priority.
+#
+# Sum must stay at or under max_gross_exposure_pct (95); PortfolioIntent rejects
+# the file otherwise. The 10% cash floor implies a tighter real ceiling of 90%.
 themes:
-  - name: "AI infrastructure"
-    target_weight_pct: 35.0  # 25.0 - Original default value [JF-change]
-    conviction: 0.8  # 0.7 - Original default value [JF-change]
+  - name: "AI semiconductors"
+    target_weight_pct: 35.0
+    conviction: 0.8
     thesis: >
       Compute demand for training and inference is still supply-constrained,
-      and the constraint has moved from GPUs toward power and networking. The
-      risk is that hyperscaler capex is pulled forward rather than durable.
-    exemplars: [NVDA, AVGO, GOOGL, AMZN, MRVL, TSM]
+      and the constraint has moved from GPUs toward power, packaging and
+      networking. The risk is that hyperscaler capex is pulled forward rather
+      than durable. Held through the manufacturers and the two industry ETFs
+      rather than concentrated in one name.
+    exemplars: [NVDA, AVGO, TSM, MRVL, AMD, SOXX, SMH]
+
+  - name: "AI platforms & applications"
+    target_weight_pct: 26.0
+    conviction: 0.7
+    thesis: >
+      The layer that has to earn a return ON the compute: hyperscale platforms
+      selling inference, and the application companies whose product only
+      exists because the compute got cheap. Distinct from the semiconductor
+      sleeve because the failure modes differ -- a capex pause hurts the chip
+      makers first and the platforms last, and a demand pause does the reverse.
+    exemplars: [GOOGL, AMZN, META, PLTR, AIQ, SPCX]
 
   - name: "Cash-generative megacap"
-    target_weight_pct: 25.0  # 30.0 - Original default value [JF-change]
+    target_weight_pct: 10.0
     conviction: 0.6
     thesis: >
       Businesses with high gross profitability and a shrinking share count,
       bought at a non-absurd earnings yield. Deliberately boring; this is the
-      ballast the AI sleeve is measured against.
-    exemplars: [AAPL, MSFT, JNJ]
+      ballast the AI sleeve is measured against. The payment networks belong
+      here rather than in financials: they take a toll on volume and carry
+      almost no credit risk.
+    exemplars: [AAPL, MSFT, V, MA]
+
+  - name: "Health care"
+    target_weight_pct: 6.0
+    conviction: 0.4
+    thesis: >
+      Demand that does not track the cycle, bought where the pipeline or the
+      payer mix is mispriced rather than for the yield. Carries one genuinely
+      speculative holding, which is what the low conviction is for.
+    exemplars: [LLY, UNH, JNJ, TEM]
+
+  - name: "Core index"
+    target_weight_pct: 4.0
+    conviction: 0.5
+    thesis: >
+      Broad beta, held so that being underinvested is a decision rather than an
+      accident. Three of these four track indices the desk already measures
+      itself against, so this sleeve is explicitly not expected to add alpha.
+    exemplars: [QQQ, ONEQ, VOO, IVV]
+
+  - name: "Industrials & energy transition"
+    target_weight_pct: 3.0
+    conviction: 0.35
+    thesis: >
+      Physical capex: the electrical and automation content of a grid being
+      rebuilt, and the launch economics of putting mass in orbit. Long-dated
+      and lumpy, which is why it is small.
+    exemplars: [HON, CAT, FSLR]
 
   - name: "Defensive / uncorrelated"
-    target_weight_pct: 12.5  # 15.0 - Original default value [JF-change]
-    conviction: 0.3  # 0.4 - Original default value [JF-change]
+    target_weight_pct: 3.0
+    conviction: 0.3
     thesis: >
-      Health care and energy, held to blunt drawdown rather than to win.
-    exemplars: [UNH, XOM, JPM, BRK.B]
+      Energy, a lender and a conglomerate, held to blunt drawdown rather than
+      to win.
+    exemplars: [XOM, JPM, BRK.B]
 
 # Free text, read by the Trader and Fund Manager only. Say things here that are
 # hard to encode as a number -- the numeric ones belong under `risk:` where
@@ -103,7 +206,7 @@ constraints:
   - "A HOLD that preserves optionality is a good outcome, not a failure to act."
 
 cadence:
-  max_decisions_per_day: 3
+  max_decisions_per_day: 15 # orig default == 3 [jf-change]
   # A stale proposal cannot be executed. A proposal generated after Tuesday's
   # close must not be executable on Thursday -- render_decision() refuses
   # outright rather than prompting.

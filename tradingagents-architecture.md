@@ -363,6 +363,72 @@ schema-parse failure after one repair turn →
 `FinalDecision(action="HOLD", rationale="degraded: <reason>")`. Never fail
 toward a trade.
 
+**As built at Stage 7. One correction: "any node error" was too broad, and the
+journal says by how much.** The rule above was implemented literally —
+`degraded = bool(state.errors)` — and it was wrong, because the analyst layer
+records *"this analyst had nothing to read"* as a node error. Over the first 76
+runs:
+
+| | |
+|---|---|
+| runs flagged degraded | 32 |
+| …whose only problem was a missing analyst | **31** |
+| error kinds ever observed | `no_data` ×38, `vetoed` ×1 |
+
+There was never a real machinery failure. What happened 31 times is that a
+symbol had no GDELT history, so the news analyst reported honestly that it was
+blind, and a BUY the fund manager had approved was rewritten to a degraded HOLD.
+With 28 of 32 universe symbols having no news history, a full research sweep
+would have produced ~28 degraded HOLDs for a reason that has nothing to do with
+the symbol — which makes the sweep useless rather than cautious.
+
+It also contradicted the rest of the design, which handles absence carefully
+everywhere else: every unavailable metric states its reason,
+`AnalystReport.data_gaps` exists so an analyst can say what it could not see,
+`render_for_analyst` prints *"NOT AVAILABLE in your area — do not estimate
+them"*, and `prompts/fund_manager.md` already says *"A degraded analyst report
+is absent evidence, not neutral evidence. A proposal resting on one should have
+its conviction cut, not its stance flipped."* The reasoning layer was right. The
+final Python override was blunt.
+
+So `NodeError` gained a `severity`:
+
+* **`fatal`** — the machinery broke. §5 unchanged: the run fails to HOLD.
+* **`partial`** — an input was absent. The decision is narrower, not
+  untrustworthy.
+
+Three things make it safe rather than a loophole:
+
+*Severity is set at the emit site, because `kind` cannot carry it.* `prefetch`
+reports `kind="no_data"` when it cannot build a snapshot at all — no prices,
+genuinely fatal — and the analyst layer reports the same `kind` for an empty
+slice. Only the code raising it knows which it is. The default is **`fatal`**, so
+a future emit site that does not stop to think about this gets §5's behaviour;
+marking something `partial` is a deliberate act. There is exactly one partial
+site today (the empty-slice branch of `analysts.py:_degraded`), and budget
+exhaustion deliberately stays fatal even though it shares that function — §5
+names it, and it is a machinery limit, not a data gap.
+
+*A coverage floor, so a real collapse still voids the run.* `degraded` is now
+`any fatal error, or coverage below the floor`: **at least half the analysts
+that ran are usable, and market is usable when it ran.** Counted against the
+analysts *present* rather than against four, so `--slice` (1 of 1) needs no
+special case while a full graph collapsing to 1 of 4 still holds. Measured
+against all 76 runs, the floor passes every one of them — it adds no veto to
+anything that has actually happened, and catches the case that has not.
+
+*Absence stays visible, because the old behaviour was at least loud.* Dropping
+the DEGRADED banner would have traded a wrong signal for no signal, so
+`FinalDecision.absent_analysts` carries the gap across the §0 split (it is on
+the decision, not on `DecisionState`, because `proposal.json` is all `execute`
+ever sees), the confirmation gate prints a `PARTIAL COVERAGE` line naming the
+blind analysts, and `desk review` flags the run `partial:news`.
+
+*Nothing mechanical changes about sizing or conviction.* Partial coverage is
+recorded and left for §11's calibration plot to measure. Capping conviction on
+coverage now would bake in an unmeasured belief, and `conviction_w` was removed
+three commits earlier precisely to keep conviction a clean measurement.
+
 ---
 
 ## 6. Model routing
@@ -1110,9 +1176,75 @@ violation message does not blame the wrong one.
 - **Marketable `LimitOrder`, never `MarketOrder`.** With delayed data you are
   looking at a 15-minute-old price.
 
+> **As built at Stage 7, and the delayed quote is the whole story.** "Marketable"
+> was implemented as the quote plus **10 bps**, which is the number you use when
+> you can see the current price. This desk cannot: the limit is computed from a
+> quote that is fifteen minutes old, and 0.1% is routinely less than a liquid
+> name moves in fifteen minutes.
+>
+> Measured on 2026-10-09. A three-order batch: HON and V filled instantly, and
+> MRVL — sized against the prior close of 284.68, gapped down ~5% overnight and
+> still moving — went out at 269.47 and never filled, because the real market
+> was above it. The batch then stalled on the fill wait, which is the symptom
+> everyone notices and not the cause.
+>
+> So `limit_offset_bps` moved into `portfolio-intent.yaml` under `execution:`,
+> bounded `0..500`, and is **read at execute time** rather than baked into the
+> proposal — it is an execution parameter, and a change to it should apply to
+> proposals already written rather than requiring a re-decide.
+> `FinalDecision.limit_offset_bps` survives as the decide-time record for the
+> journal, and the confirmation screen is handed the offset *actually used*,
+> because those two numbers can now differ and the approval screen is the one
+> place that must not print the wrong one. This book runs **100 bps**.
+>
+> **A wide limit is cheaper than it reads.** It is a ceiling, not the price you
+> pay: in that same batch HON's 207.60 limit filled at 207.40 and V's 380.97 at
+> 380.00. What it buys is the ability to cross a market that moved while the
+> quote aged.
+>
+> **But it broke the protective stop, which is the part worth remembering.**
+> `stop_price_for` anchored the stop on the *limit*. That was right at 10 bps
+> and wrong at 100: the limit is displaced from the market on purpose, so the
+> stop was dragged up with it and an 8% stop landed 7.1% below the fill —
+> while `sizing`'s `cap_risk` had sized the position on the arithmetic that 8%
+> bounds the loss. It does not make the position riskier (it loses slightly
+> less when stopped); it gets shaken out on noise the thesis was sized to ride.
+> The stop is now anchored on the **fresh quote's reference** — current, and
+> undisplaced. Note there are *three* candidate prices here and only one is
+> right: not the decide-time `plan.reference_price` (284.68, hours old), not
+> the limit, but the quote the order is being priced from right now.
+
 **Confirmation** requires typing the **ticker symbol**, not `y`. A yes/no prompt
 is answered by muscle memory. Show the dissent, the invalidation condition, and
 the whatIf numbers. There is deliberately no config flag to disable the gate.
+
+> **Two more narrow gates, as built.** Each is its own word, never the ticker,
+> because one muscle-memory answer must not be able to do two different things:
+>
+> * **`CANCEL`** — an entry order that did not reach a terminal status within
+>   `FILL_TIMEOUT_S`. Before this the batch printed "STOPPED" and exited, which
+>   read as though nothing were outstanding; MRVL order 53 was left working
+>   with a protective stop attached, so a fill after the process exited would
+>   have armed a stop against a position the book had never heard of. A closed
+>   stdin **leaves the order working** — the opposite default from the order
+>   gate, and deliberately: there, doing nothing is safe; here the order exists
+>   and a human already approved it, so cancelling unattended would be the
+>   system reversing a decision on its own.
+> * **`REVIEW`** — the batch review screen (§15.8's note on `execute --all`).
+>
+> A **partial** fill is never offered a cancel. The stop child is sized for the
+> full quantity, so pulling the parent remainder leaves a stop that would
+> oversell what was bought; fixing that properly is cancel-and-replace, which
+> FOLLOWUPS records as real work rather than something to improvise inside a
+> cancel helper.
+>
+> The market-closed case **warns rather than refuses**. A DAY limit placed at
+> 16:29 cannot fill — that was the other stalled batch — and the session is read
+> from IB's own `ContractDetails.liquidHours`, which already accounts for
+> holidays and half-days, rather than a hardcoded 09:30–16:00 this repo has no
+> calendar for. Unknown is not closed: anything IB will not answer produces no
+> warning at all, because a warning that fires on every run is one that gets
+> read past.
 
 ---
 
@@ -1360,6 +1492,30 @@ took its own Gateway (migration plan §0, revised). All measured, none obvious:
    reflection rows is exact, instant, and one fewer container.
 8. **Do not schedule `execute`.** `decide` on a cron is fine; `execute` must be
    human-initiated, always.
+
+   > **As built at Stage 7, after the batch executor.** `execute --all` places
+   > a whole sweep's worth of orders in one invocation, which is exactly the
+   > shape that tempts someone to cron it. It is not schedulable and it was not
+   > made so: it reads stdin **twice over** -- once for the batch review word,
+   > then once per order for that order's ticker -- and a closed stdin declines
+   > at every one of them. The gate class is the same `CLIConfirmationGate` a
+   > single order uses, unmodified, and `--yes --all` is **refused** rather
+   > than ignored, because a flag quietly having no effect leaves the operator
+   > believing something false about what just ran.
+   >
+   > What the batch adds is not fewer approvals but **a book that advances**.
+   > Five of `compliance.check`'s rules read the post-trade state, so N orders
+   > checked against one pre-batch snapshot walk past `max_positions`,
+   > `min_cash_pct`, `max_gross_exposure_pct`, `max_sector_pct` and
+   > `max_position_pct` together. Each order is re-checked against the book as
+   > it is after the previous fill, advanced by `compliance.post_trade` using
+   > IB's own reported fill quantity. An order still working when the wait
+   > times out **stops the batch**: never size an order against one you cannot
+   > describe.
+   >
+   > It also shows the aggregate effect before anything is sent -- the one
+   > thing no sequence of per-order prompts can show, since each prompt only
+   > knows about itself.
 9. **Scope risk.** 14 nodes × prompts × 6 providers is a lot of surface. Build
    the Stage 3 vertical slice before anything else.
 10. **GEX cannot be backtested from IB** — expired contracts are removed from the

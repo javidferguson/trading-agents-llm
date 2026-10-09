@@ -80,7 +80,18 @@ API = "https://api.gdeltproject.org/api/v2/doc/doc"
 #: This is not a guess and it is not negotiable by being polite about it. An
 #: earlier value of 1.5s here was over three times too fast and got the IP
 #: throttled, which then looks exactly like the API being down.
-REQUEST_INTERVAL_S = 5.0
+#:
+#: **7, not 5, and the margin is the point.** 5.0 is exactly the published
+#: limit, and `_throttle` gates on request START times -- so GDELT receives
+#: requests 5.00s apart with network jitter on top, and some of those arrivals
+#: land at 4.98s. Pacing precisely at a threshold means breaching it regularly,
+#: and a 429 then triggers retries that deepen the block. Measured 2026-10-08:
+#: an IP was still refused ~18 hours after being throttled.
+#:
+#: The cost of the margin is small and the cost of a block is days: 32 symbols
+#: x 2 requests goes from 5.3 to 7.5 minutes. Lower it with `--interval` if you
+#: are collecting one symbol and in a hurry; do not lower the default.
+REQUEST_INTERVAL_S = 7.0
 TIMEOUT_S = 45
 USER_AGENT = "research-desk/0.1 (gdelt sentiment cache; contact via repo)"
 
@@ -106,6 +117,11 @@ RETRY_BACKOFF_S = (10.0, 30.0)
 #: Status codes worth trying again. 429 is the throttle; 5xx is GDELT having a
 #: moment. Everything else (404, 400) is our bug and retrying just hides it.
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
+#: Has any request in THIS process been accepted? Distinguishes "we went too
+#: fast" from "this IP was already blocked", which need opposite responses:
+#: back off, versus stop entirely.
+_succeeded_once = False
 
 #: Monotonic timestamp of the last request, for the inter-request gate below.
 _last_request_at: float | None = None
@@ -187,12 +203,18 @@ def _get(params: dict[str, str]) -> Any:
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     mode = params.get("mode", "?")
 
+    # Whether THIS process has ever had a request accepted. A 429 before that
+    # cannot have been caused by our own pacing, so it is a pre-existing block
+    # and retrying is pure harm -- see the 429 branch below.
+    global _succeeded_once
+
     last_error = ""
     for attempt in range(len(RETRY_BACKOFF_S) + 1):
         _throttle()
         try:
             with urllib.request.urlopen(request, timeout=TIMEOUT_S, context=_SSL) as response:
                 body = response.read().decode("utf-8", errors="replace")
+            _succeeded_once = True
             break
         except urllib.error.HTTPError as exc:
             # The body carries GDELT's own words. Read it before deciding
@@ -202,6 +224,36 @@ def _get(params: dict[str, str]) -> Any:
             except Exception:
                 detail = exc.reason or ""
             last_error = f"HTTP {exc.code} for {mode}: {detail or exc.reason}"
+            # A 429 before this process has had ANY request accepted is a
+            # block that was already in place. Our pacing cannot have caused
+            # it, so the backoff cannot clear it -- and each retry is one more
+            # request from an IP being punished for requests. Fail immediately.
+            if exc.code == 429 and not _succeeded_once:
+                raise GdeltError(
+                    f"{last_error}\n"
+                    "  REFUSED ON THE FIRST REQUEST, so this IP was ALREADY "
+                    "blocked before this run started.\n"
+                    "  Not retrying: our pacing did not cause it, so backoff "
+                    "cannot clear it, and every\n"
+                    "  further request is more traffic from an IP being "
+                    "punished for traffic.\n"
+                    "\n"
+                    "  These blocks are long. Measured 2026-10-08: still "
+                    "refused ~18 hours later.\n"
+                    "  What actually helps, in order:\n"
+                    "    * wait hours, not minutes, and probe SPARINGLY -- "
+                    "once an hour at most\n"
+                    "    * run it from a different network; the block is "
+                    "per-IP\n"
+                    "    * mail kalev.leetaru5@gmail.com, which GDELT's own "
+                    "429 invites for this volume\n"
+                    "\n"
+                    "  Nothing was lost. `--status` shows what is missing, and "
+                    "recent days stay\n"
+                    "  reachable for ~3 months -- waiting costs depth at the "
+                    "far end, not today."
+                ) from exc
+
             if exc.code not in RETRYABLE_STATUS or attempt >= len(RETRY_BACKOFF_S):
                 if exc.code == 429:
                     raise GdeltError(
@@ -210,8 +262,9 @@ def _get(params: dict[str, str]) -> Any:
                         "per-IP block rather than a momentary burst.\n"
                         "  Retrying now adds traffic from an IP already being "
                         "throttled and may extend it.\n"
-                        "  Wait ~15 minutes, then re-run. Nothing was lost -- "
-                        "`--status` shows what is still missing."
+                        "  Stop for several HOURS, not minutes, then re-run. "
+                        "Nothing was lost --\n"
+                        "  `--status` shows what is still missing."
                     ) from exc
                 raise GdeltError(last_error) from exc
         except urllib.error.URLError as exc:

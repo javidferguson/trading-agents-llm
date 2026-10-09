@@ -44,6 +44,10 @@ dev = [
 
 [project.scripts]
 desk = "research_desk.cli:main"
+# The §0 split as two commands. `execute` imports ib_async and is only usable
+# where the `execute` extra is installed -- the decide image deliberately has
+# neither. It is never scheduled (architecture §15.8).
+execute = "research_desk.execution.cli:main"
 
 [build-system]
 requires = ["hatchling"]

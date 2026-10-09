@@ -244,3 +244,17 @@ data/
 # window, so a day lost is lost for good. It is gitignored because a JSONish
 # cache that grows daily does not belong in git history, but it does need a
 # backup. Include data/cache/gdelt in whatever backs up this machine.
+
+# The book is STATE, not configuration, and from Stage 7 the broker owns it:
+# `execute` overwrites it from the live account, so a committed copy is an
+# account balance in version control that goes stale the first time you trade.
+#
+# It was committed through Stage 6 for one reason -- "so the Stage 6 gate is
+# reproducible from a clone" -- and that reason is gone. The gate now builds its
+# own book from scripts/seed_portfolio.py:SEED_BOOK plus the bars cache (see
+# tests/conftest.py), which is committed, deterministic, and the same recipe
+# `make portfolio-seed` uses. The tests pass with any book in place, or none.
+#
+# To get one:  make portfolio-seed     (a demo book from the bars cache)
+#              execute                 (writes the real one from the broker)
+# (now data/portfolio.yaml, already covered by the data/ rule above)

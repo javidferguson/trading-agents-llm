@@ -22,14 +22,69 @@ from research_desk.context import NodeContext
 from research_desk.graph.nodes.compliance import compliance
 from research_desk.intent.engine import load_portfolio
 from research_desk.models.market import MarketSnapshot
-from research_desk.models.state import DecisionState, NodeError, RiskVerdict, TraderProposal
+from research_desk.models.state import (
+    AnalystReport,
+    DecisionState,
+    NodeError,
+    RiskVerdict,
+    TraderProposal,
+)
 
-AS_OF = date(2026, 10, 6)
+#: Derived from the shipped book rather than hardcoded, deliberately.
+#:
+#: These tests exercise the node against the REAL data/portfolio.yaml -- some
+#: of them read its marks directly -- so they must share its decision date. A
+#: fixed date went stale the moment the book was re-marked, and compliance then
+#: blocked every order with "the marks are 1 day(s) in the FUTURE -- look-ahead
+#: bias, not freshness", which is the guard being right and the test being
+#: wrong. Deriving it means `make portfolio-refresh` cannot break these again.
+#:
+#: Wiring tests that do NOT want this coupling use their own fixture book --
+#: see `fixture_book()` in tests/graph/test_decision_graph.py.
+#: The seeded book's mark date, which is the newest cached bar. Derived rather
+#: than hardcoded: compliance treats marks dated after the decision as
+#: look-ahead bias and blocks, so a fixed date goes stale the moment `make bars`
+#: runs. (It was `load_portfolio().as_of` until that file became the broker's.)
+def _seed_as_of():
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "scripts" / "seed_portfolio.py"
+    spec = importlib.util.spec_from_file_location("seed_portfolio_asof", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["seed_portfolio_asof"] = module
+    spec.loader.exec_module(module)
+    try:
+        return module.seed().as_of
+    except SystemExit:
+        return date.today()
+
+
+AS_OF = _seed_as_of()
 
 
 def ctx(tmp_path) -> NodeContext:
     return NodeContext(settings=Settings(data_dir=tmp_path), as_of=AS_OF,
                        extras={"registry": None})
+
+
+@pytest.fixture(autouse=True)
+def _book(monkeypatch, seeded_book):
+    """Give the node the SEEDED book, not ``data/portfolio.yaml``.
+
+    The node calls ``load_portfolio()`` itself, so the fixture has to be
+    injected there. Without this the tests assert against the live account:
+    once Stage 7's ``execute`` wrote the real (all-cash) book over the seed,
+    four of them failed because the book had fifteen free slots and the symbol
+    they expected to be blocked by ``max_positions`` no longer was.
+
+    The file is state. The seed recipe is the fixture.
+    """
+    import research_desk.graph.nodes.compliance as node
+
+    monkeypatch.setattr(node, "load_portfolio", lambda **kw: seeded_book)
+    return seeded_book
 
 
 def proposal(action="BUY", weight=7.0, conviction=0.8) -> TraderProposal:
@@ -49,6 +104,14 @@ def verdict(action="BUY", weight=7.0, conviction=0.8, decision="approve") -> Ris
         rationale="The committee is satisfied with the risk on this position.",
         dissent="A liquidity shock would hit this name harder than the index.",
         invalidation="A close below the 200-day moving average would end this.",
+    )
+
+
+def analyst(kind: str) -> AnalystReport:
+    return AnalystReport(
+        kind=kind, stance="bullish", confidence=0.6,
+        summary="momentum has improved against the sector since August",
+        key_points=["price above the 200-day", "volume expanding", "sector lags"],
     )
 
 
@@ -90,11 +153,13 @@ async def test_the_node_sizes_against_the_snapshots_fresh_price(tmp_path) -> Non
     assert patch["order_plan"].reference_price == pytest.approx(500.0)
 
 
-async def test_the_node_falls_back_to_the_books_mark(tmp_path) -> None:
+async def test_the_node_falls_back_to_the_books_mark(tmp_path, seeded_book) -> None:
+    """Which is the reason a ``Position`` stores a price at all: ``decide``
+    builds a snapshot for ONE symbol and has no quote for the others."""
     patch = await compliance(
         state(snapshot=snapshot(close=None)), ctx(tmp_path)
     )
-    expected = load_portfolio().get("TSM").last_price
+    expected = seeded_book.get("TSM").last_price
     assert patch["order_plan"].reference_price == pytest.approx(expected)
 
 
@@ -121,13 +186,17 @@ async def test_the_traders_proposal_is_promoted_when_there_is_no_verdict(tmp_pat
 async def test_a_vetoed_order_becomes_a_hold_in_the_final_decision(tmp_path) -> None:
     """Not a BUY with a blocked plan attached.
 
+    PLTR rather than a held name: it is themed and in-universe but UNHELD, and
+    the seeded book sits at max_positions, so the block has a real cause. (This
+    was GOOGL until the 2026-10-07 widening put GOOGL in the book.)
+
     Both objects go to the journal, but only one is what the next process acts
     on, and it must not be possible to read a BUY out of a run Python refused.
     """
-    # GOOGL is themed and in-universe but unheld, and the book is at
+    # PLTR is themed and in-universe but unheld, and the book is at
     # max_positions -- so this is blocked for a real reason.
     patch = await compliance(
-        state(symbol="GOOGL", snapshot=snapshot("GOOGL", close=347.84),
+        state(symbol="PLTR", snapshot=snapshot("PLTR", close=182.40),
               trader_proposal=proposal(weight=5.0, conviction=1.0)),
         ctx(tmp_path),
     )
@@ -153,7 +222,7 @@ async def test_a_veto_is_not_recorded_as_a_failure(tmp_path) -> None:
     that a blocked order no longer looks like a crash.
     """
     patch = await compliance(
-        state(symbol="GOOGL", snapshot=snapshot("GOOGL", close=347.84),
+        state(symbol="PLTR", snapshot=snapshot("PLTR", close=182.40),
               trader_proposal=proposal(weight=5.0, conviction=1.0)),
         ctx(tmp_path),
     )
@@ -169,7 +238,7 @@ async def test_a_veto_on_an_ALREADY_degraded_run_stays_degraded(tmp_path) -> Non
     """The flag tracks the node failure, not the veto -- so a run that both
     degraded and got vetoed is still reported as degraded."""
     patch = await compliance(
-        state(symbol="GOOGL", snapshot=snapshot("GOOGL", close=347.84),
+        state(symbol="PLTR", snapshot=snapshot("PLTR", close=182.40),
               trader_proposal=proposal(weight=5.0, conviction=1.0),
               errors=[NodeError(node="news_analyst", kind="degraded",
                                 message="no usable output")]),
@@ -181,7 +250,7 @@ async def test_a_veto_on_an_ALREADY_degraded_run_stays_degraded(tmp_path) -> Non
 async def test_every_violation_appears_in_the_notes(tmp_path) -> None:
     """The notes are what `desk decide` prints and what a human skims."""
     patch = await compliance(
-        state(symbol="GOOGL", snapshot=snapshot("GOOGL", close=347.84),
+        state(symbol="PLTR", snapshot=snapshot("PLTR", close=182.40),
               trader_proposal=proposal(weight=5.0, conviction=1.0)),
         ctx(tmp_path),
     )
@@ -206,6 +275,52 @@ async def test_a_degraded_run_cannot_carry_a_trade_into_sizing(tmp_path) -> None
     assert patch["order_plan"].quantity == 0
 
 
+async def test_an_absent_analyst_does_not_void_an_approved_buy(tmp_path) -> None:
+    """The bug this node had for 31 runs. A symbol with no GDELT history came
+    out as a degraded HOLD however good the rest of the analysis was.
+
+    The severity split is in ``NodeError``; what this asserts is that the node
+    reads it -- the line used to be ``degraded = bool(state.errors)``.
+    """
+    patch = await compliance(
+        state(
+            analyst_reports={
+                "market": analyst("market"),
+                "news": AnalystReport.degraded("no news data", kind="news"),
+                "positioning": analyst("positioning"),
+                "fundamentals": analyst("fundamentals"),
+            },
+            errors=[NodeError(node="news_analyst", kind="no_data",
+                              message="no news data was available",
+                              severity="partial")],
+        ),
+        ctx(tmp_path),
+    )
+    decision = patch["final_decision"]
+    assert decision.action == "BUY"
+    assert not decision.degraded
+    # And the gap is on the artefact `execute` reads, not only in the notes.
+    assert decision.absent_analysts == ["news"]
+    assert "partial coverage" in "\n".join(patch["notes"])
+
+
+async def test_coverage_collapsing_still_holds(tmp_path) -> None:
+    """Softening §5 was never the point. Three of four analysts absent is not
+    a narrower decision, it is nothing to decide from."""
+    patch = await compliance(
+        state(analyst_reports={
+            "market": analyst("market"),
+            "news": AnalystReport.degraded("no news data", kind="news"),
+            "positioning": AnalystReport.degraded("none", kind="positioning"),
+            "fundamentals": AnalystReport.degraded("none", kind="fundamentals"),
+        }),
+        ctx(tmp_path),
+    )
+    assert patch["final_decision"].action == "HOLD"
+    assert patch["final_decision"].degraded
+    assert patch["order_plan"].quantity == 0
+
+
 async def test_a_missing_proposal_produces_a_hold_not_a_crash(tmp_path) -> None:
     patch = await compliance(state(trader_proposal=None), ctx(tmp_path))
     assert patch["final_decision"] is None or \
@@ -218,7 +333,7 @@ async def test_an_unreadable_book_produces_a_hold_not_a_crash(tmp_path, monkeypa
     import research_desk.graph.nodes.compliance as node
 
     def boom(**kwargs):
-        raise FileNotFoundError("config/portfolio.yaml does not exist")
+        raise FileNotFoundError("data/portfolio.yaml does not exist")
 
     monkeypatch.setattr(node, "load_portfolio", boom)
     patch = await compliance(state(), ctx(tmp_path))
@@ -247,12 +362,12 @@ async def test_persist_does_not_re_promote_over_the_veto(tmp_path) -> None:
     from research_desk.graph.nodes.persist import persist
 
     patch = await compliance(
-        state(symbol="GOOGL", snapshot=snapshot("GOOGL", close=347.84),
+        state(symbol="PLTR", snapshot=snapshot("PLTR", close=182.40),
               trader_proposal=proposal(weight=5.0, conviction=1.0)),
         ctx(tmp_path),
     )
     held = DecisionState(
-        run_id="t", symbol="GOOGL", as_of=AS_OF,
+        run_id="t", symbol="PLTR", as_of=AS_OF,
         trader_proposal=proposal(weight=5.0, conviction=1.0),
         final_decision=patch["final_decision"],
         order_plan=patch["order_plan"],
@@ -261,7 +376,7 @@ async def test_persist_does_not_re_promote_over_the_veto(tmp_path) -> None:
     await persist(held, ctx(tmp_path))
 
     written = json.loads(
-        next((tmp_path / "proposals").glob("GOOGL_*.json")).read_text()
+        next((tmp_path / "proposals").glob("PLTR_*.json")).read_text()
     )
     assert written["decision"]["action"] == "HOLD", (
         "persist re-derived the decision and discarded the veto"
@@ -289,6 +404,44 @@ async def test_proposal_json_carries_the_order_plan_and_the_book(tmp_path) -> No
     assert "caps_pct" in written["order_plan"]
     assert written["book"]["equity"] > 0
     assert written["book"]["source"] in {"seed", "cache", "ib"}
+
+
+async def test_an_absent_analyst_reaches_execute_as_an_actionable_buy(tmp_path) -> None:
+    """End to end over the §0 split, which is where the bug actually bit: the
+    only thing `execute` ever sees is this file, and for 31 runs it read HOLD.
+
+    Asserted on the written JSON rather than on the patch, because the carry
+    through ``FinalDecision`` is the part that could silently be dropped.
+    """
+    from research_desk.graph.nodes.persist import persist
+
+    errors = [NodeError(node="news_analyst", kind="no_data",
+                        message="no news data was available",
+                        severity="partial")]
+    reports = {
+        "market": analyst("market"),
+        "news": AnalystReport.degraded("no news data", kind="news"),
+        "positioning": analyst("positioning"),
+        "fundamentals": analyst("fundamentals"),
+    }
+    patch = await compliance(
+        state(analyst_reports=reports, errors=errors), ctx(tmp_path)
+    )
+    held = DecisionState(
+        run_id="t", symbol="TSM", as_of=AS_OF, errors=errors,
+        analyst_reports=reports,
+        final_decision=patch["final_decision"], order_plan=patch["order_plan"],
+        portfolio=patch["portfolio"],
+    )
+    await persist(held, ctx(tmp_path))
+
+    written = json.loads(
+        next((tmp_path / "proposals").glob("TSM_*.json")).read_text()
+    )
+    assert written["decision"]["action"] == "BUY"
+    assert written["decision"]["degraded"] is False
+    assert written["decision"]["absent_analysts"] == ["news"]
+    assert written["order_plan"]["quantity"] > 0
 
 
 # --------------------------------------------------------------------------- #

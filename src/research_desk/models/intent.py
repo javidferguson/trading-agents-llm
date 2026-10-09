@@ -210,6 +210,22 @@ class Execution(BaseModel):
     require_confirmation: Literal[True] = True
     confirm_by: Literal["ticker", "symbol"] = "ticker"
 
+    #: How far through the spread a marketable limit reaches, in basis points.
+    #:
+    #: **Bounded here because this is the file's one genuinely dangerous
+    #: number.** Everything else in ``risk`` caps exposure; this one decides how
+    #: far an order will chase a price, and an unbounded value crosses a spread
+    #: far wider than the one the human approved. ``FinalDecision`` carries the
+    #: same field as a plain ``int`` with no bounds, which is safe only because
+    #: nothing ever sets it -- and it is never a model-facing schema, so Pydantic
+    #: is the only thing enforcing anything. Put the constraint where it binds.
+    #:
+    #: The default stays 10. 100 is what this book runs (see the YAML comment),
+    #: because a 15-minute-delayed quote makes 0.1% routinely unmarketable --
+    #: but a default that wide would be a surprise to anyone else loading a
+    #: minimal config.
+    limit_offset_bps: int = Field(default=10, ge=0, le=500)
+
     @model_validator(mode="after")
     def _gate_is_intact(self) -> "Execution":
         if self.require_confirmation is not True:

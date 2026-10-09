@@ -149,9 +149,12 @@ check-gateway:  ## Is our Gateway up? And is the ORB engine's conflicting?
 	@# HOST_RUN comment at the top. `|| true` stays because this target is a
 	@# report -- it prints the conflict rather than failing on it.
 	@$(HOST_RUN) python scripts/check_gateway_exclusive.py || true
+	@# "port answers" is NOT "session alive": socat listens from container
+	@# start regardless of whether the Gateway logged in (§14). Say what was
+	@# actually proved and name the check that proves the rest.
 	@nc -z -G 3 127.0.0.1 $${IB_HOST_PORT:-4012} 2>/dev/null \
-		&& echo "ok   desk-ib-gateway reachable on 127.0.0.1:$${IB_HOST_PORT:-4012}" \
-		|| echo "warn desk-ib-gateway not running. \`make gateway-start\`. Not needed until Stage 7."
+		&& echo "ok   port 127.0.0.1:$${IB_HOST_PORT:-4012} answers (socat). For a LIVE session: make gateway-session" \
+		|| echo "warn desk-ib-gateway not running. \`make gateway-start\`."
 
 # --------------------------------------------------------------------------- #
 # IB Gateway -- OURS. Never run it alongside the ORB+GEX engine's.
@@ -171,6 +174,72 @@ gateway-start:  ## Start this project's IB Gateway (refuses if the ORB one is up
 	@echo "Starting. First login can take a minute, and if IB asks for 2FA you"
 	@echo "will only see it over VNC:  open vnc://localhost:5912"
 	@echo "Watch progress with: make gateway-logs"
+
+.PHONY: execute
+execute:  ## THE STAGE 7 GATE: place an approved proposal. Needs a human and the Gateway.
+	@# `compose run` not `$(RUN)`: the confirmation gate reads stdin, so the
+	@# execute service sets stdin_open/tty. A closed stdin DECLINES rather than
+	@# proceeding, which is why this must not be run detached.
+	@#
+	@# --build IS NOT OPTIONAL HERE, and this is the one target where it is
+	@# worth the seconds.
+	@#
+	@# The `dev` service bind-mounts the WHOLE REPO at /app, so source edits are
+	@# live and nothing goes stale. `execute` deliberately mounts only data/,
+	@# logs/, config/ and prompts/ -- NOT src/ -- so the process that places
+	@# real orders runs built, reviewed code rather than whatever happens to be
+	@# in the working tree. That is a feature.
+	@#
+	@# The cost is that its image goes stale silently. Stage 7 exposed the loud
+	@# version: the `execute` console script did not exist in the image yet, so
+	@# the container died with "executable file not found in $$PATH". The
+	@# dangerous version is subtler -- change a sizing rule or a safety check in
+	@# broker.py and a stale image runs YESTERDAY'S order logic against today's
+	@# proposal, with no indication whatsoever. For the one process that moves
+	@# money, always-current beats fast.
+	@#
+	@# Layer caching makes this nearly free when nothing changed.
+	$(COMPOSE) --profile execute run --rm --build execute execute $(EXEC_ARGS)
+
+.PHONY: sync-book
+sync-book:  ## Overwrite data/portfolio.yaml FROM THE BROKER. Run after a fill.
+	@# `portfolio-refresh` cannot do this: it re-prices positions the book
+	@# already lists, from the bars cache, and never talks to IB. Only the
+	@# execute process can read the account, so this lives there.
+	$(COMPOSE) --profile execute run --rm --build execute execute --sync-book
+
+.PHONY: gateway-session
+gateway-session:  ## Prove the Gateway has a LIVE session. The open port does not.
+	@# §14: socat relays 4004 -> 4002 and listens from container start whether
+	@# or not the Gateway ever logged in, so `check-gateway`'s TCP probe reports
+	@# healthy while it sits on the login screen. This does a real
+	@# managedAccounts() round-trip. Slower, because it builds; use it when the
+	@# port says yes and something still does not work.
+	$(COMPOSE) --profile execute run --rm --build execute execute --check-session
+
+.PHONY: execute-all
+execute-all:  ## Review every pending proposal, then place them ONE AT A TIME.
+	@# The sweep's companion: `make decide-all`, `make review WANTED=1`, then
+	@# this. It shows the AGGREGATE effect of the whole set before anything is
+	@# sent -- which no sequence of single-order runs can, because each one
+	@# only knows about itself -- and then asks for each ticker separately.
+	@#
+	@# It is not `make execute` in a loop, and the difference is a correctness
+	@# one: each order is re-checked against the book AS IT IS AFTER THE
+	@# PREVIOUS FILL. Five of compliance's rules read the post-trade state, so
+	@# a loop handing every order the same pre-batch snapshot walks past
+	@# max_positions, min_cash_pct, max_gross_exposure_pct, max_sector_pct and
+	@# max_position_pct without any of them firing.
+	@#
+	@# Still human-initiated, still one typed ticker per order (§15.8, §9).
+	@# Rehearse with: EXEC_ARGS="--all --dry-run" make execute
+	$(COMPOSE) --profile execute run --rm --build execute execute --all
+
+.PHONY: execute-list
+execute-list:  ## Which proposals are pending, and which already executed
+	@# --build for the same reason as above: this reads receipts written by the
+	@# code it is about to run.
+	$(COMPOSE) --profile execute run --rm --build execute execute --list
 
 .PHONY: gateway-stop
 gateway-stop:  ## Stop this project's IB Gateway. Never touches ajj-ib-gateway.
@@ -209,6 +278,22 @@ bars:  ## Fetch daily bars from IB into the cache (needs the Gateway up)
 	# resolve_ib_endpoint() probes both, so the command is identical either way.
 	$(RUN) python scripts/fetch_bars.py $(if $(SYMBOLS),--symbols $(SYMBOLS),)
 
+.PHONY: decide-many
+decide-many:  ## Research sweep over SYMBOLS="TSM AMD". One container, continues on failure.
+	@test -n "$(SYMBOLS)" || { \
+	  echo 'usage: make decide-many SYMBOLS="TSM AMD PLTR"'; \
+	  echo '       make decide-all                 # the whole universe'; exit 2; }
+	$(RUN) bash scripts/sweep.sh $(SYMBOLS)
+
+.PHONY: decide-all
+decide-all:  ## Research sweep over the WHOLE tradeable universe. ~50 MINUTES.
+	@# Per-symbol by design (architecture decision 3), so this is N independent
+	@# runs in one container. Each READS the book and never writes it, which is
+	@# what makes the sweep safe. Past the third actionable symbol the cadence
+	@# limit vetoes the rest to HOLD -- that is the limit working; use
+	@# `desk review --wanted` to see what the pipeline actually decided.
+	$(RUN) bash scripts/sweep.sh
+
 .PHONY: snapshot
 snapshot:  ## THE STAGE 2 GATE: every §7.1 metric for a symbol, no LLM
 	$(RUN) desk snapshot --symbol $${SYMBOL:-SPY}
@@ -221,6 +306,20 @@ decide:  ## THE STAGE 3 GATE: a real decision end to end -> proposal.json
 # Stage 6 -- intent, sizing, compliance. None of these touches IB or a model.
 # --------------------------------------------------------------------------- #
 
+.PHONY: review
+review:  ## Read past runs out of the journal. WANTED=1 after a sweep. No model.
+	@# WANTED=1 is the one you want after `decide-all`: past the third
+	@# actionable symbol the cadence limit rewrites everything to HOLD, so
+	@# --actionable hides exactly the rows the sweep exists to produce.
+	$(RUN) desk review \
+	  $(if $(SYMBOL),--symbol $(SYMBOL),) \
+	  $(if $(LAST),--last $(LAST),) \
+	  $(if $(DATE),--date $(DATE),) \
+	  $(if $(RUN_ID),--run-id $(RUN_ID),) \
+	  $(if $(WANTED),--wanted,) \
+	  $(if $(ACTIONABLE),--actionable,) \
+	  $(if $(FULL),--full,)
+
 .PHONY: portfolio
 portfolio:  ## THE STAGE 6 GATE (part 1): the book and the drift table, no LLM, no broker
 	$(RUN) desk portfolio
@@ -230,7 +329,7 @@ candidates:  ## Channel 1: today's tradeable set, computed before any model runs
 	$(RUN) desk candidates --earnings
 
 .PHONY: portfolio-seed
-portfolio-seed:  ## Rebuild config/portfolio.yaml from the bars cache. Reads the cache; never fetches.
+portfolio-seed:  ## Rebuild data/portfolio.yaml from the bars cache. Reads the cache; never fetches.
 	$(RUN) python scripts/seed_portfolio.py --seed
 
 .PHONY: portfolio-refresh

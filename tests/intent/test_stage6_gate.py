@@ -47,10 +47,17 @@ def _decision(**overrides) -> FinalDecision:
 
 
 def _run(decision: FinalDecision, *, dollar_adv: float | None = 2e9,
-         prior: int = 0):
-    """The whole Stage 6 path: load, size, check. Nothing else."""
+         prior: int = 0, portfolio=None):
+    """The whole Stage 6 path: load, size, check. Nothing else.
+
+    ``portfolio`` is the SEEDED book, passed in by the caller. It is not read
+    from data/portfolio.yaml: that file is state the broker owns from Stage 7
+    on, and a gate asserting against it would break every time the account
+    moved. See tests/intent/conftest.py.
+    """
     intent = load_intent()
-    portfolio = load_portfolio()
+    if portfolio is None:
+        portfolio = load_portfolio()
     drift = compute_gaps(intent, portfolio, as_of=portfolio.as_of)
     sized = size_order(decision, intent, portfolio, drift,
                        as_of=portfolio.as_of,
@@ -68,8 +75,8 @@ def _run(decision: FinalDecision, *, dollar_adv: float | None = 2e9,
 # --------------------------------------------------------------------------- #
 
 
-def test_an_order_plan_is_produced_from_the_shipped_book() -> None:
-    plan, sized = _run(_decision())
+def test_an_order_plan_is_produced_from_the_seeded_book(seeded_book) -> None:
+    plan, sized = _run(_decision(), portfolio=seeded_book)
     assert plan.symbol == "TSM"
     assert plan.quantity > 0
     assert plan.actionable
@@ -79,7 +86,7 @@ def test_an_order_plan_is_produced_from_the_shipped_book() -> None:
     }
 
 
-def test_the_plan_is_produced_with_no_network_access_at_all() -> None:
+def test_the_plan_is_produced_with_no_network_access_at_all(seeded_book) -> None:
     """**Zero IB contact**, asserted by making every socket connection fail.
 
     Stronger than checking for ``ib_async``: it proves the path reaches no
@@ -98,7 +105,7 @@ def test_the_plan_is_produced_with_no_network_access_at_all() -> None:
 
     socket.socket.connect = refuse
     try:
-        plan, _ = _run(_decision())
+        plan, _ = _run(_decision(), portfolio=seeded_book)
     finally:
         socket.socket.connect = original
 
@@ -130,10 +137,10 @@ def test_the_decide_path_still_does_not_import_ib_async() -> None:
     assert not [m for m in result.stdout.strip().split(",") if m]
 
 
-def test_a_plan_is_produced_even_when_no_order_goes_out() -> None:
+def test_a_plan_is_produced_even_when_no_order_goes_out(seeded_book) -> None:
     """A run that wrote nothing is indistinguishable from a run that never
     happened, and the reason is the most useful field in the file."""
-    plan, _ = _run(_decision(action="HOLD"))
+    plan, _ = _run(_decision(action="HOLD"), portfolio=seeded_book)
     assert plan.action == "HOLD"
     assert plan.quantity == 0
     assert plan.skip_reason
@@ -158,18 +165,18 @@ def _approving_verdict(**overrides) -> RiskVerdict:
     return RiskVerdict(**body)
 
 
-def test_a_fund_manager_approving_the_whole_book_is_vetoed() -> None:
+def test_a_fund_manager_approving_the_whole_book_is_vetoed(seeded_book) -> None:
     """The headline case: ``approve``, conviction 1.0, 100% of equity."""
     decision = _final_from_verdict(
         _approving_verdict(), "TSM",
         expires_at=datetime(2026, 10, 7, 12, 0), stop_loss_pct=8.0,
     )
-    plan, sized = _run(decision)
+    plan, sized = _run(decision, portfolio=seeded_book)
 
     # Sizing alone already refuses to express it: the minimum of four caps
     # cannot exceed the smallest one.
     assert sized.target_weight_pct <= load_intent().risk.max_position_pct
-    assert plan.quantity * (plan.reference_price or 0) < load_portfolio().equity
+    assert plan.quantity * (plan.reference_price or 0) < seeded_book.equity
 
 
 @pytest.mark.parametrize(
@@ -179,17 +186,19 @@ def test_a_fund_manager_approving_the_whole_book_is_vetoed() -> None:
         ("GME", "universe_membership"),
     ],
 )
-def test_a_non_compliant_decision_is_blocked_by_rule(symbol: str, rule: str) -> None:
+def test_a_non_compliant_decision_is_blocked_by_rule(
+    symbol: str, rule: str, seeded_book
+) -> None:
     decision = _final_from_verdict(
         _approving_verdict(target_weight_pct=5.0), symbol,
         expires_at=datetime(2026, 10, 7, 12, 0), stop_loss_pct=8.0,
     )
-    plan, _ = _run(decision)
+    plan, _ = _run(decision, portfolio=seeded_book)
     assert rule in [v.rule for v in plan.blocking]
     assert plan.quantity == 0
 
 
-def test_the_veto_survives_a_hand_built_plan_that_bypasses_sizing() -> None:
+def test_the_veto_survives_a_hand_built_plan_that_bypasses_sizing(seeded_book) -> None:
     """The veto must not depend on sizing having behaved.
 
     Sizing is the layer that *usually* prevents an over-sized order, so a test
@@ -199,7 +208,7 @@ def test_the_veto_survives_a_hand_built_plan_that_bypasses_sizing() -> None:
     from research_desk.models.orders import OrderPlan
 
     intent = load_intent()
-    portfolio = load_portfolio()
+    portfolio = seeded_book
     held = portfolio.get("TSM")
 
     # 2,000 shares of TSM is far above every cap, and nothing sized it.
@@ -219,31 +228,42 @@ def test_the_veto_survives_a_hand_built_plan_that_bypasses_sizing() -> None:
     assert not plan.actionable
 
 
-def test_the_veto_blocks_on_the_real_book_at_max_positions() -> None:
+def test_the_veto_blocks_on_the_seeded_book_at_max_positions(seeded_book) -> None:
     """The seeded book holds exactly ``max_positions``, so a new symbol is
     refused -- which is the condition the gate's drift table is built around."""
     intent = load_intent()
-    portfolio = load_portfolio()
+    portfolio = seeded_book
     assert portfolio.position_count == intent.risk.max_positions, (
         "the seeded book no longer sits at max_positions, so this gate no "
-        "longer tests the condition it was built for -- re-seed it with "
-        "`make portfolio-seed` or update the assertion deliberately"
+        "longer tests the condition it was built for -- fix SEED_BOOK in "
+        "scripts/seed_portfolio.py, which is the fixture"
     )
 
     from research_desk.models.orders import OrderPlan
 
-    # GOOGL is a themed, in-universe symbol the book does not hold.
+    # Pick the unheld symbol from the config rather than naming one. This was
+    # hardcoded to GOOGL until the 2026-10-07 widening put GOOGL in the book,
+    # at which point the test asserted a veto on a symbol that could not
+    # trigger it. Derived, it cannot go stale again.
+    unheld = next(
+        s for s in intent.universe.tradeable
+        if s not in portfolio.symbols and intent.theme_for(s) is not None
+    )
+
     plan = rules.check(
-        OrderPlan(symbol="GOOGL", as_of=portfolio.as_of, action="BUY",
-                  quantity=10, reference_price=347.84,
-                  estimated_notional=3478.40),
-        _decision(symbol="GOOGL"), intent, portfolio, as_of=portfolio.as_of,
+        OrderPlan(symbol=unheld, as_of=portfolio.as_of, action="BUY",
+                  quantity=10, reference_price=100.0,
+                  estimated_notional=1_000.0),
+        _decision(symbol=unheld), intent, portfolio, as_of=portfolio.as_of,
         sectors=sector_map(), dollar_adv=2e9,
     )
-    assert "max_positions" in [v.rule for v in plan.blocking]
+    assert "max_positions" in [v.rule for v in plan.blocking], (
+        f"{unheld} is unheld and the book is full, so opening it must be "
+        f"blocked. Got: {[v.rule for v in plan.blocking]}"
+    )
 
 
-def test_no_model_output_can_switch_a_check_off() -> None:
+def test_no_model_output_can_switch_a_check_off(seeded_book) -> None:
     """The two-key property, stated as a test.
 
     ``RiskVerdict.decision`` is read for reporting and is never a condition. If
@@ -252,7 +272,7 @@ def test_no_model_output_can_switch_a_check_off() -> None:
     from research_desk.models.orders import OrderPlan
 
     intent = load_intent()
-    portfolio = load_portfolio()
+    portfolio = seeded_book
     held = portfolio.get("TSM")
     oversized = OrderPlan(
         symbol="TSM", as_of=portfolio.as_of, action="BUY", quantity=2_000,
